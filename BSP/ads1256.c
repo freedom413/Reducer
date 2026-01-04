@@ -1,7 +1,11 @@
 #include "ads1256.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/_intsup.h>
 
-ADS1256_t ads1256_a;
-
+#define  T6_US    ((50U * 1000000U / FCLk) + 1)  // t6 = 50 / 7,680,000 ≈ 6.51 µs
+#define  T16_US   ((4U * 1000000U / FCLk) + 1)  // t6 = 50 / 7,680,000 ≈ 6.51 µs
 /**
 ADDRESS REGISTER RESET
 VALUE BIT 7 BIT 6 BIT 5 BIT 4 BIT 3 BIT 2 BIT 1 BIT 0
@@ -111,12 +115,404 @@ WAKEUP Completes SYNC and Exits Standby Mode 1111   1111 (FFh)
 #define ADS1256_CMD_RESET       0xFE
 // #define ADS1256_CMD_WAKEUP      0xFF
 
-int ads1256_init(ADS1256_t *ads1256, pfn_ads1256_io_t read, pfn_ads1256_io_t write, pfn_ads1256_cs_t cs)
+
+static int __ads1256_write_reg(ADS1256_t *ads1256, uint8_t start_reg, uint8_t *p_data, uint8_t nbytes)
 {
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t cmd = ADS1256_CMD_WREG | start_reg;
+    uint8_t count = 0x0f & (nbytes - 1);
+    ret = ads1256->cs(false);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(&cmd, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(&count, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(p_data, nbytes);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->cs(true);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return ret;
+}
+
+static int __ads1256_read_reg(ADS1256_t *ads1256, uint8_t start_reg, uint8_t *p_data, uint8_t nbytes)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t cmd = ADS1256_CMD_RREG | start_reg;
+    uint8_t count = 0x0f & (nbytes - 1);
+    ret = ads1256->cs(false);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(&cmd, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(&count, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    // Dummy byte for t6 delay
+    ret = ads1256->delay_us(T6_US);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->read(p_data, nbytes);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->cs(true);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return ret;
+}
+
+static int __ads1256_set_reg_bit(ADS1256_t *ads1256, uint8_t reg, uint8_t bit_mask)
+{
+    int ret = 0;
+    uint8_t reg_val = 0;
+    ret = __ads1256_read_reg(ads1256, reg, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    reg_val |= bit_mask;
+    ret = __ads1256_write_reg(ads1256, reg, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    return ret;
+}
+
+static int __ads1256_write_cmd(ADS1256_t *ads1256, uint8_t cmd)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    ret = ads1256->cs(false);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(&cmd, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->cs(true);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return ret;
+}
+
+static int __ads1256_reset(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    if (ads1256->reset != NULL) {
+        ret = ads1256->reset(false);
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->delay_us(T16_US);
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->reset(true);
+        if (ret < 0) {
+            return ret;
+        }
+    } else {
+        ret = __ads1256_write_cmd(ads1256, ADS1256_CMD_RESET);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return ret;
+}
+
+static int __ads1256_sync_down(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    if (ads1256->sync_down != NULL) {
+        ret = ads1256->sync_down(false);
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->delay_us(T16_US);
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->sync_down(true);
+        if (ret < 0) {
+            return ret;
+        }
+    } else {
+        ret = __ads1256_write_cmd(ads1256, ADS1256_CMD_RESET);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return ret;
+}
+
+int ads1256_read_data(ADS1256_t *ads1256, uint32_t *p_data )
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    if (ads1256->mod != READ_ONECE_MODE) {
+        return -1;
+    }
+
+    int ret = 0;
+    uint8_t cmd = ADS1256_CMD_RDATA;
+    uint8_t buf[3] = {0};
+    ret = ads1256->cs(false);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(&cmd, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    // Dummy byte for t6 delay
+    ret = ads1256->delay_us(T6_US);
+    if (ret < 0) {
+        return ret;
+    }
+    // Read 3 bytes from ADS1256 ADC 24-bit data
+    ret = ads1256->read(buf, 3);
+    if (ret < 0) {
+        return ret;
+    }
+    // Convert 3 bytes to 24-bit data
+   *p_data = (uint32_t)buf[0] << 16 | (uint32_t)buf[1] << 8 | (uint32_t)buf[2];
+    ret = ads1256->cs(true);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return ret;
+}
+
+
+int ads1256_read_data_continue(ADS1256_t *ads1256, uint32_t *p_data, uint8_t buf_len)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    ads1256->mod = READ_CONTINUE_MODE;
+
+    int ret = 0;
+    uint8_t i = 0;
+    uint8_t cmd = ADS1256_CMD_RDATA;
+    ret = ads1256->cs(false);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->write(&cmd, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    // Dummy byte for t6 delay
+    ret = ads1256->delay_us(T6_US);
+    if (ret < 0) {
+        return ret;
+    }
+    while (ads1256->mod == READ_CONTINUE_MODE) {
+        uint8_t buf[3] = {0};
+        if (ads1256->is_data_ready) {
+            ret = ads1256->read(buf, 3);
+            if (ret < 0) {
+                return ret;
+            }
+            // Convert 3 bytes to 24-bit data
+           *p_data = (uint32_t)buf[0] << 16 | (uint32_t)buf[1] << 8 | (uint32_t)buf[2];
+            if ((++i) >= buf_len) {
+                i = 0;
+            }
+            p_data += i;
+            ads1256->is_data_ready = false;
+        }    
+    }
+
+    ret = ads1256->cs(true);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return ret;
+}
+
+int ads1256_read_data_continue_stop(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    ads1256->mod = READ_ONECE_MODE;
+    return __ads1256_write_cmd(ads1256, ADS1256_CMD_SDATAC);
+}
+
+int ads1256_enable_low_order(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+
+    return __ads1256_set_reg_bit(ads1256, ADS1256_REG_STATUS, ADS1256_REG_STATUS_ORDER_MASK);
+}
+
+int ads1256_auto_Calibration(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+
+    return __ads1256_set_reg_bit(ads1256, ADS1256_REG_STATUS, ADS1256_REG_STATUS_ACAL_MASK);
+}
+
+int ads1256_enable_buff(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+
+    return __ads1256_set_reg_bit(ads1256, ADS1256_REG_STATUS, ADS1256_REG_STATUS_BUFEN_MASK);
+}
+
+int ads1256_data_ready(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t reg_val = 0;
+    ret = __ads1256_read_reg(ads1256, ADS1256_REG_STATUS, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    return (reg_val & ADS1256_REG_STATUS_DRDY_MASK) > 0;
+}
+
+int ads1256_set_ainp(ADS1256_t *ads1256, ads1256_ain_t ainp)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t reg_val = 0;
+    ret = __ads1256_read_reg(ads1256, ADS1256_REG_MUX, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    reg_val &= ~ADS1256_REG_MUX_PSEL_MASK;
+    reg_val |= ((((uint8_t)ainp) << ADS1256_REG_MUX_PSEL_POS) & ADS1256_REG_MUX_PSEL_MASK);
+    ret = __ads1256_write_reg(ads1256, ADS1256_REG_MUX, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    return ret;
+}
+
+int ads1256_set_ainn(ADS1256_t *ads1256, ads1256_ain_t ainn)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t reg_val = 0;
+    ret = __ads1256_read_reg(ads1256, ADS1256_REG_MUX, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    reg_val &= ~ADS1256_REG_MUX_NSEL_MASK;
+    reg_val |= ((((uint8_t)ainn) << ADS1256_REG_MUX_NSEL_POS) & ADS1256_REG_MUX_NSEL_MASK);
+    ret = __ads1256_write_reg(ads1256, ADS1256_REG_MUX, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    return ret;
+}
+
+int ads1256_set_gpa(ADS1256_t *ads1256, ads1256_gpa_t gpa)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t reg_val = 0;
+    ret = __ads1256_read_reg(ads1256, ADS1256_REG_ADCON, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    reg_val &= ~ADS1256_REG_ADCON_PGA_MASK;
+    reg_val |= ((((uint8_t)gpa) << ADS1256_REG_ADCON_PGA_POS) & ADS1256_REG_ADCON_PGA_MASK);
+    ret = __ads1256_write_reg(ads1256, ADS1256_REG_ADCON, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    return ret;
+}
+
+int ads1256_set_sps(ADS1256_t *ads1256, ads1256_sps_t sps)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t reg_val = (uint8_t)sps;
+    ret = __ads1256_write_reg(ads1256, ADS1256_REG_DRATE, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    return ret;
+}
+
+int ads1256_init(ADS1256_t                 *ads1256, 
+                 pfn_ads1256_io_t           read,
+                 pfn_ads1256_io_t           write, 
+                 pfn_ads1256_pin_t          cs,
+                 pfn_ads1256_delay_us_t     delay_us,
+                 ads1256_mod_t              mod,
+                 pfn_ads1256_pin_t          reset,
+                 pfn_ads1256_pin_t          sync_down)
+{   
+    if (ads1256 == NULL || read == NULL || write == NULL || cs == NULL || delay_us == NULL) {
+        return -1;
+    }
     ads1256->read = read;
     ads1256->write = write;
     ads1256->cs = cs;
-    ads1256->initialized = true;
-    return 0;
+    ads1256->delay_us = delay_us;
+    ads1256->mod = mod;
+    ads1256->reset = reset;
+    ads1256->sync_down = sync_down;
+    ads1256->is_data_ready = false;
+    ads1256->is_init = true;
+    return __ads1256_reset(ads1256);
 }
 
