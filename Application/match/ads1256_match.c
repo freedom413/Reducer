@@ -124,37 +124,60 @@ ADS1256_t ads1256_b;
 int adc_ads1256_init(void)
 {
     int ret;
-    ret = ads1256_init( &ads1256_a, 
-                            ads1256_write, 
-                           ads1256_read, 
-                          ads1256_a_pin_op, 
-                        ads1256_delay_us);
+    ads1256_init(&ads1256_a, 
+                    ads1256_write, 
+                   ads1256_read, 
+                  ads1256_a_pin_op, 
+                ads1256_delay_us);
 
-    if(ret != 0) {
+
+
+    ads1256_init( &ads1256_b, 
+                     ads1256_write, 
+                    ads1256_read, 
+                   ads1256_b_pin_op, 
+                 ads1256_delay_us);
+
+    
+    // 复位
+    ret = ads1256_reset(&ads1256_a);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_reset(&ads1256_b);
+    if (ret < 0) {
         return ret;
     }
 
-    ret = ads1256_init( &ads1256_b, 
-                            ads1256_write, 
-                           ads1256_read, 
-                          ads1256_b_pin_op, 
-                        ads1256_delay_us);
-    if (ret != 0) {
+    // 配置放大增益
+    ret = ads1256_set_gpa(&ads1256_a, ADS1256_GPA_64);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_set_gpa(&ads1256_b, ADS1256_GPA_64);
+    if (ret < 0) {
+        return ret;
+    }
+
+    // 配置采样速率
+    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_3750);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_3750);
+    if (ret < 0) {
         return ret;
     }
     
-    // 复位
-    ads1256_reset(&ads1256_a);
-    ads1256_reset(&ads1256_b);
-    // 配置放大增益
-    ads1256_set_gpa(&ads1256_a, ADS1256_GPA_64);
-    ads1256_set_gpa(&ads1256_b, ADS1256_GPA_64);
-    // 配置采样速率
-    ads1256_set_sps(&ads1256_a, ADS1256_SPS_3750);
-    ads1256_set_sps(&ads1256_b, ADS1256_SPS_3750);
     // 自校准
-    ads1256_calibration(&ads1256_a, ADS1256_CAL_SELF);
-    ads1256_calibration(&ads1256_b, ADS1256_CAL_SELF);
+    ret = ads1256_calibration(&ads1256_a, ADS1256_CAL_SELF);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_calibration(&ads1256_b, ADS1256_CAL_SELF);
+    if (ret < 0) {
+        return ret;
+    }
     
     return 0;
 }

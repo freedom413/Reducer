@@ -2,6 +2,8 @@
 #include "stdio.h"
 #include <stdint.h>
 #include "dbg.h"
+#include "delay.h"
+#include "can.h"
 
 extern ADS1256_t ads1256_a;
 extern ADS1256_t ads1256_b;
@@ -34,8 +36,14 @@ static int adc_b_index = 3;
 int32_t adc_raw_value[6] = {0};
 
 void setup(void)
-{
-    adc_ads1256_init();
+{   
+    int ret;
+    delay_init();
+    can_init();
+    ret = adc_ads1256_init();
+    if (ret < 0) {
+        dbg_printf("adc_ads1256_init failed, ret = %d\n", ret);
+    }
     //开始通道转换
     ads1256_set_ain_pin(&ads1256_a, adc_ch[adc_a_index].p, adc_ch[adc_a_index].n);
     ads1256_set_ain_pin(&ads1256_b, adc_ch[adc_b_index].p, adc_ch[adc_b_index].n);
