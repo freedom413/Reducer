@@ -375,7 +375,13 @@ int ads1256_read_data(ADS1256_t *ads1256, int32_t *p_data)
         return ret;
     }
     // Convert 3 bytes to 24-bit data
-   *p_data = (uint32_t)buf[0] << 16 | (uint32_t)buf[1] << 8 | (uint32_t)buf[2];
+    uint32_t val = (((uint32_t)buf[0]) << 16) | (((uint32_t)buf[1]) << 8) | ((uint32_t)buf[2]);
+    if (val & 0x800000) {
+        val |= 0xFF000000;
+    }else {
+        val &= 0x00FFFFFF;
+    }
+   *p_data = (int32_t)val;
     return ret;
 }
 
@@ -455,6 +461,11 @@ int ads1256_calibration(ADS1256_t *ads1256, ads1256_calibration_t cal)
     if (ret < 0) {
         return ret;
     }
+    
+    while (ads1256_is_data_ready(ads1256) != 1) {
+        ads1256->delay_us(T6_US);
+    }
+
     return ret;
 }
 

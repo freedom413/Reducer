@@ -48,6 +48,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/ads1256/ads1256.c
     BSP/can.c
     BSP/dbg.c
+    BSP/delay.c
+    Application/user.c
+    Application/match/ads1256_match.c
 )
 
 # Add include paths

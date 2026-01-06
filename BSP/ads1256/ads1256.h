@@ -5,6 +5,7 @@
 
 #define  FCLK  7680000UL  // 7.68MHz crystal oscillator frequency
 
+#define  ADS1256_SCOPE
 
 typedef enum ads1256_pin_op ads1256_pin_op_t;
 typedef enum ads1256_pin ads1256_pin_t;
