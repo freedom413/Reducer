@@ -4,11 +4,16 @@
 #include <stdint.h>
 #include <sys/_intsup.h>
 
-#define  T6_US    ((50U * 1000000U / FCLK) + 1)  // t6 = 50 / 7,680,000 ≈ 6.51 µs
-#define  T16_US   ((4U * 1000000U / FCLK) + 1)  // t6 = 50 / 7,680,000 ≈ 6.51 µs
+
+/* from datasheet */
+
+#define  T11_4    ((4U * 1000000U / FCLK) + 1) 
+#define  T11_24   ((24U * 1000000U / FCLK) + 1) 
+#define  T6       ((50U * 1000000U / FCLK) + 1)  
+#define  T16      ((4U * 1000000U / FCLK) + 1) 
 
 
-#define  DRDY_WAIT_COUNT  (3)
+#define  DRDY_WAIT_COUNT  (30)
 /**
 ADDRESS REGISTER RESET
 VALUE BIT 7 BIT 6 BIT 5 BIT 4 BIT 3 BIT 2 BIT 1 BIT 0
@@ -143,6 +148,10 @@ static int __ads1256_write_reg(ADS1256_t *ads1256, uint8_t start_reg, uint8_t *p
     if (ret < 0) {
         return ret;
     }
+    ret = ads1256->delay_us(T11_4);
+    if (ret < 0) {
+        return ret;
+    }
     ret = ads1256->pin_op(ADS1256_Pin_CS, ADS1256_PIN_OP_HIGH);
     if (ret < 0) {
         return ret;
@@ -171,12 +180,15 @@ static int __ads1256_read_reg(ADS1256_t *ads1256, uint8_t start_reg, uint8_t *p_
     if (ret < 0) {
         return ret;
     }
-    // Dummy byte for t6 delay
-    ret = ads1256->delay_us(T6_US);
+    ret = ads1256->delay_us(T6);
     if (ret < 0) {
         return ret;
     }
     ret = ads1256->read(p_data, nbytes);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->delay_us(T11_4);
     if (ret < 0) {
         return ret;
     }
@@ -244,80 +256,6 @@ static int __ads1256_write_cmd(ADS1256_t *ads1256, uint8_t cmd)
 
 /****************************ads1256 api************************************/
 
-int ads1256_sync(ADS1256_t *ads1256)
-{
-    if (!ads1256->is_init) {
-        return -1;
-    }
-    int ret = 0;
-    if (ads1256->pin_op != NULL) {
-        ret = ads1256->pin_op(ADS1256_Pin_SYNC, ADS1256_PIN_OP_LOW);
-        if (ret == 2) {
-            goto nopin;
-        }
-        if (ret < 0) {
-            return ret;
-        }
-        ret = ads1256->delay_us(T16_US);
-        if (ret < 0) {
-            return ret;
-        }
-        ret = ads1256->pin_op(ADS1256_Pin_SYNC, ADS1256_PIN_OP_HIGH);
-        if (ret < 0) {
-            return ret;
-        }
-    } else {
-nopin:
-        ret = __ads1256_write_cmd(ads1256, ADS1256_CMD_SYNC);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-    return ret;
-}
-
-int ads1256_wakeup(ADS1256_t *ads1256)
-{
-    if (!ads1256->is_init) {
-        return -1;
-    }
-
-    return __ads1256_write_cmd(ads1256, ADS1256_CMD_WAKEUP);
-
-}
-
-int ads1256_reset(ADS1256_t *ads1256)
-{
-    if (!ads1256->is_init) {
-        return -1;
-    }
-    int ret = 0;
-    if (ads1256->pin_op != NULL) {
-        ret = ads1256->pin_op(ADS1256_Pin_RST, ADS1256_PIN_OP_LOW);
-        if (ret == 2) {
-            goto nopin;
-        }
-        if (ret < 0) {
-            return ret;
-        }
-        ret = ads1256->delay_us(T16_US);
-        if (ret < 0) {
-            return ret;
-        }
-        ret = ads1256->pin_op(ADS1256_Pin_RST, ADS1256_PIN_OP_HIGH);
-        if (ret < 0) {
-            return ret;
-        }
-    } else {
-nopin:
-        ret = __ads1256_write_cmd(ads1256, ADS1256_CMD_RESET);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-    return ret;
-}
-
 int ads1256_is_data_ready(ADS1256_t *ads1256)
 {
     if (!ads1256->is_init) {
@@ -344,6 +282,106 @@ nopin:
     }
 }
 
+int ads1256_is_data_ready_wait(ADS1256_t *ads1256, uint32_t try_count)
+{
+    int ret = 0;
+    int i = 0;
+    while (true) {
+        ret = ads1256_is_data_ready(ads1256);
+        if (ret < 0) {
+            return ret;
+        }
+        if (ret == 1) {
+            break;
+        }
+        if (++i >= try_count) {
+            return -2;
+        }
+        ads1256->delay_us(T11_4);
+    }
+    return ret;
+}
+
+
+int ads1256_wakeup(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+
+    return __ads1256_write_cmd(ads1256, ADS1256_CMD_WAKEUP);
+
+}
+
+
+int ads1256_sync(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    if (ads1256->pin_op != NULL) {
+        ret = ads1256->pin_op(ADS1256_Pin_SYNC, ADS1256_PIN_OP_LOW);
+        if (ret == 2) {
+            goto nopin;
+        }
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->delay_us(T16);
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->pin_op(ADS1256_Pin_SYNC, ADS1256_PIN_OP_HIGH);
+        if (ret < 0) {
+            return ret;
+        }
+    } else {
+nopin:
+        ret = __ads1256_write_cmd(ads1256, ADS1256_CMD_SYNC);
+        if (ret < 0) {
+            return ret;
+        }  
+    }
+    return ret;
+}
+
+int ads1256_reset(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    if (ads1256->pin_op != NULL) {
+        ret = ads1256->pin_op(ADS1256_Pin_RST, ADS1256_PIN_OP_LOW);
+        if (ret == 2) {
+            goto nopin;
+        }
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->delay_us(T16);
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256->pin_op(ADS1256_Pin_RST, ADS1256_PIN_OP_HIGH);
+        if (ret < 0) {
+            return ret;
+        }
+    } else {
+nopin:
+        ret = __ads1256_write_cmd(ads1256, ADS1256_CMD_RESET);
+        if (ret < 0) {
+            return ret;
+        }
+        ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return ret;
+}
+
 int ads1256_read_data(ADS1256_t *ads1256, int32_t *p_data)
 {
     if (!ads1256->is_init) {
@@ -360,13 +398,16 @@ int ads1256_read_data(ADS1256_t *ads1256, int32_t *p_data)
     if (ret < 0) {
         return ret;
     }
-    // Dummy byte for t6 delay
-    ret = ads1256->delay_us(T6_US);
+    ret = ads1256->delay_us(T6);
     if (ret < 0) {
         return ret;
     }
     // Read 3 bytes from ADS1256 ADC 24-bit data
     ret = ads1256->read(buf, 3);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256->delay_us(T11_4);
     if (ret < 0) {
         return ret;
     }
@@ -392,26 +433,16 @@ int ads1256_continue_read_start(ADS1256_t *ads1256)
         return -1;
     }
     int ret = 0;
-    int i = 0;
-    while (true) {
-        ret = ads1256_is_data_ready(ads1256);
-        if (ret < 0) {
-            return ret;
-        }
-        if (ret == 1) {
-            break;
-        }
-        if (++i >= DRDY_WAIT_COUNT) {
-            return -2;
-        }
-        ads1256->delay_us(T6_US);
+    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
+    if (ret < 0) {
+        return ret;
     }
     ret =  __ads1256_write_cmd(ads1256, ADS1256_CMD_RDATAC);
     if (ret < 0) {
         return ret;
     }
     // Dummy byte for t6 delay
-    ret = ads1256->delay_us(T6_US);
+    ret = ads1256->delay_us(T6);
     if (ret < 0) {
         return ret;
     }
@@ -425,25 +456,14 @@ int ads1256_continue_read_stop(ADS1256_t *ads1256)
         return -1;
     }
     int ret = 0;
-    int i = 0;
-    while (true) {
-        ret = ads1256_is_data_ready(ads1256);
-        if (ret < 0) {
-            return ret;
-        }
-        if (ret == 1) {
-            break;
-        }
-        if (++i >= DRDY_WAIT_COUNT) {
-            return -2;
-        }
-        ads1256->delay_us(T6_US);
+    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
+    if (ret < 0) {
+        return ret;
     }
     ret =  __ads1256_write_cmd(ads1256, ADS1256_CMD_SDATAC);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256->delay_us(T6_US);
     if (ret < 0) {
         return ret;
     }
@@ -462,8 +482,9 @@ int ads1256_calibration(ADS1256_t *ads1256, ads1256_calibration_t cal)
         return ret;
     }
     
-    while (ads1256_is_data_ready(ads1256) != 1) {
-        ads1256->delay_us(T6_US);
+    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
+    if (ret < 0) {
+        return ret;
     }
 
     return ret;

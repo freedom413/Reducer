@@ -4,7 +4,7 @@
 #include "usart.h"
 #include "dbg.h"
 
-// 简易串口printf函数（支持%d, %u, %x, %s, %c）
+/*  简易串口printf函数（支持%d, %u, %x, %s, %c）相比c库printf函数，节省了20kb 的空间 */
 void dbg_printf(const char *fmt, ...)
 {
     char buffer[256];

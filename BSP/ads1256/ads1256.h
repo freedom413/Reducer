@@ -134,6 +134,7 @@ int ads1256_sync(ADS1256_t *ads1256);
 int ads1256_wakeup(ADS1256_t *ads1256);
 int ads1256_reset(ADS1256_t *ads1256);
 int ads1256_is_data_ready(ADS1256_t *ads1256);
+int ads1256_is_data_ready_wait(ADS1256_t *ads1256, uint32_t try_count);
 int ads1256_read_data(ADS1256_t *ads1256, int32_t *p_data);
 int ads1256_continue_read_start(ADS1256_t *ads1256);
 int ads1256_continue_read_stop(ADS1256_t *ads1256);
