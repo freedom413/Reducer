@@ -40,6 +40,7 @@ static inline int adc_restart(ADS1256_t *ads1256)
     if (ret < 0) {
         return ret;
     }
+    return ret;
 }
 
 static uint8_t adc_all_ch_mask = 0x00;
