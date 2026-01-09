@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Application/user.c
     Application/match/ads1256_match.c
     component/Ring-Buffer/ringbuffer.c
+    Application/algorithm/adc_conversion.c
 )
 
 # Add include paths
@@ -59,7 +60,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     BSP
     BSP/ads1256
-    component/Ring-Buffer/
+    component/Ring-Buffer
+    Application/algorithm
 )
 
 # Add project symbols (macros)

@@ -1,6 +1,9 @@
 #ifndef __ADC_CONVERSION_H__
 #define __ADC_CONVERSION_H__
 
+#include "stdint.h"
+#include "math.h"
+
 /**
  * @brief ads1256 原始值转电压
  * @param raw ads1256 原始值
@@ -8,24 +11,35 @@
  * @param pga PGA 增益
  * @return 电压值，单位：伏特 (V)
  */
-extern float inline ads1256_raw_to_voltage(int32_t raw, float ref_voltage, uint8_t pga);
-
+static inline float ads1256_raw_to_voltage(int32_t raw, float ref_voltage, uint8_t pga)
+{
+    float voltage = ((float)raw / 8388608.0f) * (ref_voltage / pga);
+    return voltage;
+}
 
 /**
  * @brief 应变片电压转应变 (ε)
  * @param voltage 电压值，单位：伏特 (V)
- * @param v_ex 应变片电压偏移
+ * @param v_ex 应变片激励电压
  * @param k 应变片灵敏度
  * @return 应变值 (ε)
  */
-extern float inline voltage_to_strain(float voltage, float v_ex, float k);
+static inline float voltage_to_strain(float voltage, float v_ex, float k)
+{
+    float strain = voltage * 4.0f / (v_ex * k);
+    return strain;
+}
 
 /**
  * @brief 应变转微应变 (µε)
  * @param strain 应变值 (ε)
  * @return 微应变值 (µε)
  */
-extern float inline strain_to_microstrain(float strain);
+static inline float strain_to_microstrain(float strain)
+{
+    float microstrain = strain * 1000000.f;
+    return microstrain;
+}
 
 /**
  * @brief 将应变转换为应力 (基于胡克定律)
@@ -33,7 +47,12 @@ extern float inline strain_to_microstrain(float strain);
  * @param E 材料的弹性模量，单位: MPa (兆帕)
  * @return 应力值，单位: MPa (兆帕)
  */
-extern float inline strain_to_stress_MPa(float strain, float E);
+static inline float strain_to_stress_MPa(float strain, float E) 
+{
+
+    float stress = E * strain;
+    return stress;
+}
 
 /**
  * @brief 从应力和面积计算作用力 (基础版本，单位需匹配)
@@ -44,7 +63,9 @@ extern float inline strain_to_stress_MPa(float strain, float E);
  *       - 应力(MPa) × 面积(mm²) = 力(N)
  *       - 应力(Pa) × 面积(m²) = 力(N)
  */
-extern float inline calculate_force_basic(float stress, float area);
+static inline float calculate_force_basic(float stress, float area) {
+    return stress * area;
+}
 
 /**
  * @brief 从力和面积计算压力（基础版本，单位需匹配）
@@ -53,7 +74,14 @@ extern float inline calculate_force_basic(float stress, float area);
  * @return 压力，单位：帕斯卡 (Pa)
  * @note 确保单位匹配：力(N) ÷ 面积(m²) = 压力(Pa)
  */
-extern float inline calculate_pressure_basic(float force, float area);
+static inline float calculate_pressure_basic(float force, float area) 
+{
+    if (fabs(area) < 1e-12f) {
+        return 0.0f;
+    }
+    return force / area;
+}
+
 
 /**
  * @brief 计算基本压力（基于胡克定律）

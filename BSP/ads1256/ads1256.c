@@ -130,17 +130,14 @@ static int __ads1256_write_reg(ADS1256_t *ads1256, uint8_t start_reg, uint8_t *p
         return -1;
     }
     int ret = 0;
-    uint8_t cmd = ADS1256_CMD_WREG | start_reg;
-    uint8_t count = 0x0f & (nbytes - 1);
+    uint8_t wreg_cmd [2] = {0};
+    wreg_cmd[0] = ADS1256_CMD_WREG | start_reg;
+    wreg_cmd[1] = 0x0f & (nbytes - 1);
     ret = ads1256->pin_op(ADS1256_Pin_CS, ADS1256_PIN_OP_LOW);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256->write(&cmd, 1);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256->write(&count, 1);
+    ret = ads1256->write(wreg_cmd, sizeof(wreg_cmd));
     if (ret < 0) {
         return ret;
     }
@@ -166,17 +163,14 @@ static int __ads1256_read_reg(ADS1256_t *ads1256, uint8_t start_reg, uint8_t *p_
         return -1;
     }
     int ret = 0;
-    uint8_t cmd = ADS1256_CMD_RREG | start_reg;
-    uint8_t count = 0x0f & (nbytes - 1);
+    uint8_t rreg_cmd [2] = {0};
+    rreg_cmd[0] = ADS1256_CMD_RREG | start_reg;
+    rreg_cmd[1] = 0x0f & (nbytes - 1);
     ret = ads1256->pin_op(ADS1256_Pin_CS, ADS1256_PIN_OP_LOW);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256->write(&cmd, 1);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256->write(&count, 1);
+    ret = ads1256->write(rreg_cmd, sizeof(rreg_cmd));
     if (ret < 0) {
         return ret;
     }

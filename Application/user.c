@@ -4,6 +4,7 @@
 #include "dbg.h"
 #include "delay.h"
 #include "can.h"
+#include "adc_conversion.h"
 
 extern ADS1256_t ads1256_a;
 extern ADS1256_t ads1256_b;
@@ -53,7 +54,7 @@ static int adc_a_next_index;
 static int adc_b_next_index;
 
 int32_t adc_raw_value[6] = {0};
-
+float pressure[6] = {0.0f};
 void setup(void)
 {   
     int ret;
@@ -108,6 +109,17 @@ void loop(void)
     /* 所有通道转换完成 */
     if (adc_all_ch_mask == 0x3F) {
         adc_all_ch_mask = 0x00;
+        
+        // float pressure[6] = {0.0f};
+        // for (int i = 0; i < 6; i++) {
+            pressure[0] = get_pressure_basic(
+                adc_raw_value[0], 3.0f, 64,
+                3.3f, 2.11f, 
+                200.0f, 
+                2.5f,
+                1.5f);
+        // }
+
         dbg_printf("adc_raw_value: %d, %d, %d, %d, %d, %d\n", 
             adc_raw_value[0], adc_raw_value[1], adc_raw_value[2], 
             adc_raw_value[3], adc_raw_value[4], adc_raw_value[5]);
