@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include "delay.h"
 
+/* ads1256 HAL适配层 */
+
 static int ads1256_write(uint8_t *p_data, uint8_t nbytes)
 {
     HAL_StatusTypeDef ret;

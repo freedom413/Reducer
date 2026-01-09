@@ -490,6 +490,26 @@ int ads1256_calibration(ADS1256_t *ads1256, ads1256_calibration_t cal)
     return ret;
 }
 
+
+int ads1256_into_standby(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    ret = __ads1256_write_cmd(ads1256, ADS1256_CMD_STANDBY);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return ret;
+}
+
 int ads1256_low_order_enable(ADS1256_t *ads1256, bool enable)
 {
     if (!ads1256->is_init) {

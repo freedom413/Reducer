@@ -37,8 +37,8 @@ typedef enum ads1256_pin {
 } ads1256_pin_t;
 
 typedef enum ads1256_pin_op{
-    ADS1256_PIN_OP_HIGH = 0,
-    ADS1256_PIN_OP_LOW,
+    ADS1256_PIN_OP_LOW = 0,
+    ADS1256_PIN_OP_HIGH,
     ADS1256_PIN_OP_READ,
 } ads1256_pin_op_t;
 
@@ -128,8 +128,13 @@ typedef struct ads1256{
 }ADS1256_t;
 
 
-/* return value: < 0 means error, negative means success */
 
+
+/* first call ads1256_init function to initialize the ads1256 */
+
+/* api use For the usage method of the API, please refer to the official data manual. */
+
+/* return value: < 0 means error, negative means success */
 int ads1256_sync(ADS1256_t *ads1256);
 int ads1256_wakeup(ADS1256_t *ads1256);
 int ads1256_reset(ADS1256_t *ads1256);
@@ -139,6 +144,7 @@ int ads1256_read_data(ADS1256_t *ads1256, int32_t *p_data);
 int ads1256_continue_read_start(ADS1256_t *ads1256);
 int ads1256_continue_read_stop(ADS1256_t *ads1256);
 int ads1256_calibration(ADS1256_t *ads1256, ads1256_calibration_t cal);
+int ads1256_into_standby(ADS1256_t *ads1256);
 int ads1256_low_order_enable(ADS1256_t *ads1256, bool enable);
 int ads1256_auto_calibration_enable(ADS1256_t *ads1256, bool enable);
 int ads1256_buff_enable(ADS1256_t *ads1256, bool enable);
