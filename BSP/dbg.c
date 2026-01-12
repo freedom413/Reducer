@@ -4,6 +4,7 @@
 #include "usart.h"
 #include "dbg.h"
 
+#if 0
 /*  简易串口printf函数（支持%d, %u, %x, %s, %c）相比c库printf函数，节省了20kb 的空间 */
 void dbg_printf(const char *fmt, ...)
 {
@@ -16,5 +17,16 @@ void dbg_printf(const char *fmt, ...)
     
     if (len > 0) {
         HAL_UART_Transmit(DBG_UART, (uint8_t *)buffer, len, HAL_MAX_DELAY);
+    }
+}
+
+#endif
+
+void _putchar(char character)
+{
+    HAL_StatusTypeDef ret;
+    ret = HAL_UART_Transmit(DBG_UART, (uint8_t *)&character, 1, HAL_MAX_DELAY);
+    if(ret != HAL_OK) {
+        // error handle
     }
 }

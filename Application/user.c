@@ -1,5 +1,4 @@
 #include "ads1256.h"
-#include "stdio.h"
 #include <stdint.h>
 #include "dbg.h"
 #include "delay.h"
@@ -62,7 +61,7 @@ void setup(void)
     can_init();
     ret = adc_ads1256_init();
     if (ret < 0) {
-        dbg_printf("adc_ads1256_init failed, ret = %d\n", ret);
+        printf("adc_ads1256_init failed, ret = %d\n", ret);
     }
     //开始首次通道转换
     ads1256_set_ain_pin(&ads1256_a, adc_ch[adc_a_index].p, adc_ch[adc_a_index].n);
@@ -120,7 +119,7 @@ void loop(void)
                 1.5f);
         // }
 
-        dbg_printf("adc_raw_value: %d, %d, %d, %d, %d, %d\n", 
+            printf("adc_raw_value: %d, %d, %d, %d, %d, %d\n", 
             adc_raw_value[0], adc_raw_value[1], adc_raw_value[2], 
             adc_raw_value[3], adc_raw_value[4], adc_raw_value[5]);
     }

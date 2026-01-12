@@ -1,3 +1,9 @@
-[submodule "component/Ring-Buffer"]
-	path = component/Ring-Buffer
+[submodule "components/printf"]
+	path = components/printf
+	url = git@github.com:mpaland/printf.git
+[submodule "components/cJSON"]
+	path = components/cJSON
+	url = git@github.com:DaveGamble/cJSON.git
+[submodule "components/Ring-Buffer"]
+	path = components/Ring-Buffer
 	url = git@github.com:AndersKaloer/Ring-Buffer.git
