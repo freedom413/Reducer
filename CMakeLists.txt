@@ -45,12 +45,12 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    BSP/ads1256/ads1256.c
+    BSP/ads1256/ads1256_port.c
+    BSP/ads1256/driver/ads1256.c
     BSP/can.c
     BSP/dbg.c
     BSP/delay.c
     Application/user.c
-    Application/match/ads1256_match.c
     Application/algorithm/adc_conversion.c
     components/Ring-Buffer/ringbuffer.c
     components/cJSON/cJSON.c
@@ -63,7 +63,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     BSP
-    BSP/ads1256
+    BSP/ads1256/driver
+    Application
     Application/algorithm
     components/Ring-Buffer
     components/cJSON
