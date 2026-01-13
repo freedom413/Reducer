@@ -4,7 +4,7 @@
 #include "usart.h"
 #include "dbg.h"
 
-#if 0
+#ifndef  COM_DBG_PRINTF
 /*  简易串口printf函数（支持%d, %u, %x, %s, %c）相比c库printf函数，节省了20kb 的空间 */
 void dbg_printf(const char *fmt, ...)
 {
@@ -19,8 +19,7 @@ void dbg_printf(const char *fmt, ...)
         HAL_UART_Transmit(DBG_UART, (uint8_t *)buffer, len, HAL_MAX_DELAY);
     }
 }
-
-#endif
+#else 
 
 void _putchar(char character)
 {
@@ -30,3 +29,7 @@ void _putchar(char character)
         // error handle
     }
 }
+
+#endif
+
+
