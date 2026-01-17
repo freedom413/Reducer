@@ -127,16 +127,16 @@ int adc_ads1256_init(void)
 {
     int ret;
     ads1256_init(&ads1256_a, 
-                    ads1256_write, 
-                   ads1256_read, 
+                    ads1256_read, 
+                   ads1256_write, 
                   ads1256_a_pin_op, 
                 ads1256_delay_us);
 
 
 
     ads1256_init( &ads1256_b, 
-                     ads1256_write, 
-                    ads1256_read, 
+                     ads1256_read, 
+                    ads1256_write, 
                    ads1256_b_pin_op, 
                  ads1256_delay_us);
 
@@ -157,6 +157,12 @@ int adc_ads1256_init(void)
         return ret;
     }
     ret = ads1256_set_gpa(&ads1256_b, ADS1256_GPA_64);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ads1256_gpa_t gpa;
+    ret = ads1256_get_gpa(&ads1256_b, &gpa);
     if (ret < 0) {
         return ret;
     }

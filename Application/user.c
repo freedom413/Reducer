@@ -4,7 +4,7 @@
 #include "delay.h"
 #include "can.h"
 #include "adc_conversion.h"
-
+#include "fdcan.h"
 extern ADS1256_t ads1256_a;
 extern ADS1256_t ads1256_b;
 int adc_ads1256_init(void);
@@ -105,6 +105,15 @@ void loop(void)
         adc_b_index = adc_b_next_index;
     }
 
+    if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0) {
+        uint8_t RxData[8] = {0};
+        FDCAN_RxHeaderTypeDef RxHeader;
+    // 读取消息
+        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
+        {
+        //   ProcessCANMessage(&RxHeader, RxData);
+        }
+    }
     /* 所有通道转换完成 */
     if (adc_all_ch_mask == 0x3F) {
         adc_all_ch_mask = 0x00;
@@ -113,12 +122,13 @@ void loop(void)
         // for (int i = 0; i < 6; i++) {
             pressure[0] = get_pressure_basic(
                 adc_raw_value[0], 3.0f, 64,
-                3.3f, 2.11f, 
+                3.3f, 1.91f, 
                 200.0f, 
                 2.5f,
                 1.5f);
         // }
-
+           
+        can_send(0x55, (uint8_t *)&adc_raw_value[0], sizeof(adc_raw_value[0]));
             dbg_printf("adc_raw_value: %d, %d, %d, %d, %d, %d\n", 
             adc_raw_value[0], adc_raw_value[1], adc_raw_value[2], 
             adc_raw_value[3], adc_raw_value[4], adc_raw_value[5]);

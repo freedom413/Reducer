@@ -7,3 +7,6 @@
 [submodule "components/Ring-Buffer"]
 	path = components/Ring-Buffer
 	url = git@github.com:AndersKaloer/Ring-Buffer.git
+[submodule "components/FlashDB"]
+	path = components/FlashDB
+	url = https://github.com/armink/FlashDB.git
