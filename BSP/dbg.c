@@ -1,7 +1,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "stdio.h"
-#include "usart.h"
+// #include "usart.h"
 #include "dbg.h"
 
 #ifndef  COM_DBG_PRINTF
@@ -23,11 +23,11 @@ void dbg_printf(const char *fmt, ...)
 
 void _putchar(char character)
 {
-    HAL_StatusTypeDef ret;
-    ret = HAL_UART_Transmit(DBG_UART, (uint8_t *)&character, 1, HAL_MAX_DELAY);
-    if(ret != HAL_OK) {
-        // error handle
-    }
+    // HAL_StatusTypeDef ret;
+    // ret = HAL_UART_Transmit(DBG_UART, (uint8_t *)&character, 1, 0XFF);
+    // if(ret != HAL_OK) {
+    //     // error handle
+    // }
 }
 
 #endif

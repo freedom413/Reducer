@@ -149,10 +149,12 @@ int ads1256_low_order_enable(ADS1256_t *ads1256, bool enable);
 int ads1256_auto_calibration_enable(ADS1256_t *ads1256, bool enable);
 int ads1256_buff_enable(ADS1256_t *ads1256, bool enable);
 int ads1256_set_ain_pin(ADS1256_t *ads1256, ads1256_ain_t ainp, ads1256_ain_t ainn);
+int ads1256_get_ain_pin(ADS1256_t *ads1256, ads1256_ain_t *ainp, ads1256_ain_t *ainn);
 int ads1256_set_gpa(ADS1256_t *ads1256, ads1256_gpa_t gpa);
 int ads1256_get_gpa(ADS1256_t *ads1256, ads1256_gpa_t *p_gpa);
 int ads1256_set_sps(ADS1256_t *ads1256, ads1256_sps_t sps);
 int ads1256_get_sps(ADS1256_t *ads1256, ads1256_sps_t *p_sps);
+int ads1256_start_sync_conv(ADS1256_t *ads1256);
 int ads1256_init(ADS1256_t                 *ads1256, 
                  pfn_ads1256_io_t           read,
                  pfn_ads1256_io_t           write, 

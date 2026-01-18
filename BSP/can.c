@@ -1,9 +1,16 @@
-#include "fdcan.h"
+
 #include "stdint.h"
 #include <stdint.h>
+#include "can.h"
+#include "lwrb.h"
+
+static lwrb_t can_recv_ring;
+static char can_recv_msg_buf[CAN_MSG_BUFF_SIZE];
 
 int can_init(void)
 {
+    // 初始化接收消息缓冲区
+    lwrb_init(&can_recv_ring, can_recv_msg_buf, CAN_MSG_BUFF_SIZE);
     // 4. 启动FDCAN并激活接收中断
     HAL_FDCAN_Start(&hfdcan1);
     // 激活FIFO0新消息中断
@@ -11,15 +18,39 @@ int can_init(void)
     return 0;
 }
 
-int can_send(uint32_t id, uint8_t *data, uint32_t len)
+
+int can_data_len_get(uint32_t frame_len)
+{
+    if(frame_len <= 8 && frame_len >= FDCAN_DLC_BYTES_0) {
+        return frame_len;
+    }
+    else {
+        switch (frame_len) {
+            case FDCAN_DLC_BYTES_12: return 12; break;
+            case FDCAN_DLC_BYTES_16: return 16; break;
+            case FDCAN_DLC_BYTES_20: return 20; break;
+            case FDCAN_DLC_BYTES_24: return 24; break;
+            case FDCAN_DLC_BYTES_32: return 32; break;
+            case FDCAN_DLC_BYTES_48: return 48; break;
+            case FDCAN_DLC_BYTES_64: return 64; break;
+            default: return -1;  // 长度错误
+        }
+    }
+}
+
+
+int can_classic_data_frame_send(uint32_t id, uint8_t *data, uint32_t len)
 {
     FDCAN_TxHeaderTypeDef TxHeader;
     HAL_StatusTypeDef ret;
-    
     uint32_t send_len = len;
     uint8_t  current_len = 0;
 
-    TxHeader.Identifier = id; // 标准ID
+    if (data == NULL) {
+        return -2;
+    }
+
+    TxHeader.Identifier = id % 0x7FFu; // 标准ID
     TxHeader.IdType = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType = FDCAN_DATA_FRAME; // 数据帧
     // 关键：以下三个标志必须正确设置，以符合经典CAN格式
@@ -31,20 +62,10 @@ int can_send(uint32_t id, uint8_t *data, uint32_t len)
 
     do {
         current_len = send_len >= 8 ? 8 : send_len;
-        switch (len) {
-            case 1: TxHeader.DataLength = FDCAN_DLC_BYTES_1; break;
-            case 2: TxHeader.DataLength = FDCAN_DLC_BYTES_2; break;
-            case 3: TxHeader.DataLength = FDCAN_DLC_BYTES_3; break;
-            case 4: TxHeader.DataLength = FDCAN_DLC_BYTES_4; break;
-            case 5: TxHeader.DataLength = FDCAN_DLC_BYTES_5; break;
-            case 6: TxHeader.DataLength = FDCAN_DLC_BYTES_6; break;
-            case 7: TxHeader.DataLength = FDCAN_DLC_BYTES_7; break;
-            case 8: TxHeader.DataLength = FDCAN_DLC_BYTES_8; break;
-            default: return 0;  // 长度错误
-        }
+        TxHeader.DataLength = current_len;
         ret = HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, data);
         if (ret != HAL_OK) {
-            // 处理发送失败
+            return -3;  // 发送失败
         }
         data += current_len;
         send_len -= current_len;
@@ -53,47 +74,35 @@ int can_send(uint32_t id, uint8_t *data, uint32_t len)
     return (int)len;
 }
 
-int can_recv(uint32_t id, uint8_t *data, uint32_t len)
+int can_recv(can_msg_t *msg, uint32_t count)
 {
-    return -1;
+    return lwrb_read(&can_recv_ring, (char *)msg, count * sizeof(can_msg_t));
 }
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
-{
-  FDCAN_RxHeaderTypeDef RxHeader;
-  uint8_t RxData[64];  // 最大64字节
-  
-  // 检查中断类型
-  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)
-  {
-    // 从FIFO0读取消息
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
-    {
-      // 处理接收到的消息
-    //   ProcessCANMessage(&RxHeader, RxData);
+{  
+    static can_msg_t can_recv_msg;
+    // 检查中断类型
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET) {
+      // 从FIFO0读取消息
+      if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, 
+        &can_recv_msg.RxHeader, can_recv_msg.data) == HAL_OK){
+        // 处理接收到的消息
+        lwrb_write(&can_recv_ring, (char *)&can_recv_msg, sizeof(can_recv_msg));
+      }
+      else {
+        // 处理接收错误
+        return;
+      }
     }
-  }
-  
-  // 检查FIFO满中断
-  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_FULL) != RESET)
-  {
-    // // FIFO0已满，需要尽快处理数据
-    // printf("FDCAN FIFO0 Full!\n");
     
-    // // 可以一次性读取所有消息
-    // while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) > 0)
-    // {
-    //   if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
-    //   {
-    //     ProcessCANMessage(&RxHeader, RxData);
-    //   }
-    // }
-  }
-  
-  // 检查消息丢失中断
-  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) != RESET)
-  {
-    // printf("FDCAN FIFO0 Message Lost!\n");
-    // 可以记录错误计数或采取恢复措施
-  }
+    // 检查FIFO满中断
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_FULL) != RESET) {
+
+    }
+    
+    // 检查消息丢失中断
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) != RESET) {
+
+    }
 }

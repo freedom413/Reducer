@@ -563,6 +563,22 @@ int ads1256_set_ain_pin(ADS1256_t *ads1256, ads1256_ain_t ainp, ads1256_ain_t ai
     return ret;
 }
 
+int ads1256_get_ain_pin(ADS1256_t *ads1256, ads1256_ain_t *ainp, ads1256_ain_t *ainn)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret = 0;
+    uint8_t reg_val = 0;
+    ret = __ads1256_read_reg(ads1256, ADS1256_REG_MUX, &reg_val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    *ainp = (ads1256_ain_t)((reg_val & ADS1256_REG_MUX_PSEL_MASK) >> ADS1256_REG_MUX_PSEL_POS);
+    *ainn = (ads1256_ain_t)((reg_val & ADS1256_REG_MUX_NSEL_MASK) >> ADS1256_REG_MUX_NSEL_POS);
+    return ret;
+}
+
 
 int ads1256_set_gpa(ADS1256_t *ads1256, ads1256_gpa_t gpa)
 {
@@ -644,5 +660,22 @@ int ads1256_init(ADS1256_t                 *ads1256,
     ads1256->delay_us = delay_us;
     ads1256->is_init = true;
     return 0;
+}
+
+int ads1256_start_sync_conv(ADS1256_t *ads1256)
+{
+    if (!ads1256->is_init) {
+        return -1;
+    }
+    int ret;
+    ret = ads1256_sync(ads1256);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_wakeup(ads1256);
+    if (ret < 0) {
+        return ret;
+    }
+    return ret;
 }
 

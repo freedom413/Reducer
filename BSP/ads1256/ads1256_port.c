@@ -12,7 +12,7 @@
 static int ads1256_write(uint8_t *p_data, uint8_t nbytes)
 {
     HAL_StatusTypeDef ret;
-    ret = HAL_SPI_Transmit(&hspi1, p_data, nbytes, HAL_MAX_DELAY);
+    ret = HAL_SPI_Transmit(&hspi1, p_data, nbytes, 0xf);
     if(ret != HAL_OK) {
         return -1;
     } else {
@@ -23,7 +23,7 @@ static int ads1256_write(uint8_t *p_data, uint8_t nbytes)
 static int ads1256_read(uint8_t *p_data, uint8_t nbytes)
 {
     HAL_StatusTypeDef ret;
-    ret = HAL_SPI_Receive(&hspi1, p_data, nbytes, HAL_MAX_DELAY);
+    ret = HAL_SPI_Receive(&hspi1, p_data, nbytes, 0xf);
     if(ret != HAL_OK) {
         return -1;
     } else {
@@ -168,11 +168,11 @@ int adc_ads1256_init(void)
     }
 
     // 配置采样速率
-    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_3750);
+    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_100);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_3750);
+    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_100);
     if (ret < 0) {
         return ret;
     }
