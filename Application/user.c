@@ -8,6 +8,7 @@
 #include "ads1256_raw_data_recv.h"
 #include "user.h"
 
+void ads1256_int_enable(void);
 
 static uint8_t adc_all_ch_mask = 0x00;
 
@@ -20,11 +21,13 @@ void setup(void)
     delay_init();
     can_init();
     adc_ads1256_start();
+    // ads1256_int_enable(); 
 }
 
 
 void loop(void)
 {   
+    ads1256_drdy_callback();
     int recv_count = 0;
     ads1256_ch_t ch = {0};
     int a = 0;

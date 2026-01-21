@@ -166,17 +166,30 @@ int adc_ads1256_init(void)
     if (ret < 0) {
         return ret;
     }
+    ret = ads1256_get_gpa(&ads1256_a, &gpa);
+    if (ret < 0) {
+        return ret;
+    }
 
     // 配置采样速率
-    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_100);
+    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_2_5);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_100);
+    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_2_5);
     if (ret < 0) {
         return ret;
     }
-    
+    ads1256_sps_t sps;
+    ret = ads1256_get_sps(&ads1256_a, &sps);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_get_sps(&ads1256_b, &sps);
+    if (ret < 0) {
+        return ret;
+    }
+
     // 自校准
     ret = ads1256_calibration(&ads1256_a, ADS1256_CAL_SELF);
     if (ret < 0) {

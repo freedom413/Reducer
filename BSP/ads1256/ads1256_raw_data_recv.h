@@ -28,4 +28,6 @@ void adc_ads1256_start(void);
 int adc_ads1256_get_data(ads1256_data_t *data , uint32_t max_count);
 void ads1256_data_get_ch(ads1256_data_t *data, ads1256_ch_t *ch);
 
+void ads1256_drdy_callback(void);
+
 #endif /* __ADS1256_RAW_DATA_RECV_H__ */

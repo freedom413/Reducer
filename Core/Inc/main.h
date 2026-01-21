@@ -59,10 +59,8 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define ADC1_DRDY_Pin GPIO_PIN_0
 #define ADC1_DRDY_GPIO_Port GPIOA
-#define ADC1_DRDY_EXTI_IRQn EXTI0_IRQn
 #define ADC2_DRDY_Pin GPIO_PIN_1
 #define ADC2_DRDY_GPIO_Port GPIOA
-#define ADC2_DRDY_EXTI_IRQn EXTI1_IRQn
 #define ADC_SYNC_Pin GPIO_PIN_2
 #define ADC_SYNC_GPIO_Port GPIOA
 #define ADC_RESET_Pin GPIO_PIN_3

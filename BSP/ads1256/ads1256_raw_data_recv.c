@@ -65,51 +65,57 @@ int adc_ads1256_get_data(ads1256_data_t *data , uint32_t max_count)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
+    HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
+    volatile int a = 0;
+    while(a ++ < 100);
+    HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
+}
+void ads1256_drdy_callback(void)
+{
     static int32_t raw_value = 0;
     static ads1256_ch_t ch = {0};
     static ads1256_data_t adc_data = {0};
     static uint8_t adc_a_index = 0;
     static uint8_t adc_b_index = 0;
 
-    if (GPIO_Pin == ADC2_DRDY_Pin || GPIO_Pin == ADC1_DRDY_Pin) {
-        HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
-        if (ads1256_is_data_ready(&ads1256_a)) {
-            /* 先获取当前转换完成的通道号 */
-            ads1256_get_ain_pin(&ads1256_a, &ch.p, &ch.n);
-            /* 切换到下一组通道 */
-            adc_a_index = (adc_a_index + 1) % ARR_LEN(ads1235_a_ch);
-            /* 配置下一个待检测ain通道 */
-            ads1256_set_ain_pin(&ads1256_a, ads1235_a_ch[adc_a_index].p, ads1235_a_ch[adc_a_index].n);
-            /* 开始下一次转换 */
-            ads1256_start_sync_conv(&ads1256_a);
-            /* 读取上一次转换结果 */
-            ads1256_read_data(&ads1256_a, &raw_value);
-            /* 汇总通道信息 */
-            ads1256_data_set_ch(&adc_data, ch);
-            adc_data.raw_value = raw_value;
-            adc_data.pid = ADS1256_A;
-            /* 写入数据缓冲区，满则覆盖旧数据 */
-            lwrb_overwrite(&ads1256_data_rb, (const char *)&adc_data, sizeof(adc_data));
-        }
 
-        if (ads1256_is_data_ready(&ads1256_b)) {
-            /* 先获取当前转换完成的通道号 */
-            ads1256_get_ain_pin(&ads1256_b, &ch.p, &ch.n);
-            /* 切换到下一组通道 */
-            adc_b_index = (adc_b_index + 1) % ARR_LEN(ads1235_b_ch);
-            /* 配置下一个待检测ain通道 */
-            ads1256_set_ain_pin(&ads1256_b, ads1235_b_ch[adc_b_index].p, ads1235_b_ch[adc_b_index].n);
-            /* 开始下一次转换 */
-            ads1256_start_sync_conv(&ads1256_b);
-            /* 读取上一次转换结果 */
-            ads1256_read_data(&ads1256_b, &raw_value);
-            /* 汇总通道信息 */
-            ads1256_data_set_ch(&adc_data, ch);
-            adc_data.raw_value = raw_value;
-            adc_data.pid = ADS1256_B;
-            /* 写入数据缓冲区，满则覆盖旧数据 */
-            lwrb_overwrite(&ads1256_data_rb, (const char *)&adc_data, sizeof(adc_data));
-        }
+    if (ads1256_is_data_ready(&ads1256_a)) {
+        HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
+        /* 先获取当前转换完成的通道号 */
+        ads1256_get_ain_pin(&ads1256_a, &ch.p, &ch.n);
+        /* 切换到下一组通道 */
+        adc_a_index = (adc_a_index + 1) % ARR_LEN(ads1235_a_ch);
+        /* 配置下一个待检测ain通道 */
+        ads1256_set_ain_pin(&ads1256_a, ads1235_a_ch[adc_a_index].p, ads1235_a_ch[adc_a_index].n);
+        /* 开始下一次转换 */
+        ads1256_start_sync_conv(&ads1256_a);
+        /* 读取上一次转换结果 */
+        ads1256_read_data(&ads1256_a, &raw_value);
+        /* 汇总通道信息 */
+        ads1256_data_set_ch(&adc_data, ch);
+        adc_data.raw_value = raw_value;
+        adc_data.pid = ADS1256_A;
+        /* 写入数据缓冲区，满则覆盖旧数据 */
+        lwrb_overwrite(&ads1256_data_rb, (const char *)&adc_data, sizeof(adc_data));
         HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_RESET);
+    }
+
+    if (ads1256_is_data_ready(&ads1256_b)) {
+        /* 先获取当前转换完成的通道号 */
+        ads1256_get_ain_pin(&ads1256_b, &ch.p, &ch.n);
+        /* 切换到下一组通道 */
+        adc_b_index = (adc_b_index + 1) % ARR_LEN(ads1235_b_ch);
+        /* 配置下一个待检测ain通道 */
+        ads1256_set_ain_pin(&ads1256_b, ads1235_b_ch[adc_b_index].p, ads1235_b_ch[adc_b_index].n);
+        /* 开始下一次转换 */
+        ads1256_start_sync_conv(&ads1256_b);
+        /* 读取上一次转换结果 */
+        ads1256_read_data(&ads1256_b, &raw_value);
+        /* 汇总通道信息 */
+        ads1256_data_set_ch(&adc_data, ch);
+        adc_data.raw_value = raw_value;
+        adc_data.pid = ADS1256_B;
+        /* 写入数据缓冲区，满则覆盖旧数据 */
+        lwrb_overwrite(&ads1256_data_rb, (const char *)&adc_data, sizeof(adc_data));
     }
 }

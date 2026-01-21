@@ -13,7 +13,7 @@
 #define  T16      ((4U * 1000000U / FCLK) + 1) 
 
 
-#define  DRDY_WAIT_COUNT  (30)
+#define  DRDY_WAIT_COUNT  (1200)
 /**
 ADDRESS REGISTER RESET
 VALUE BIT 7 BIT 6 BIT 5 BIT 4 BIT 3 BIT 2 BIT 1 BIT 0
@@ -276,24 +276,12 @@ nopin:
     }
 }
 
-int ads1256_is_data_ready_wait(ADS1256_t *ads1256, uint32_t try_count)
+static void ads1256_is_data_ready_wait(ADS1256_t *ads1256)
 {
-    int ret = 0;
-    int i = 0;
-    while (true) {
-        ret = ads1256_is_data_ready(ads1256);
-        if (ret < 0) {
-            return ret;
-        }
-        if (ret == 1) {
-            break;
-        }
-        if (++i >= try_count) {
-            return -2;
-        }
-        ads1256->delay_us(T11_4);
+
+    while (!ads1256_is_data_ready(ads1256)) {
+        ;
     }
-    return ret;
 }
 
 
@@ -368,10 +356,10 @@ nopin:
         if (ret < 0) {
             return ret;
         }
-        ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
-        if (ret < 0) {
-            return ret;
-        }
+    }
+    ads1256_is_data_ready_wait(ads1256);
+    if (ret < 0) {
+        return ret;
     }
     return ret;
 }
@@ -427,7 +415,7 @@ int ads1256_continue_read_start(ADS1256_t *ads1256)
         return -1;
     }
     int ret = 0;
-    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
+    ads1256_is_data_ready_wait(ads1256);
     if (ret < 0) {
         return ret;
     }
@@ -450,10 +438,8 @@ int ads1256_continue_read_stop(ADS1256_t *ads1256)
         return -1;
     }
     int ret = 0;
-    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
-    if (ret < 0) {
-        return ret;
-    }
+    ads1256_is_data_ready_wait(ads1256);
+
     ret =  __ads1256_write_cmd(ads1256, ADS1256_CMD_SDATAC);
     if (ret < 0) {
         return ret;
@@ -475,11 +461,8 @@ int ads1256_calibration(ADS1256_t *ads1256, ads1256_calibration_t cal)
     if (ret < 0) {
         return ret;
     }
-    
-    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
-    if (ret < 0) {
-        return ret;
-    }
+
+    ads1256_is_data_ready_wait(ads1256);
 
     return ret;
 }
@@ -496,11 +479,7 @@ int ads1256_into_standby(ADS1256_t *ads1256)
         return ret;
     }
     
-    ret = ads1256_is_data_ready_wait(ads1256, DRDY_WAIT_COUNT);
-    if (ret < 0) {
-        return ret;
-    }
-
+    ads1256_is_data_ready_wait(ads1256);
     return ret;
 }
 
