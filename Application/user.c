@@ -7,14 +7,15 @@
 #include "fdcan.h"
 #include "ads1256_raw_data_recv.h"
 #include "user.h"
+#include "can_data.h"
 
 void ads1256_int_enable(void);
 
 static uint8_t adc_all_ch_mask = 0x00;
 
-static int adc_raw_value[6] = {0};
-
+static int32_t adc_raw_value[6] = {0};
 static ads1256_data_t adc_ads1256_data[6] = {0};
+
 
 void setup(void)
 {   
@@ -51,8 +52,8 @@ void loop(void)
         else if (adc_ads1256_data[i].pid == ADS1256_B) {
             for (j = 0; j < ARR_LEN(ads1235_b_ch); j++) {
                 if (ads1235_b_ch[j].p == ch.p && ads1235_b_ch[j].n == ch.n) {
-                    adc_raw_value[j + ARR_LEN(ads1235_a_ch)] = adc_ads1256_data[i].raw_value;
-                    adc_all_ch_mask |= (0x01 << (j + ARR_LEN(ads1235_a_ch)));
+                    adc_raw_value[j + ARR_LEN(ads1235_b_ch)] = adc_ads1256_data[i].raw_value;
+                    adc_all_ch_mask |= (0x01 << (j + ARR_LEN(ads1235_b_ch)));
                     break;
                 }
             }
@@ -63,10 +64,16 @@ void loop(void)
     }
     /* 所有通道转换完成 */
     if (adc_all_ch_mask == 0x3F) {
-        adc_all_ch_mask = 0x00;           
-        can_classic_data_frame_send(0x55, (uint8_t *)&adc_raw_value[0], sizeof(adc_raw_value[0]));
-            dbg_printf("adc_raw_value: %d, %d, %d, %d, %d, %d\n", 
-            adc_raw_value[0], adc_raw_value[1], adc_raw_value[2], 
-            adc_raw_value[3], adc_raw_value[4], adc_raw_value[5]);
+        adc_all_ch_mask = 0x00;
+        for (int i = 0; i < ARR_LEN(adc_raw_value); i++) {
+            int16_t voltage = ads1256_raw_to_voltage(adc_raw_value[i],3.0f,64) * 1000000;
+            can_data_t data;
+            can_data_conv(i, voltage, voltage, voltage, &data);
+            can_classic_data_frame_send(0x55, (uint8_t *)&data, sizeof(data));
+        }
+
+            // dbg_printf("adc_raw_value: %d, %d, %d, %d, %d, %d\n", 
+            // adc_raw_value[0], adc_raw_value[1], adc_raw_value[2], 
+            // adc_raw_value[3], adc_raw_value[4], adc_raw_value[5]);
     }
 }

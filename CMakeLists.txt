@@ -58,6 +58,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     components/cJSON/cJSON.c
     components/cJSON/cJSON_Utils.c
     components/printf/printf.c
+    Application/algorithm/can_data.c
 
 )
 
