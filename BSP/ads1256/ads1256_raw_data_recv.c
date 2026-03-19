@@ -65,10 +65,8 @@ int adc_ads1256_get_data(ads1256_data_t *data , uint32_t max_count)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
-    volatile int a = 0;
-    while(a ++ < 100);
-    HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
+    (void)GPIO_Pin;
+    // Removed busy-wait loop - was blocking interrupts
 }
 void ads1256_drdy_callback(void)
 {
