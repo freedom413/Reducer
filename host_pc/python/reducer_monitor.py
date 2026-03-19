@@ -26,7 +26,6 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QPushButton, QComboBox,
     QSpinBox, QDoubleSpinBox, QTextEdit, QStatusBar, QFileDialog,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderStretchRole
 )
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QFont

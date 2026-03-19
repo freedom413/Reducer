@@ -33,6 +33,11 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 
+# CAN ID definitions (must match embedded firmware)
+CAN_ID_TX_DATA = 0x101  # Data from device to host
+CAN_ID_RX_CONFIG = 0x100  # Config commands from host to device
+
+
 # SLCAN baudrate codes
 class Baudrate(Enum):
     BAUD_10K = ('S0', 10000)
