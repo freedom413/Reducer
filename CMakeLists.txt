@@ -59,6 +59,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     components/cJSON/cJSON_Utils.c
     components/printf/printf.c
     Application/algorithm/can_data.c
+    Application/algorithm/filter.c
+    Application/algorithm/flexspline_math.c
 
 )
 
