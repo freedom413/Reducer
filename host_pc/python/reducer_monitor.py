@@ -35,7 +35,22 @@ import pyqtgraph as pg
 
 # Serial/CAN
 import serial.tools.list_ports
+import struct
 from slcan_protocol import SLCANProtocol, CANFrame, Baudrate, list_serial_ports
+
+
+def crc16_ccitt(data: bytes) -> int:
+    """Calculate CRC-16-CCITT (polynomial 0x1021, initial 0xFFFF)"""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
 
 # Constants
 from slcan_protocol import CAN_ID_TX_DATA, CAN_ID_RX_CONFIG
@@ -45,6 +60,12 @@ CAN_FRAME_VOLTAGE = 0x01
 CAN_FRAME_STRAIN = 0x02
 CAN_FRAME_STRESS = 0x03
 CAN_FRAME_DISP = 0x04
+
+# Command types (must match embedded firmware)
+CAN_CMD_SET_SAMPLE_RATE = 0x01
+CAN_CMD_SET_FILTER_SIZE = 0x02
+CAN_CMD_ZERO_DATUM = 0x03
+CAN_CMD_START_CALIB = 0x04
 
 # Number of channels
 NUM_CHANNELS = 6
@@ -144,6 +165,10 @@ class ReducerMonitorWindow(QMainWindow):
         # Connection group
         conn_group = self._create_connection_group()
         main_layout.addWidget(conn_group)
+
+        # Command group
+        cmd_group = self._create_command_group()
+        main_layout.addWidget(cmd_group)
 
         # Tab widget for waveforms and data
         tabs = QTabWidget()
@@ -298,6 +323,53 @@ class ReducerMonitorWindow(QMainWindow):
         else:
             self.connect()
 
+    def send_command(self, cmd_type: int, param: int = 0, value: int = 0) -> bool:
+        """Send command to embedded device"""
+        if not self.slcan or not self.is_connected:
+            return False
+        data = struct.pack('<BB', cmd_type, param)
+        data += struct.pack('<I', value)
+        frame = CANFrame(id=CAN_ID_RX_CONFIG, data=data, is_extended=False, is_remote=False)
+        return self.slcan.send_frame(frame)
+
+    def on_zero_clicked(self):
+        """Handle Zero Sensor button click"""
+        if self.send_command(CAN_CMD_ZERO_DATUM):
+            self.status_bar.showMessage("Zero command sent")
+            logger.info("Zero command sent")
+        else:
+            self.status_bar.showMessage("Failed to send zero command")
+            logger.warning("Failed to send zero command")
+
+    def on_calib_clicked(self):
+        """Handle Calibrate button click"""
+        if self.send_command(CAN_CMD_START_CALIB):
+            self.status_bar.showMessage("Calibration command sent")
+            logger.info("Calibration command sent")
+        else:
+            self.status_bar.showMessage("Failed to send calibration command")
+            logger.warning("Failed to send calibration command")
+
+    def _create_command_group(self) -> QGroupBox:
+        """Create the command control group"""
+        group = QGroupBox("Commands")
+        layout = QHBoxLayout()
+
+        self.zero_btn = QPushButton("Zero Sensor")
+        self.zero_btn.clicked.connect(self.on_zero_clicked)
+        self.zero_btn.setEnabled(False)
+        layout.addWidget(self.zero_btn)
+
+        self.calib_btn = QPushButton("Calibrate")
+        self.calib_btn.clicked.connect(self.on_calib_clicked)
+        self.calib_btn.setEnabled(False)
+        layout.addWidget(self.calib_btn)
+
+        layout.addStretch()
+
+        group.setLayout(layout)
+        return group
+
     def connect(self):
         """Connect to the CAN adapter"""
         port = self.port_combo.currentData()
@@ -327,6 +399,8 @@ class ReducerMonitorWindow(QMainWindow):
             self.is_connected = True
             self.connect_btn.setText("Disconnect")
             self.log_btn.setEnabled(True)
+            self.zero_btn.setEnabled(True)
+            self.calib_btn.setEnabled(True)
             self.status_bar.showMessage(f"Connected to {port} at {baudrate.bps} bps")
 
             logger.info(f"Connected to {port}")
@@ -353,6 +427,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.is_connected = False
         self.connect_btn.setText("Connect")
         self.log_btn.setEnabled(False)
+        self.zero_btn.setEnabled(False)
+        self.calib_btn.setEnabled(False)
         self.status_bar.showMessage("Disconnected")
         logger.info("Disconnected")
 
@@ -364,6 +440,15 @@ class ReducerMonitorWindow(QMainWindow):
         if len(frame.data) < 8:
             logger.warning(f"Short frame received: {len(frame.data)} bytes")
             return
+
+        # Verify CRC (bytes 6-7 contain CRC-16-CCITT of first 6 bytes)
+        data_for_crc = frame.data[:6]
+        received_crc = struct.unpack('>H', frame.data[6:8])[0]
+        calculated_crc = crc16_ccitt(data_for_crc)
+
+        if received_crc != calculated_crc:
+            logger.warning(f"CRC mismatch: received=0x{received_crc:04X}, calculated=0x{calculated_crc:04X}")
+            return  # Discard bad frame
 
         # Parse frame (matches can_tx_frame_t from firmware)
         # Byte 0: frame_type

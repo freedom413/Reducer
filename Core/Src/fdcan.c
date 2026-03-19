@@ -61,6 +61,19 @@ void MX_FDCAN1_Init(void)
   }
   /* USER CODE BEGIN FDCAN1_Init 2 */
 
+  /* Configure filter to accept only CAN_ID_RX_CONFIG (0x100) */
+  FDCAN_FilterTypeDef sFilterConfig;
+  sFilterConfig.IdType = FDCAN_STANDARD_ID;
+  sFilterConfig.FilterIndex = 0;
+  sFilterConfig.FilterID1 = CAN_ID_RX_CONFIG;
+  sFilterConfig.FilterID2 = CAN_ID_RX_CONFIG;
+  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  sFilterConfig.FilterType = FDCAN_FILTER_DUAL;
+
+  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) {
+    Error_Handler();
+  }
+
   /* USER CODE END FDCAN1_Init 2 */
 
 }
