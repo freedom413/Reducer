@@ -70,39 +70,71 @@ static void update_statistics(uint8_t ch, int32_t value)
     running_var[ch] += delta * delta2;
 }
 
+static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
+{
+    (void)param;
+    (void)value;
+
+    switch (cmd_type) {
+        case CAN_CMD_ZERO_DATUM:
+            filter_reset_all();
+            for (int i = 0; i < 6; i++) {
+                running_mean[i] = 0;
+                running_var[i] = 0;
+                adc_filtered_value[i] = 0;
+            }
+            sample_count = 0;
+            break;
+        case CAN_CMD_SET_FILTER_SIZE:
+            /* Future: implement configurable filter */
+            break;
+        default:
+            break;
+    }
+}
+
 void loop(void)
 {
+    /* Process incoming CAN commands FIRST */
+    can_msg_t msg;
+    if (can_recv(&msg, 1) > 0) {
+        if (msg.RxHeader.Identifier == CAN_ID_RX_CONFIG &&
+            msg.RxHeader.DataLength >= 6) {
+            /* Parse command frame (matches can_rx_frame_t) */
+            uint8_t cmd_type = msg.data[0];
+            uint8_t param = msg.data[1];
+            uint32_t value = ((uint32_t)msg.data[2]) |
+                             ((uint32_t)msg.data[3] << 8) |
+                             ((uint32_t)msg.data[4] << 16) |
+                             ((uint32_t)msg.data[5] << 24);
+            process_can_command(cmd_type, param, value);
+        }
+    }
+
     ads1256_drdy_callback();
-    int recv_count = 0;
-    ads1256_ch_t ch = {0};
-    int i;
-    int j;
 
-    recv_count = adc_ads1256_get_data(adc_ads1256_data, 6);
+    int recv_count = adc_ads1256_get_data(adc_ads1256_data, 6);
 
-    for (i = 0; i < recv_count; i++) {
+    for (int i = 0; i < recv_count; i++) {
+        ads1256_ch_t ch;
         ads1256_data_get_ch(&adc_ads1256_data[i], &ch);
 
         if (adc_ads1256_data[i].pid == ADS1256_A) {
-            for (j = 0; j < ARR_LEN(ads1235_a_ch); j++) {
+            for (int j = 0; j < ARR_LEN(ads1235_a_ch); j++) {
                 if (ads1235_a_ch[j].p == ch.p && ads1235_a_ch[j].n == ch.n) {
                     adc_raw_value[j] = adc_ads1256_data[i].raw_value;
                     adc_all_ch_mask |= (0x01 << j);
                     break;
                 }
             }
-        }
-        else if (adc_ads1256_data[i].pid == ADS1256_B) {
-            for (j = 0; j < ARR_LEN(ads1235_b_ch); j++) {
+        } else if (adc_ads1256_data[i].pid == ADS1256_B) {
+            for (int j = 0; j < ARR_LEN(ads1235_b_ch); j++) {
                 if (ads1235_b_ch[j].p == ch.p && ads1235_b_ch[j].n == ch.n) {
                     adc_raw_value[j + ARR_LEN(ads1235_b_ch)] = adc_ads1256_data[i].raw_value;
                     adc_all_ch_mask |= (0x01 << (j + ARR_LEN(ads1235_b_ch)));
                     break;
                 }
             }
-        }
-        else {
-            // error - unknown PID
         }
     }
 
@@ -112,7 +144,6 @@ void loop(void)
 
         /* Process each channel: filter -> outlier check -> calculate -> send */
         for (int i = 0; i < 6; i++) {
-            /* Apply moving average filter */
             int32_t filtered = filter_apply((uint8_t)i, adc_raw_value[i]);
 
             /* Check for outliers (skip if first few samples) */
@@ -129,33 +160,22 @@ void loop(void)
             flexspline_calculate(filtered, &flexspline_params, &result);
 
             /* Send voltage frame (frame_type=0x01) */
-            {
-                can_tx_frame_t frame;
-                int16_t voltage_mv = (int16_t)(result.voltage * 10); // x0.1 mV -> keep precision
-                int16_t voltage_frac = (int16_t)((result.voltage * 10 - voltage_mv) * 100);
-                can_build_tx_frame(&frame, CAN_FRAME_VOLTAGE, (uint8_t)i,
-                                   voltage_mv, voltage_frac);
-                can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
-            }
+            can_tx_frame_t frame;
+            int16_t voltage_mv = (int16_t)lrintf(result.voltage * 10);
+            int16_t voltage_frac = (int16_t)lrintf((result.voltage * 10 - voltage_mv) * 100);
+            can_build_tx_frame(&frame, CAN_FRAME_VOLTAGE, (uint8_t)i, voltage_mv, voltage_frac);
+            can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
 
             /* Send strain frame (frame_type=0x02) */
-            {
-                can_tx_frame_t frame;
-                int16_t strain_val = (int16_t)result.strain;  // micro-strain
-                can_build_tx_frame(&frame, CAN_FRAME_STRAIN, (uint8_t)i,
-                                   strain_val, 0);
-                can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
-            }
+            int16_t strain_val = (int16_t)result.strain;
+            can_build_tx_frame(&frame, CAN_FRAME_STRAIN, (uint8_t)i, strain_val, 0);
+            can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
 
             /* Send stress frame (frame_type=0x03) */
-            {
-                can_tx_frame_t frame;
-                int16_t stress_val = (int16_t)(result.stress * 100); // x0.01 MPa
-                int16_t stress_frac = (int16_t)((result.stress * 100 - stress_val) * 100);
-                can_build_tx_frame(&frame, CAN_FRAME_STRESS, (uint8_t)i,
-                                   stress_val, stress_frac);
-                can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
-            }
+            int16_t stress_val = (int16_t)lrintf(result.stress * 100);
+            int16_t stress_frac = (int16_t)lrintf((result.stress * 100 - stress_val) * 100);
+            can_build_tx_frame(&frame, CAN_FRAME_STRESS, (uint8_t)i, stress_val, stress_frac);
+            can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
         }
     }
 }

@@ -4,8 +4,8 @@
 #include <stdint.h>
 
 // CAN ID definitions
-#define CAN_ID_TX_DATA     0x55   // Downlink: STM32 -> PC
-#define CAN_ID_RX_CONFIG  0x56   // Uplink: PC -> STM32
+#define CAN_ID_TX_DATA     0x101  // Downlink: STM32 -> PC
+#define CAN_ID_RX_CONFIG   0x100  // Uplink: PC -> STM32
 
 // Frame type definitions
 #define CAN_FRAME_VOLTAGE  0x01   // Raw voltage data
