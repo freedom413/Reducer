@@ -39,33 +39,27 @@ import struct
 from slcan_protocol import SLCANProtocol, CANFrame, Baudrate, list_serial_ports
 
 
-def crc16_ccitt(data: bytes) -> int:
-    """Calculate CRC-16-CCITT (polynomial 0x1021, initial 0xFFFF)"""
-    crc = 0xFFFF
+def crc8_xor(data: bytes) -> int:
+    """Calculate CRC-8 XOR checksum (for combined frames)"""
+    crc = 0
     for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = (crc << 1) ^ 0x1021
-            else:
-                crc <<= 1
-            crc &= 0xFFFF
+        crc ^= byte
     return crc
 
 # Constants
 from slcan_protocol import CAN_ID_TX_DATA, CAN_ID_RX_CONFIG
 
-# Frame type definitions (must match embedded firmware)
-CAN_FRAME_VOLTAGE = 0x01
-CAN_FRAME_STRAIN = 0x02
-CAN_FRAME_STRESS = 0x03
-CAN_FRAME_DISP = 0x04
+# Frame type - only combined frame (0x05) is used
+CAN_FRAME_COMBINED = 0x05
 
 # Command types (must match embedded firmware)
 CAN_CMD_SET_SAMPLE_RATE = 0x01
 CAN_CMD_SET_FILTER_SIZE = 0x02
 CAN_CMD_ZERO_DATUM = 0x03
 CAN_CMD_START_CALIB = 0x04
+CAN_CMD_SAVE_ZERO = 0x05
+CAN_CMD_LOAD_ZERO = 0x06
+CAN_CMD_CLEAR_ZERO = 0x07
 
 # Number of channels
 NUM_CHANNELS = 6
@@ -333,10 +327,10 @@ class ReducerMonitorWindow(QMainWindow):
         return self.slcan.send_frame(frame)
 
     def on_zero_clicked(self):
-        """Handle Zero Sensor button click"""
+        """Handle Zero Sensor button click - saves zero offset to Flash"""
         if self.send_command(CAN_CMD_ZERO_DATUM):
-            self.status_bar.showMessage("Zero command sent")
-            logger.info("Zero command sent")
+            self.status_bar.showMessage("Zero calibration saved to Flash")
+            logger.info("Zero calibration saved to Flash")
         else:
             self.status_bar.showMessage("Failed to send zero command")
             logger.warning("Failed to send zero command")
@@ -349,6 +343,41 @@ class ReducerMonitorWindow(QMainWindow):
         else:
             self.status_bar.showMessage("Failed to send calibration command")
             logger.warning("Failed to send calibration command")
+
+    def on_filter_size_changed(self, value):
+        """Handle filter size spinbox change"""
+        if self.send_command(CAN_CMD_SET_FILTER_SIZE, param=0, value=value):
+            logger.info(f"Filter size set to {value}")
+        else:
+            self.status_bar.showMessage("Failed to send filter size command")
+            logger.warning("Failed to send filter size command")
+
+    def on_save_zero_clicked(self):
+        """Handle Save Zero button click - saves current offsets to Flash"""
+        if self.send_command(CAN_CMD_SAVE_ZERO):
+            self.status_bar.showMessage("Zero offset saved to Flash")
+            logger.info("Zero offset saved to Flash")
+        else:
+            self.status_bar.showMessage("Failed to save zero offset")
+            logger.warning("Failed to save zero offset")
+
+    def on_load_zero_clicked(self):
+        """Handle Load Zero button click - loads offsets from Flash"""
+        if self.send_command(CAN_CMD_LOAD_ZERO):
+            self.status_bar.showMessage("Zero offset loaded from Flash")
+            logger.info("Zero offset loaded from Flash")
+        else:
+            self.status_bar.showMessage("Failed to load zero offset")
+            logger.warning("Failed to load zero offset")
+
+    def on_clear_zero_clicked(self):
+        """Handle Clear Zero button click - clears offsets from Flash"""
+        if self.send_command(CAN_CMD_CLEAR_ZERO):
+            self.status_bar.showMessage("Zero offset cleared from Flash")
+            logger.info("Zero offset cleared from Flash")
+        else:
+            self.status_bar.showMessage("Failed to clear zero offset")
+            logger.warning("Failed to clear zero offset")
 
     def _create_command_group(self) -> QGroupBox:
         """Create the command control group"""
@@ -364,6 +393,32 @@ class ReducerMonitorWindow(QMainWindow):
         self.calib_btn.clicked.connect(self.on_calib_clicked)
         self.calib_btn.setEnabled(False)
         layout.addWidget(self.calib_btn)
+
+        # Zero offset Flash storage controls
+        self.save_zero_btn = QPushButton("Save Zero")
+        self.save_zero_btn.clicked.connect(self.on_save_zero_clicked)
+        self.save_zero_btn.setEnabled(False)
+        layout.addWidget(self.save_zero_btn)
+
+        self.load_zero_btn = QPushButton("Load Zero")
+        self.load_zero_btn.clicked.connect(self.on_load_zero_clicked)
+        self.load_zero_btn.setEnabled(False)
+        layout.addWidget(self.load_zero_btn)
+
+        self.clear_zero_btn = QPushButton("Clear Zero")
+        self.clear_zero_btn.clicked.connect(self.on_clear_zero_clicked)
+        self.clear_zero_btn.setEnabled(False)
+        layout.addWidget(self.clear_zero_btn)
+
+        # Filter size control
+        layout.addWidget(QLabel("Filter Size:"))
+        self.filter_size_spin = QSpinBox()
+        self.filter_size_spin.setMinimum(2)
+        self.filter_size_spin.setMaximum(64)
+        self.filter_size_spin.setValue(16)
+        self.filter_size_spin.setEnabled(False)
+        self.filter_size_spin.valueChanged.connect(self.on_filter_size_changed)
+        layout.addWidget(self.filter_size_spin)
 
         layout.addStretch()
 
@@ -401,6 +456,10 @@ class ReducerMonitorWindow(QMainWindow):
             self.log_btn.setEnabled(True)
             self.zero_btn.setEnabled(True)
             self.calib_btn.setEnabled(True)
+            self.save_zero_btn.setEnabled(True)
+            self.load_zero_btn.setEnabled(True)
+            self.clear_zero_btn.setEnabled(True)
+            self.filter_size_spin.setEnabled(True)
             self.status_bar.showMessage(f"Connected to {port} at {baudrate.bps} bps")
 
             logger.info(f"Connected to {port}")
@@ -429,11 +488,15 @@ class ReducerMonitorWindow(QMainWindow):
         self.log_btn.setEnabled(False)
         self.zero_btn.setEnabled(False)
         self.calib_btn.setEnabled(False)
+        self.save_zero_btn.setEnabled(False)
+        self.load_zero_btn.setEnabled(False)
+        self.clear_zero_btn.setEnabled(False)
+        self.filter_size_spin.setEnabled(False)
         self.status_bar.showMessage("Disconnected")
         logger.info("Disconnected")
 
     def on_can_frame_received(self, frame: CANFrame):
-        """Handle received CAN frame"""
+        """Handle received CAN frame - only combined frame format (0x05)"""
         if frame.id != CAN_ID_TX_DATA:
             return
 
@@ -441,47 +504,42 @@ class ReducerMonitorWindow(QMainWindow):
             logger.warning(f"Short frame received: {len(frame.data)} bytes")
             return
 
-        # Verify CRC (bytes 6-7 contain CRC-16-CCITT of first 6 bytes)
-        data_for_crc = frame.data[:6]
-        received_crc = struct.unpack('>H', frame.data[6:8])[0]
-        calculated_crc = crc16_ccitt(data_for_crc)
-
-        if received_crc != calculated_crc:
-            logger.warning(f"CRC mismatch: received=0x{received_crc:04X}, calculated=0x{calculated_crc:04X}")
-            return  # Discard bad frame
-
-        # Parse frame (matches can_tx_frame_t from firmware)
-        # Byte 0: frame_type
-        # Byte 1: channel
-        # Byte 2-3: value (int16, big-endian)
-        # Byte 4-5: value_frac
-        # Byte 6-7: crc16
-
         frame_type = frame.data[0]
         channel = frame.data[1]
-        value = int.from_bytes(frame.data[2:4], byteorder='big', signed=True)
-        value_frac = int.from_bytes(frame.data[4:6], byteorder='big', signed=True)
 
         if channel >= NUM_CHANNELS:
             logger.warning(f"Invalid channel: {channel}")
             return
 
-        # Update channel data based on frame type
-        with self.lock:
-            if frame_type == CAN_FRAME_VOLTAGE:
-                # Voltage in 0.1 mV, frac in 0.01 mV
-                self.channel_data[channel].voltage = value / 10.0 + value_frac / 1000.0
-            elif frame_type == CAN_FRAME_STRAIN:
-                # Strain in micro-strain
-                self.channel_data[channel].strain = float(value)
-            elif frame_type == CAN_FRAME_STRESS:
-                # Stress in 0.01 MPa, frac in 0.0001 MPa
-                self.channel_data[channel].stress = value / 100.0 + value_frac / 100000.0
-            elif frame_type == CAN_FRAME_DISP:
-                # Displacement in micro-meters
-                self.channel_data[channel].displacement = float(value)
+        # Only handle combined frame format (frame_type=0x05)
+        if frame_type != CAN_FRAME_COMBINED:
+            logger.warning(f"Unknown frame type: 0x{frame_type:02X}")
+            return
 
-        # Emit signal for UI update
+        # Combined frame format: all data in one frame
+        # Byte 0: frame_type (0x05)
+        # Byte 1: channel
+        # Bytes 2-3: voltage (int16, BE, 0.1 mV)
+        # Bytes 4-5: strain (int16, BE, µε)
+        # Byte 6: stress (int8, signed, 0.1 MPa)
+        # Byte 7: crc8 (XOR checksum of bytes 0-6)
+
+        # Verify CRC-8
+        received_crc = frame.data[7]
+        calculated_crc = crc8_xor(frame.data[:7])
+        if received_crc != calculated_crc:
+            logger.warning(f"CRC-8 mismatch: received=0x{received_crc:02X}, calculated=0x{calculated_crc:02X}")
+            return
+
+        voltage_01mv = int.from_bytes(frame.data[2:4], byteorder='big', signed=True)
+        strain_ue = int.from_bytes(frame.data[4:6], byteorder='big', signed=True)
+        stress_01mpa = struct.unpack('>b', bytes([frame.data[6]]))[0]  # signed int8
+
+        with self.lock:
+            self.channel_data[channel].voltage = voltage_01mv / 10.0  # Convert 0.1mV to mV
+            self.channel_data[channel].strain = float(strain_ue)
+            self.channel_data[channel].stress = stress_01mpa / 10.0  # Convert 0.1MPa to MPa
+
         self.data_updated.emit(channel, {
             'voltage': self.channel_data[channel].voltage,
             'strain': self.channel_data[channel].strain,

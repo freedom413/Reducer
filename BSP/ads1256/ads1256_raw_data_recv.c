@@ -5,9 +5,6 @@
 #include "lwrb.h"
 
 int adc_ads1256_init(void);
-extern ADS1256_t ads1256_a;
-extern ADS1256_t ads1256_b;
-
 
 static lwrb_t ads1256_data_rb;
 static char ads1256_data_buf[ADS1256_DATA_BUFF_SIZE];
@@ -116,4 +113,18 @@ void ads1256_drdy_callback(void)
         /* 写入数据缓冲区，满则覆盖旧数据 */
         lwrb_overwrite(&ads1256_data_rb, (const char *)&adc_data, sizeof(adc_data));
     }
+}
+
+int adc_ads1256_calibrate(void)
+{
+    int ret_a, ret_b;
+
+    // Perform self-calibration on both ADCs
+    ret_a = ads1256_calibration(&ads1256_a, ADS1256_CAL_SELF);
+    ret_b = ads1256_calibration(&ads1256_b, ADS1256_CAL_SELF);
+
+    // Return 0 if both succeeded, or first error code
+    if (ret_a != 0) return ret_a;
+    if (ret_b != 0) return ret_b;
+    return 0;
 }

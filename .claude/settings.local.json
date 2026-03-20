@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --preset=Debug)",
+      "Bash(cmake:*)",
+      "Bash(ls:*)",
+      "Bash(python -m py_compile reducer_monitor.py)",
+      "Bash(python -m py_compile slcan_protocol.py)",
+      "Bash(.venv/Scripts/python.exe reducer_monitor.py)",
+      "Bash(C:/Users/ff/Desktop/my_project/Reducer/host_pc/.venv/Scripts/python.exe test_gui.py)",
+      "Bash(C:/Users/ff/Desktop/my_project/Reducer/host_pc/.venv/Scripts/python.exe -c \":*)",
+      "Bash(python test_gui.py)",
+      "Bash(python:*)"
+    ]
+  }
+}
