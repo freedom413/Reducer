@@ -24,10 +24,17 @@ typedef struct ads1256_ch {
 extern const ads1256_ch_t ads1235_a_ch[3];
 extern const ads1256_ch_t ads1235_b_ch[3];
 
+// ADS1256 objects (defined in ads1256_port.c)
+extern ADS1256_t ads1256_a;
+extern ADS1256_t ads1256_b;
+
 void adc_ads1256_start(void);
 int adc_ads1256_get_data(ads1256_data_t *data , uint32_t max_count);
 void ads1256_data_get_ch(ads1256_data_t *data, ads1256_ch_t *ch);
 
 void ads1256_drdy_callback(void);
+
+// Calibration function - triggers ADS1256 self-calibration
+int adc_ads1256_calibrate(void);
 
 #endif /* __ADS1256_RAW_DATA_RECV_H__ */
