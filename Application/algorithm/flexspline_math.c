@@ -93,20 +93,41 @@ float flexspline_stress_to_displacement(float stress, float I, float y_max, floa
 void flexspline_calculate(int32_t raw, const flexspline_params_t *params,
                           flexspline_result_t *result)
 {
-    // Step 1: Raw to voltage
-    float voltage = flexspline_raw_to_voltage(raw, params->ref_voltage, params->pga);
-    result->voltage = voltage * 1000.0f; // Convert to mV for display
+    // Optimized calculation: combine steps to reduce redundant operations
+    // raw -> voltage -> strain -> stress
 
-    // Step 2: Voltage to strain (micro-strain)
-    float strain = flexspline_voltage_to_strain(voltage, params->excitation_v, params->gauge_k);
-    result->strain = strain * 1000000.0f; // Convert to µε
+    // Pre-compute scaling factor: (ref_v / pga) * 1000 / (v_ex * gauge_k) * 10^6
+    // This combines: raw_to_voltage * voltage_to_strain * 10^6
 
-    // Step 3: Strain to stress (MPa)
-    result->stress = flexspline_strain_to_stress(strain, params->elastic_modulus);
+    // Step 1: Raw to voltage (V)
+    float voltage = ((float)raw / 8388608.0f) * (params->ref_voltage / (float)params->pga);
 
-    // Step 4: Displacement (requires geometry - using stress as proxy for now)
-    // In practice, displacement depends on the harmonic drive geometry:
-    // δ = f(σ, I, y_max, L, boundary conditions)
-    // Placeholder: just use stress * a constant factor for demonstration
-    result->displacement = result->stress * 0.01f; // Placeholder scaling
+    // Store voltage in mV for display
+    result->voltage = voltage * 1000.0f;
+
+    // Step 2 & 3 combined: Raw -> strain (µε) -> stress (MPa)
+    // ε = V_bridge * 4 / (V_ex * K)
+    // σ = E * ε
+    // Combined: σ = E * raw * ref_v * 4 / (8388608 * pga * v_ex * gauge_k)
+
+    // strain = voltage * 4 / (v_ex * gauge_k) * 10^6 = µε
+    float v_ex = params->excitation_v;
+    float gauge_k = params->gauge_k;
+
+    // Guard against division by zero
+    if (fabsf(v_ex) < 1e-9f || fabsf(gauge_k) < 1e-9f) {
+        result->strain = 0.0f;
+        result->stress = 0.0f;
+        result->displacement = 0.0f;
+        return;
+    }
+
+    // Calculate strain in micro-strain
+    result->strain = voltage * (4.0f / (v_ex * gauge_k)) * 1000000.0f;
+
+    // Calculate stress in MPa using Hooke's law
+    result->stress = params->elastic_modulus * (result->strain / 1000000.0f);
+
+    // Displacement placeholder
+    result->displacement = result->stress * 0.01f;
 }

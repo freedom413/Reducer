@@ -60,6 +60,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     components/printf/printf.c
     Application/algorithm/can_data.c
     Application/algorithm/filter.c
+    Application/algorithm/flash_storage.c
     Application/algorithm/flexspline_math.c
 
 )
