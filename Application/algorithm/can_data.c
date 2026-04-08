@@ -22,8 +22,10 @@ void can_build_combined_frame(can_tx_combined_frame_t *frame, uint8_t channel,
 {
     frame->frame_type = 0x05;  // Combined frame type
     frame->channel = channel;
-    frame->voltage = voltage_01mv;
-    frame->strain = strain_ue;
+    frame->voltage_be[0] = (uint8_t)(((uint16_t)voltage_01mv >> 8) & 0xFF);
+    frame->voltage_be[1] = (uint8_t)((uint16_t)voltage_01mv & 0xFF);
+    frame->strain_be[0] = (uint8_t)(((uint16_t)strain_ue >> 8) & 0xFF);
+    frame->strain_be[1] = (uint8_t)((uint16_t)strain_ue & 0xFF);
     frame->stress = stress_01mpa;
 
     // Calculate XOR checksum over first 7 bytes

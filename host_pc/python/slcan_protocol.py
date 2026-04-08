@@ -91,6 +91,12 @@ class SLCANProtocol:
             self.port = port
             self.baudrate = baudrate
 
+            # Wait for device to initialize after opening serial port
+            time.sleep(0.1)
+
+            # Clear any initial data from device
+            self.serial.reset_input_buffer()
+
             # Set CAN baudrate
             if not self._set_baudrate(baudrate):
                 logger.error("Failed to set baudrate")
@@ -205,7 +211,7 @@ class SLCANProtocol:
             cmd = f"{cmd_char}{id_str}{dlc:X}".encode('ascii')
 
             if not frame.is_remote:
-                cmd += frame.data
+                cmd += frame.data.hex().upper().encode('ascii')
 
             cmd += b'\r'
 
@@ -305,9 +311,10 @@ class SLCANProtocol:
                     return None
                 can_id = int(line[1:4], 16)
                 dlc = int(chr(line[4]), 16)
-                if len(line) < 5 + dlc:
+                expected_len = 5 + dlc * 2
+                if len(line) < expected_len:
                     return None
-                data = bytes(line[5:5 + dlc])
+                data = bytes.fromhex(line[5:expected_len].decode('ascii'))
                 return CANFrame(id=can_id, data=data, is_extended=False,
                                is_remote=False, timestamp=time.time())
 
@@ -322,13 +329,14 @@ class SLCANProtocol:
 
             elif cmd == 'T':
                 # Extended data frame: TIIILDDDD...
-                if len(line) < 9:
+                if len(line) < 10:
                     return None
                 can_id = int(line[1:9], 16)
                 dlc = int(chr(line[9]), 16)
-                if len(line) < 10 + dlc:
+                expected_len = 10 + dlc * 2
+                if len(line) < expected_len:
                     return None
-                data = bytes(line[10:10 + dlc])
+                data = bytes.fromhex(line[10:expected_len].decode('ascii'))
                 return CANFrame(id=can_id, data=data, is_extended=True,
                                is_remote=False, timestamp=time.time())
 
