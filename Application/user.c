@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdbool.h>
+#include <string.h>
 #include "dbg.h"
 #include "delay.h"
 #include "can.h"
@@ -12,6 +13,8 @@
 #include "filter.h"
 #include "flash_storage.h"
 #include "flexspline_math.h"
+#include "stm32g4xx_hal_flash.h"
+#include "stm32g4xx_hal_flash_ex.h"
 
 void ads1256_int_enable(void);
 
@@ -33,13 +36,51 @@ void ads1256_int_enable(void);
 //     .read = flash_read,
 // };
 
-// User must provide this function to register flash operations
-// __attribute__((weak)) void flash_storage_register_user_ops(void)
-// {
-//     flash_storage_register_ops(&my_flash_ops);
-// }
-void flash_storage_register_user_ops(void) __attribute__((weak));
-void flash_storage_register_user_ops(void) {}
+static void flash_unlock(void)
+{
+    HAL_FLASH_Unlock();
+}
+
+static void flash_lock(void)
+{
+    HAL_FLASH_Lock();
+}
+
+static int flash_erase_page(uint32_t addr)
+{
+    FLASH_EraseInitTypeDef erase = {0};
+    uint32_t page_error = 0;
+
+    erase.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase.Banks = FLASH_BANK_1;
+    erase.Page = (addr - FLASH_BASE) / FLASH_PAGE_SIZE;
+    erase.NbPages = 1;
+
+    return (HAL_FLASHEx_Erase(&erase, &page_error) == HAL_OK) ? 0 : -1;
+}
+
+static int flash_program_dw(uint32_t addr, uint64_t data)
+{
+    return (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, data) == HAL_OK) ? 0 : -1;
+}
+
+static void flash_read(uint32_t addr, void *data, uint32_t len)
+{
+    memcpy(data, (const void *)addr, len);
+}
+
+static const flash_hw_ops_t flash_hw_ops = {
+    .unlock = flash_unlock,
+    .lock = flash_lock,
+    .erase_page = flash_erase_page,
+    .program_doubleword = flash_program_dw,
+    .read = flash_read,
+};
+
+void flash_storage_register_user_ops(void)
+{
+    flash_storage_register_ops(&flash_hw_ops);
+}
 
 void ads1256_int_enable(void);
 
@@ -110,8 +151,8 @@ static int32_t adc_filtered_value[ADC_CHANNEL_COUNT] = {0};
 #define OUTLIER_MIN_SAMPLES   10     // Minimum samples before outlier detection
 
 static float running_mean[ADC_CHANNEL_COUNT] = {0};
-static float running_var[ADC_CHANNEL_COUNT] = {0};  // Running variance (not std dev)
-static uint8_t sample_count = 0;
+static float running_m2[ADC_CHANNEL_COUNT] = {0};
+static uint16_t sample_count[ADC_CHANNEL_COUNT] = {0};
 
 void setup(void)
 {
@@ -134,12 +175,12 @@ void setup(void)
 
 static inline bool is_outlier(uint8_t ch, int32_t value)
 {
-    if (sample_count < OUTLIER_MIN_SAMPLES) {
+    if (sample_count[ch] < OUTLIER_MIN_SAMPLES) {
         return false;  // Not enough samples for outlier detection
     }
 
     float mean = running_mean[ch];
-    float variance = running_var[ch];
+    float variance = running_m2[ch] / (float)(sample_count[ch] - 1U);
 
     // Avoid sqrt by comparing squared values
     // outlier if diff^2 > threshold^2 * var
@@ -157,26 +198,26 @@ static inline bool is_outlier(uint8_t ch, int32_t value)
 
 static void update_statistics(uint8_t ch, int32_t value)
 {
-    if (sample_count >= 255) {
-        sample_count = 254;  // Prevent overflow, keep running
+    if (sample_count[ch] == UINT16_MAX) {
+        return;
     }
-    sample_count++;
+    sample_count[ch]++;
 
     // Welford's online algorithm for running variance
     float delta = (float)value - running_mean[ch];
-    running_mean[ch] += delta / (float)sample_count;
+    running_mean[ch] += delta / (float)sample_count[ch];
     float delta2 = (float)value - running_mean[ch];
-    running_var[ch] += delta * delta2;
+    running_m2[ch] += delta * delta2;
 }
 
 static void reset_statistics(void)
 {
     for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
         running_mean[i] = 0;
-        running_var[i] = 0;
+        running_m2[i] = 0;
         adc_filtered_value[i] = 0;
+        sample_count[i] = 0;
     }
-    sample_count = 0;
 }
 
 static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
@@ -225,6 +266,8 @@ static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
         case CAN_CMD_LOAD_ZERO:
             // Reload zero offsets from Flash
             filter_load_zero_from_flash();
+            filter_reset_all();
+            reset_statistics();
             break;
 
         case CAN_CMD_CLEAR_ZERO:
@@ -233,6 +276,8 @@ static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
                 filter_set_zero_offset(i, 0);
             }
             flash_storage_clear();
+            filter_reset_all();
+            reset_statistics();
             break;
 
         default:
@@ -248,9 +293,10 @@ void loop(void)
     /* Process incoming CAN commands FIRST */
     can_msg_t msg;
     // Use timeout=0 for non-blocking check
-    if (can_recv(&msg, 0) > 0) {
+    if (can_recv(&msg, 1) == (int)sizeof(can_msg_t)) {
+        int dlc_bytes = can_data_len_get(msg.RxHeader.DataLength);
         if (msg.RxHeader.Identifier == CAN_ID_RX_CONFIG &&
-            msg.RxHeader.DataLength >= 6) {
+            dlc_bytes >= (int)sizeof(can_rx_frame_t)) {
             /* Parse command frame (matches can_rx_frame_t) */
             uint8_t cmd_type = msg.data[0];
             uint8_t param = msg.data[1];

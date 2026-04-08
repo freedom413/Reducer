@@ -40,6 +40,7 @@ from reducer_monitor import (
     CAN_CMD_SET_FILTER_SIZE,
     CAN_CMD_START_CALIB,
 )
+from slcan_protocol import SLCANProtocol
 
 
 class TestCRCFunctions(unittest.TestCase):
@@ -242,7 +243,7 @@ class TestCSVLogging(unittest.TestCase):
         self.window.csv_writer = csv.writer(self.window.csv_file)
         self.window.csv_writer.writerow([
             'timestamp', 'channel',
-            'voltage_mv', 'strain_ue', 'stress_mpa', 'displacement_um'
+            'voltage_mv', 'strain_ue', 'stress_mpa', 'displacement_derived'
         ])
         self.window.csv_file.close()
 
@@ -276,6 +277,31 @@ class TestCSVLogging(unittest.TestCase):
             self.assertEqual(len(rows), 2)  # header + 1 data row
             self.assertIn('123.45', rows[1][2])
             self.assertIn('500.0', rows[1][3])
+
+
+class TestSLCANProtocol(unittest.TestCase):
+    """Test SLCAN ASCII payload handling"""
+
+    def test_send_standard_frame_uses_ascii_hex_payload(self):
+        proto = SLCANProtocol()
+        proto.serial = MagicMock()
+        proto.serial.is_open = True
+        proto.serial.read = MagicMock(return_value=b'\r')
+        proto.is_open = True
+
+        ok = proto.send_standard_data(0x123, bytes([0x11, 0x22, 0xAB]))
+
+        self.assertTrue(ok)
+        proto.serial.write.assert_called_once_with(b't12331122AB\r')
+
+    def test_parse_standard_frame_decodes_ascii_hex_payload(self):
+        proto = SLCANProtocol()
+
+        frame = proto._parse_line(b't12331122AB')
+
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.id, 0x123)
+        self.assertEqual(frame.data, bytes([0x11, 0x22, 0xAB]))
 
 
 class TestChannelData(unittest.TestCase):
@@ -334,6 +360,25 @@ class TestWaveformBuffer(unittest.TestCase):
             len(self.window.waveform_buffers[0]),
             WAVEFORM_BUFFER_SIZE
         )
+
+    def test_stats_labels_update_with_voltage_history(self):
+        self.window.on_data_updated(0, {
+            'voltage': 10.0,
+            'strain': 0.0,
+            'stress': 0.0,
+            'displacement': 0.0
+        })
+        self.window.on_data_updated(0, {
+            'voltage': 20.0,
+            'strain': 0.0,
+            'stress': 0.0,
+            'displacement': 0.0
+        })
+
+        min_lbl, max_lbl, avg_lbl = self.window.stats_labels[0]
+        self.assertEqual(min_lbl.text(), "Min: 10.000 mV")
+        self.assertEqual(max_lbl.text(), "Max: 20.000 mV")
+        self.assertEqual(avg_lbl.text(), "Avg: 15.000 mV")
 
 
 class TestConstants(unittest.TestCase):
@@ -502,6 +547,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestCRCFunctions))
     suite.addTests(loader.loadTestsFromTestCase(TestCombinedFrameParsing))
     suite.addTests(loader.loadTestsFromTestCase(TestCSVLogging))
+    suite.addTests(loader.loadTestsFromTestCase(TestSLCANProtocol))
     suite.addTests(loader.loadTestsFromTestCase(TestChannelData))
     suite.addTests(loader.loadTestsFromTestCase(TestWaveformBuffer))
     suite.addTests(loader.loadTestsFromTestCase(TestConstants))

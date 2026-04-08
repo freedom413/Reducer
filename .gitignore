@@ -1,3 +1,7 @@
 build
 mx.scratch
 !.settings
+__pycache__/
+*.pyc
+.venv/
+host_pc/.venv/

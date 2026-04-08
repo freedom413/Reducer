@@ -17,17 +17,17 @@
 // Byte 0: frame_type = 0x05
 // Byte 1: channel (0-5)
 // Bytes 2-3: voltage (int16, in 0.1 mV units, big-endian)
-// Bytes 4-5: strain (int16, in µε units, big-endian)
+// Bytes 4-5: strain (int16, in micro-strain units, big-endian)
 // Byte 6: stress (int8, in 0.1 MPa units, signed)
 // Byte 7: crc8 (XOR checksum of bytes 0-6)
 
 typedef struct __attribute__((packed)) {
     uint8_t  frame_type;    // 0x05
     uint8_t  channel;       // 0-5
-    int16_t  voltage;       // Voltage in 0.1 mV
-    int16_t  strain;       // Strain in µε (micro-strain)
-    int8_t   stress;       // Stress in 0.1 MPa (signed)
-    uint8_t  crc8;         // XOR checksum of bytes 0-6
+    uint8_t  voltage_be[2]; // Voltage in 0.1 mV, big-endian
+    uint8_t  strain_be[2];  // Strain in micro-strain, big-endian
+    int8_t   stress;        // Stress in 0.1 MPa (signed)
+    uint8_t  crc8;          // XOR checksum of bytes 0-6
 } can_tx_combined_frame_t;
 
 _Static_assert(sizeof(can_tx_combined_frame_t) == 8, "can_tx_combined_frame_t must be 8 bytes");

@@ -92,16 +92,22 @@ class CANReceiver(QThread):
         super().__init__()
         self.slcan = slcan
         self.running = True
+        self._callback = None
 
     def run(self):
         def callback(frame: CANFrame):
             self.frame_received.emit(frame)
 
-        self.slcan.register_rx_callback(callback)
+        self._callback = callback
+        self.slcan.register_rx_callback(self._callback)
 
-        # Keep thread alive
-        while self.running:
-            QThread.sleep(0.1)
+        try:
+            while self.running:
+                QThread.msleep(100)
+        finally:
+            if self._callback is not None:
+                self.slcan.unregister_rx_callback(self._callback)
+                self._callback = None
 
     def stop(self):
         self.running = False
@@ -122,6 +128,7 @@ class ReducerMonitorWindow(QMainWindow):
 
         # Channel data
         self.channel_data: List[ChannelData] = [ChannelData() for _ in range(NUM_CHANNELS)]
+        self.channel_stats: List[Dict[str, Optional[float]]] = []
         self.lock = Lock()
 
         # Waveform data buffers
@@ -137,6 +144,7 @@ class ReducerMonitorWindow(QMainWindow):
 
         # Setup UI
         self.init_ui()
+        self._reset_measurements()
 
         # Connect signals
         self.data_updated.connect(self.on_data_updated)
@@ -310,6 +318,30 @@ class ReducerMonitorWindow(QMainWindow):
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
         return colors[ch % len(colors)]
 
+    def _reset_measurements(self):
+        with self.lock:
+            self.channel_data = [ChannelData() for _ in range(NUM_CHANNELS)]
+            self.waveform_buffers = [[] for _ in range(NUM_CHANNELS)]
+            self.channel_stats = [
+                {'min': None, 'max': None, 'sum': 0.0, 'count': 0}
+                for _ in range(NUM_CHANNELS)
+            ]
+
+        if hasattr(self, 'data_table'):
+            for row in range(NUM_CHANNELS):
+                for col in range(1, 5):
+                    self.data_table.item(row, col).setText("-")
+
+        if hasattr(self, 'stats_labels'):
+            for min_lbl, max_lbl, avg_lbl in self.stats_labels:
+                min_lbl.setText("Min: -")
+                max_lbl.setText("Max: -")
+                avg_lbl.setText("Avg: -")
+
+        if hasattr(self, 'plot_curves'):
+            for curve in self.plot_curves:
+                curve.setData([])
+
     def on_connect_clicked(self):
         """Handle connect/disconnect button click"""
         if self.is_connected:
@@ -450,6 +482,7 @@ class ReducerMonitorWindow(QMainWindow):
             self.can_receiver = CANReceiver(self.slcan)
             self.can_receiver.frame_received.connect(self.on_can_frame_received)
             self.can_receiver.start()
+            self._reset_measurements()
 
             self.is_connected = True
             self.connect_btn.setText("Disconnect")
@@ -484,6 +517,7 @@ class ReducerMonitorWindow(QMainWindow):
             self.slcan = None
 
         self.is_connected = False
+        self._reset_measurements()
         self.connect_btn.setText("Connect")
         self.log_btn.setEnabled(False)
         self.zero_btn.setEnabled(False)
@@ -539,6 +573,7 @@ class ReducerMonitorWindow(QMainWindow):
             self.channel_data[channel].voltage = voltage_01mv / 10.0  # Convert 0.1mV to mV
             self.channel_data[channel].strain = float(strain_ue)
             self.channel_data[channel].stress = stress_01mpa / 10.0  # Convert 0.1MPa to MPa
+            self.channel_data[channel].displacement = self.channel_data[channel].stress * 0.01
 
         self.data_updated.emit(channel, {
             'voltage': self.channel_data[channel].voltage,
@@ -559,7 +594,19 @@ class ReducerMonitorWindow(QMainWindow):
             self.data_table.item(channel, 1).setText(f"{data['voltage']:.3f}")
             self.data_table.item(channel, 2).setText(f"{data['strain']:.2f}")
             self.data_table.item(channel, 3).setText(f"{data['stress']:.4f}")
-            self.data_table.item(channel, 4).setText(f"{data['displacement']:.2f}")
+            self.data_table.item(channel, 4).setText(f"{data['displacement']:.4f}")
+
+        stats = self.channel_stats[channel]
+        voltage = data['voltage']
+        stats['count'] += 1
+        stats['sum'] += voltage
+        stats['min'] = voltage if stats['min'] is None else min(stats['min'], voltage)
+        stats['max'] = voltage if stats['max'] is None else max(stats['max'], voltage)
+        avg = stats['sum'] / stats['count']
+        min_lbl, max_lbl, avg_lbl = self.stats_labels[channel]
+        min_lbl.setText(f"Min: {stats['min']:.3f} mV")
+        max_lbl.setText(f"Max: {stats['max']:.3f} mV")
+        avg_lbl.setText(f"Avg: {avg:.3f} mV")
 
         # Write to CSV if logging
         if self.logging_enabled and self.csv_writer:
@@ -599,7 +646,7 @@ class ReducerMonitorWindow(QMainWindow):
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow([
                 'timestamp', 'channel',
-                'voltage_mv', 'strain_ue', 'stress_mpa', 'displacement_um'
+                'voltage_mv', 'strain_ue', 'stress_mpa', 'displacement_derived'
             ])
             self.logging_enabled = True
             self.log_btn.setText("Stop Logging")
