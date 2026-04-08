@@ -1,6 +1,7 @@
 #ifndef __FLASH_STORAGE_H__
 #define __FLASH_STORAGE_H__
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // ============================================================================
