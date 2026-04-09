@@ -6,42 +6,89 @@
 // ============================================================================
 // CAN ID definitions
 // ============================================================================
-#define CAN_ID_TX_DATA     0x101  // Downlink: STM32 -> PC
-#define CAN_ID_RX_CONFIG   0x100  // Uplink: PC -> STM32
+#define CAN_ID_RX_COMMAND    0x100  // Uplink: PC -> STM32
+#define CAN_ID_TX_TELEMETRY  0x101  // Downlink: STM32 -> PC telemetry
+#define CAN_ID_TX_STATUS     0x102  // Downlink: STM32 -> PC command status
 
 // ============================================================================
-// Combined CAN TX Frame - All data in one transmission (8 bytes)
-// Reduces CAN bus load from 18 frames to 6 frames per cycle
+// Frame type definitions
 // ============================================================================
-// Layout (8 bytes):
-// Byte 0: frame_type = 0x05
+#define CAN_FRAME_TYPE_TELEMETRY  0x51
+#define CAN_FRAME_TYPE_COMMAND    0xA0
+#define CAN_FRAME_TYPE_STATUS     0xA1
+
+// ============================================================================
+// Command status definitions
+// ============================================================================
+#define CAN_STATUS_OK             0x00
+#define CAN_STATUS_BAD_CRC        0xE1
+#define CAN_STATUS_BAD_TYPE       0xE2
+#define CAN_STATUS_BAD_CMD        0xE3
+#define CAN_STATUS_BAD_VALUE      0xE4
+
+// ============================================================================
+// Telemetry CAN TX Frame - 8-byte classic CAN
+// ============================================================================
+// Byte 0: frame_type = 0x51
 // Byte 1: channel (0-5)
 // Bytes 2-3: voltage (int16, in 0.1 mV units, big-endian)
 // Bytes 4-5: strain (int16, in micro-strain units, big-endian)
-// Byte 6: stress (int8, in 0.1 MPa units, signed)
+// Byte 6: stress preview (int8, in 0.1 MPa units, signed, clipped on overflow)
 // Byte 7: crc8 (XOR checksum of bytes 0-6)
-
 typedef struct __attribute__((packed)) {
-    uint8_t  frame_type;    // 0x05
-    uint8_t  channel;       // 0-5
-    uint8_t  voltage_be[2]; // Voltage in 0.1 mV, big-endian
-    uint8_t  strain_be[2];  // Strain in micro-strain, big-endian
-    int8_t   stress;        // Stress in 0.1 MPa (signed)
-    uint8_t  crc8;          // XOR checksum of bytes 0-6
-} can_tx_combined_frame_t;
+    uint8_t  frame_type;
+    uint8_t  channel;
+    uint8_t  voltage_be[2];
+    uint8_t  strain_be[2];
+    int8_t   stress;
+    uint8_t  crc8;
+} can_tx_telemetry_frame_t;
 
-_Static_assert(sizeof(can_tx_combined_frame_t) == 8, "can_tx_combined_frame_t must be 8 bytes");
+_Static_assert(sizeof(can_tx_telemetry_frame_t) == 8, "can_tx_telemetry_frame_t must be 8 bytes");
 
 // ============================================================================
-// CAN RX Frame (from PC - for configuration/commands)
+// Command frame (PC -> STM32) with CRC and sequence number
 // ============================================================================
+// Byte 0: frame_type = 0xA0
+// Byte 1: sequence
+// Byte 2: cmd_type
+// Byte 3: param
+// Bytes 4-5: value (uint16, little-endian)
+// Byte 6: reserved
+// Byte 7: crc8 (XOR checksum of bytes 0-6)
 typedef struct __attribute__((packed)) {
+    uint8_t  frame_type;
+    uint8_t  sequence;
     uint8_t  cmd_type;
     uint8_t  param;
-    uint32_t value;
-} can_rx_frame_t;
+    uint8_t  value_le[2];
+    uint8_t  reserved;
+    uint8_t  crc8;
+} can_rx_command_frame_t;
 
-_Static_assert(sizeof(can_rx_frame_t) == 6, "can_rx_frame_t must be 6 bytes");
+_Static_assert(sizeof(can_rx_command_frame_t) == 8, "can_rx_command_frame_t must be 8 bytes");
+
+// ============================================================================
+// Status frame (STM32 -> PC) for command acknowledgment
+// ============================================================================
+// Byte 0: frame_type = 0xA1
+// Byte 1: sequence
+// Byte 2: cmd_type
+// Byte 3: status
+// Bytes 4-5: value (uint16, little-endian)
+// Byte 6: detail
+// Byte 7: crc8 (XOR checksum of bytes 0-6)
+typedef struct __attribute__((packed)) {
+    uint8_t  frame_type;
+    uint8_t  sequence;
+    uint8_t  cmd_type;
+    uint8_t  status;
+    uint8_t  value_le[2];
+    uint8_t  detail;
+    uint8_t  crc8;
+} can_tx_status_frame_t;
+
+_Static_assert(sizeof(can_tx_status_frame_t) == 8, "can_tx_status_frame_t must be 8 bytes");
 
 // ============================================================================
 // Command types for RX
@@ -67,14 +114,18 @@ _Static_assert(sizeof(can_rx_frame_t) == 6, "can_rx_frame_t must be 6 bytes");
 uint8_t can_calc_crc8(const uint8_t *data, uint8_t len);
 
 /**
- * @brief Build combined CAN frame with all sensor data
+ * @brief Build telemetry CAN frame with all sensor data
  * @param frame Pointer to frame structure
  * @param channel Channel number (0-5)
  * @param voltage_01mv Voltage in 0.1 mV units (e.g., 1234 = 123.4 mV)
  * @param strain_ue Strain in micro-strain units
- * @param stress_01mpa Stress in 0.1 MPa units (signed)
+ * @param stress_01mpa Stress preview in 0.1 MPa units (signed, clipped)
  */
-void can_build_combined_frame(can_tx_combined_frame_t *frame, uint8_t channel,
-                              int16_t voltage_01mv, int16_t strain_ue, int8_t stress_01mpa);
+void can_build_telemetry_frame(can_tx_telemetry_frame_t *frame, uint8_t channel,
+                               int16_t voltage_01mv, int16_t strain_ue, int8_t stress_01mpa);
+void can_build_status_frame(can_tx_status_frame_t *frame, uint8_t sequence,
+                            uint8_t cmd_type, uint8_t status, uint16_t value,
+                            uint8_t detail);
+uint16_t can_frame_u16_le_get(const uint8_t value_le[2]);
 
 #endif // __CAN_DATA_H__

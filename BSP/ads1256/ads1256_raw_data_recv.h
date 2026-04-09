@@ -2,6 +2,7 @@
 #define __ADS1256_RAW_DATA_RECV_H__
 
 #include "ads1256.h"
+#include <stdbool.h>
 #include "user.h"
 
 typedef struct ads1256_data{
@@ -33,8 +34,12 @@ int adc_ads1256_get_data(ads1256_data_t *data , uint32_t max_count);
 void ads1256_data_get_ch(ads1256_data_t *data, ads1256_ch_t *ch);
 
 void ads1256_drdy_callback(void);
+bool ads1256_take_drdy_pending(void);
 
 // Calibration function - triggers ADS1256 self-calibration
 int adc_ads1256_calibrate(void);
+int adc_ads1256_set_sample_rate(uint16_t sps);
+uint16_t adc_ads1256_get_sample_rate(void);
+int adc_ads1256_restart(void);
 
 #endif /* __ADS1256_RAW_DATA_RECV_H__ */

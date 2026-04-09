@@ -220,9 +220,48 @@ static void reset_statistics(void)
     }
 }
 
-static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
+static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
+                            uint16_t value, uint8_t detail)
+{
+    can_tx_status_frame_t frame;
+    can_build_status_frame(&frame, sequence, cmd_type, status, value, detail);
+    can_classic_data_frame_send(CAN_ID_TX_STATUS, (uint8_t *)&frame, sizeof(frame));
+}
+
+static int16_t clamp_i16_from_float(float value)
+{
+    long rounded = lrintf(value);
+    if (rounded > INT16_MAX) {
+        return INT16_MAX;
+    }
+    if (rounded < INT16_MIN) {
+        return INT16_MIN;
+    }
+    return (int16_t)rounded;
+}
+
+static int8_t clamp_i8_from_float(float value)
+{
+    long rounded = lrintf(value);
+    if (rounded > INT8_MAX) {
+        return INT8_MAX;
+    }
+    if (rounded < INT8_MIN) {
+        return INT8_MIN;
+    }
+    return (int8_t)rounded;
+}
+
+static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t value,
+                                   uint16_t *applied_value, uint8_t *detail)
 {
     (void)param;
+    if (applied_value != NULL) {
+        *applied_value = value;
+    }
+    if (detail != NULL) {
+        *detail = 0;
+    }
 
     switch (cmd_type) {
         case CAN_CMD_ZERO_DATUM:
@@ -234,54 +273,70 @@ static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
             filter_save_zero_to_flash();
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
 
         case CAN_CMD_SET_FILTER_SIZE:
-            // param: channel (unused, applies to all)
-            // value: new filter window size
+            if (value < 2U || value > 64U) {
+                if (detail != NULL) {
+                    *detail = (uint8_t)value;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
             filter_set_window_size((uint8_t)value);
-            break;
+            if (applied_value != NULL) {
+                *applied_value = value;
+            }
+            return CAN_STATUS_OK;
 
         case CAN_CMD_SET_SAMPLE_RATE:
-            // param: ADC chip (0=ADS1256_A, 1=ADS1256_B, 2=both)
-            // value: SPS code (see ads1256_sps_t)
-            // Note: This requires reconfiguration and is hardware dependent
-            // For now, we acknowledge but don't actually change rate
-            // Future: implement if needed
-            break;
-
-        case CAN_CMD_START_CALIB:
-            // Trigger ADS1256 self-calibration
-            adc_ads1256_calibrate();
-            // Also reset filters and statistics after calibration
+            if (adc_ads1256_set_sample_rate(value) != 0) {
+                if (detail != NULL) {
+                    *detail = 1;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
+            if (applied_value != NULL) {
+                *applied_value = adc_ads1256_get_sample_rate();
+            }
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
+
+        case CAN_CMD_START_CALIB:
+            if (adc_ads1256_calibrate() != 0 || adc_ads1256_restart() != 0) {
+                if (detail != NULL) {
+                    *detail = 2;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
+            filter_reset_all();
+            reset_statistics();
+            return CAN_STATUS_OK;
 
         case CAN_CMD_SAVE_ZERO:
-            // Save current zero offsets to Flash
             filter_save_zero_to_flash();
-            break;
+            return CAN_STATUS_OK;
 
         case CAN_CMD_LOAD_ZERO:
-            // Reload zero offsets from Flash
             filter_load_zero_from_flash();
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
 
         case CAN_CMD_CLEAR_ZERO:
-            // Clear zero offsets from Flash and reset to 0
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
                 filter_set_zero_offset(i, 0);
             }
             flash_storage_clear();
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
 
         default:
-            break;
+            if (detail != NULL) {
+                *detail = cmd_type;
+            }
+            return CAN_STATUS_BAD_CMD;
     }
 }
 
@@ -295,20 +350,32 @@ void loop(void)
     // Use timeout=0 for non-blocking check
     if (can_recv(&msg, 1) == (int)sizeof(can_msg_t)) {
         int dlc_bytes = can_data_len_get(msg.RxHeader.DataLength);
-        if (msg.RxHeader.Identifier == CAN_ID_RX_CONFIG &&
-            dlc_bytes >= (int)sizeof(can_rx_frame_t)) {
-            /* Parse command frame (matches can_rx_frame_t) */
-            uint8_t cmd_type = msg.data[0];
-            uint8_t param = msg.data[1];
-            uint32_t value = ((uint32_t)msg.data[2]) |
-                             ((uint32_t)msg.data[3] << 8) |
-                             ((uint32_t)msg.data[4] << 16) |
-                             ((uint32_t)msg.data[5] << 24);
-            process_can_command(cmd_type, param, value);
+        if (msg.RxHeader.Identifier == CAN_ID_RX_COMMAND &&
+            dlc_bytes >= (int)sizeof(can_rx_command_frame_t)) {
+            const can_rx_command_frame_t *frame = (const can_rx_command_frame_t *)msg.data;
+            uint8_t expected_crc = can_calc_crc8(msg.data, 7);
+            uint16_t value = can_frame_u16_le_get(frame->value_le);
+            uint8_t detail = 0;
+
+            if (frame->frame_type != CAN_FRAME_TYPE_COMMAND) {
+                send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_TYPE,
+                                value, frame->frame_type);
+            } else if (frame->crc8 != expected_crc) {
+                send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_CRC,
+                                value, expected_crc);
+            } else {
+                uint16_t applied_value = value;
+                uint8_t status = process_can_command(frame->cmd_type, frame->param, value,
+                                                     &applied_value, &detail);
+                send_can_status(frame->sequence, frame->cmd_type, status,
+                                applied_value, detail);
+            }
         }
     }
 
-    ads1256_drdy_callback();
+    if (ads1256_take_drdy_pending()) {
+        ads1256_drdy_callback();
+    }
 
     int recv_count = adc_ads1256_get_data(adc_ads1256_data, ADC_CHANNEL_COUNT);
 
@@ -347,17 +414,17 @@ void loop(void)
             flexspline_calculate(filtered, &flexspline_params, &result);
 
             /* Use combined CAN frame to reduce bus load (1 frame per channel instead of 3) */
-            can_tx_combined_frame_t frame;
+            can_tx_telemetry_frame_t frame;
 
             // voltage in 0.1 mV units (e.g., 123.4 mV -> 1234)
-            int16_t voltage_01mv = (int16_t)lrintf(result.voltage * 10);
+            int16_t voltage_01mv = clamp_i16_from_float(result.voltage * 10.0f);
             // strain in micro-strain units
-            int16_t strain_ue = (int16_t)result.strain;
-            // stress in 0.1 MPa units (e.g., 12.3 MPa -> 123)
-            int8_t stress_01mpa = (int8_t)lrintf(result.stress * 10);
+            int16_t strain_ue = clamp_i16_from_float(result.strain);
+            // stress preview in 0.1 MPa units, clipped to fit the compact 1-byte field
+            int8_t stress_01mpa = clamp_i8_from_float(result.stress * 10.0f);
 
-            can_build_combined_frame(&frame, i, voltage_01mv, strain_ue, stress_01mpa);
-            can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
+            can_build_telemetry_frame(&frame, i, voltage_01mv, strain_ue, stress_01mpa);
+            can_classic_data_frame_send(CAN_ID_TX_TELEMETRY, (uint8_t *)&frame, sizeof(frame));
         }
     }
 }
