@@ -1,5 +1,6 @@
 #include "filter.h"
 #include "flash_storage.h"
+#include <stddef.h>
 
 static moving_avg_filter_t filters[FILTER_CHANNEL_COUNT];
 static uint8_t current_window_size = FILTER_WINDOW_SIZE_DEFAULT;
@@ -97,7 +98,7 @@ void filter_set_zero_offset(uint8_t ch, int32_t offset)
 
 void filter_get_zero_offset(uint8_t ch, int32_t *offset)
 {
-    if (ch >= FILTER_CHANNEL_COUNT) return;
+    if (ch >= FILTER_CHANNEL_COUNT || offset == NULL) return;
     *offset = filters[ch].zero_offset;
 }
 

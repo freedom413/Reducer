@@ -75,7 +75,6 @@ int flash_storage_save_zero(const int32_t *offset)
 {
     calib_data_t data;
     uint32_t flash_addr = FLASH_STORAGE_ADDR;
-    uint64_t *data_ptr;
     uint32_t total_dwords;
     int ret;
 
@@ -84,6 +83,8 @@ int flash_storage_save_zero(const int32_t *offset)
         flash_ops->program_doubleword == NULL) {
         return -1;  // Ops not registered
     }
+
+    memset(&data, 0, sizeof(data));
 
     // Prepare calibration data
     data.version = CALIB_DATA_VERSION;
@@ -102,18 +103,19 @@ int flash_storage_save_zero(const int32_t *offset)
         return ret;
     }
 
-    // Program double-words (8 bytes at a time)
-    data_ptr = (uint64_t *)&data;
+    // Program double-words (8 bytes at a time).
+    // Copy through a local uint64_t to avoid reading past the packed struct.
     total_dwords = (sizeof(calib_data_t) + 7) / 8;
 
     for (uint32_t i = 0; i < total_dwords; i++) {
-        ret = flash_ops->program_doubleword(flash_addr, *data_ptr);
+        uint64_t dword = 0ULL;
+        memcpy(&dword, ((const uint8_t *)&data) + (i * 8U), sizeof(dword));
+        ret = flash_ops->program_doubleword(flash_addr, dword);
         if (ret != 0) {
             flash_ops->lock();
             return -3;
         }
         flash_addr += 8;
-        data_ptr++;
     }
 
     // Lock Flash
