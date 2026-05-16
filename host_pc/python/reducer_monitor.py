@@ -2,20 +2,16 @@
 reducer_monitor.py - Reducer Flexspline State Monitoring GUI
 
 A PyQt6-based real-time monitoring application for the Reducer Flexspline
-State Detection System. Displays 6-channel ADC data received via CAN (slcan).
-
-Features:
-- Real-time multi-channel waveform display using pyqtgraph
-- Data panel showing voltage, strain, stress, displacement
-- CSV data logging
-- Connection status and error handling
+State Detection System. Uses python-can to communicate with USB-CAN adapters,
+with SLCAN serial adapters as the primary transport.
 """
 
-import sys
-import os
 import csv
 import datetime
 import logging
+import sys
+import time
+from collections import deque
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from threading import Lock
@@ -24,33 +20,35 @@ from threading import Lock
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QGroupBox, QLabel, QPushButton, QComboBox,
-    QSpinBox, QDoubleSpinBox, QTextEdit, QStatusBar, QFileDialog,
+    QSpinBox, QStatusBar, QFileDialog,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem,
 )
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QObject, QThread
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import QTimer, pyqtSignal, QThread
 
 # Plotting
 import pyqtgraph as pg
 
-# Serial/CAN
-import serial.tools.list_ports
-import struct
-from slcan_protocol import SLCANProtocol, CANFrame, Baudrate, list_serial_ports
-
-
-def crc8_xor(data: bytes) -> int:
-    """Calculate CRC-8 XOR checksum (for combined frames)"""
-    crc = 0
-    for byte in data:
-        crc ^= byte
-    return crc
-
-# Constants
-from slcan_protocol import CAN_ID_TX_DATA, CAN_ID_RX_CONFIG
-
-# Frame type - only combined frame (0x05) is used
-CAN_FRAME_COMBINED = 0x05
+from can_protocol import (
+    Baudrate,
+    CANFrame,
+    CAN_ID_TX_STATUS,
+    CAN_ID_TX_TELEMETRY,
+    CAN_STATUS_BAD_CMD,
+    CAN_STATUS_BAD_CRC,
+    CAN_STATUS_BAD_TYPE,
+    CAN_STATUS_BAD_VALUE,
+    CAN_STATUS_OK,
+    CAN_STATUS_STORAGE_ERROR,
+    DEFAULT_SLCAN_TTY_BAUDRATE,
+    PythonCANInterface,
+    StatusFrame,
+    SUPPORTED_SLCAN_SERIAL_BAUDRATES,
+    available_interfaces,
+    build_command_frame,
+    list_can_channels,
+    parse_status_frame,
+    parse_telemetry_frame,
+)
 
 # Command types (must match embedded firmware)
 CAN_CMD_SET_SAMPLE_RATE = 0x01
@@ -66,6 +64,10 @@ NUM_CHANNELS = 6
 
 # Waveform buffer size
 WAVEFORM_BUFFER_SIZE = 1000
+COMMAND_ACK_TIMEOUT_S = 2.0
+
+DEFAULT_ELASTIC_MODULUS_MPA = 210000.0
+SUPPORTED_SAMPLE_RATES = [5, 10, 15, 25, 30, 50, 60, 100, 500, 1000]
 
 
 logging.basicConfig(level=logging.INFO,
@@ -84,13 +86,13 @@ class ChannelData:
 
 
 class CANReceiver(QThread):
-    """Background thread for receiving CAN frames"""
+    """Background thread for forwarding python-can frames to the UI thread"""
 
-    frame_received = pyqtSignal(CANFrame)
+    frame_received = pyqtSignal(object)
 
-    def __init__(self, slcan: SLCANProtocol):
+    def __init__(self, can_bus: PythonCANInterface):
         super().__init__()
-        self.slcan = slcan
+        self.can_bus = can_bus
         self.running = True
         self._callback = None
 
@@ -99,14 +101,14 @@ class CANReceiver(QThread):
             self.frame_received.emit(frame)
 
         self._callback = callback
-        self.slcan.register_rx_callback(self._callback)
+        self.can_bus.register_rx_callback(self._callback)
 
         try:
             while self.running:
                 QThread.msleep(100)
         finally:
             if self._callback is not None:
-                self.slcan.unregister_rx_callback(self._callback)
+                self.can_bus.unregister_rx_callback(self._callback)
                 self._callback = None
 
     def stop(self):
@@ -123,8 +125,11 @@ class ReducerMonitorWindow(QMainWindow):
         super().__init__()
 
         # CAN protocol
-        self.slcan: Optional[SLCANProtocol] = None
+        self.can_bus: Optional[PythonCANInterface] = None
         self.can_receiver: Optional[CANReceiver] = None
+        self.command_sequence = 0
+        self.pending_commands: Dict[int, str] = {}
+        self.pending_command_deadlines: Dict[int, float] = {}
 
         # Channel data
         self.channel_data: List[ChannelData] = [ChannelData() for _ in range(NUM_CHANNELS)]
@@ -132,7 +137,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.lock = Lock()
 
         # Waveform data buffers
-        self.waveform_buffers: List[List[float]] = [[] for _ in range(NUM_CHANNELS)]
+        self.waveform_buffers = [deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)]
+        self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
 
         # CSV logging
         self.csv_writer: Optional[csv.writer] = None
@@ -144,6 +150,8 @@ class ReducerMonitorWindow(QMainWindow):
 
         # Setup UI
         self.init_ui()
+        self._refresh_channels()
+        self._update_connection_options()
         self._reset_measurements()
 
         # Connect signals
@@ -153,6 +161,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_plots)
         self.update_timer.start(50)  # 20 Hz update rate
+
+        self.command_timeout_timer = QTimer()
+        self.command_timeout_timer.timeout.connect(self._check_command_timeouts)
+        self.command_timeout_timer.start(250)
 
     def init_ui(self):
         """Initialize the user interface"""
@@ -191,22 +203,38 @@ class ReducerMonitorWindow(QMainWindow):
         self.status_bar.showMessage("Disconnected")
 
     def _create_connection_group(self) -> QGroupBox:
-        """Create the serial connection configuration group"""
-        group = QGroupBox("Serial Connection")
+        """Create the CAN connection configuration group"""
+        group = QGroupBox("CAN Connection")
         layout = QHBoxLayout()
 
-        # Port selection
-        layout.addWidget(QLabel("COM Port:"))
-        self.port_combo = QComboBox()
-        self._refresh_ports()
-        layout.addWidget(self.port_combo)
+        layout.addWidget(QLabel("Interface:"))
+        self.interface_combo = QComboBox()
+        for interface_name, label in available_interfaces():
+            self.interface_combo.addItem(label, interface_name)
+        self.interface_combo.currentIndexChanged.connect(self._on_interface_changed)
+        layout.addWidget(self.interface_combo)
 
-        # Baudrate selection
-        layout.addWidget(QLabel("Baudrate:"))
+        layout.addWidget(QLabel("Channel:"))
+        self.channel_combo = QComboBox()
+        self.channel_combo.setEditable(True)
+        layout.addWidget(self.channel_combo)
+
+        self.serial_baud_label = QLabel("Adapter Baud:")
+        layout.addWidget(self.serial_baud_label)
+        self.serial_baud_combo = QComboBox()
+        for serial_baudrate in SUPPORTED_SLCAN_SERIAL_BAUDRATES:
+            self.serial_baud_combo.addItem(str(serial_baudrate), serial_baudrate)
+        serial_baud_index = self.serial_baud_combo.findData(DEFAULT_SLCAN_TTY_BAUDRATE)
+        if serial_baud_index >= 0:
+            self.serial_baud_combo.setCurrentIndex(serial_baud_index)
+        layout.addWidget(self.serial_baud_combo)
+
+        # CAN bitrate selection
+        layout.addWidget(QLabel("CAN Baudrate:"))
         self.baud_combo = QComboBox()
         for br in Baudrate:
             self.baud_combo.addItem(f"{br.bps // 1000}K", br)
-        self.baud_combo.setCurrentIndex(5)  # Default to 500K
+        self.baud_combo.setCurrentText("500K")
         layout.addWidget(self.baud_combo)
 
         # Connect button
@@ -216,7 +244,7 @@ class ReducerMonitorWindow(QMainWindow):
 
         # Refresh ports button
         refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self._refresh_ports)
+        refresh_btn.clicked.connect(self._refresh_channels)
         layout.addWidget(refresh_btn)
 
         layout.addStretch()
@@ -226,6 +254,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.log_btn.clicked.connect(self.on_log_clicked)
         self.log_btn.setEnabled(False)
         layout.addWidget(self.log_btn)
+
+        slcan_index = self.interface_combo.findData("slcan")
+        if slcan_index >= 0:
+            self.interface_combo.setCurrentIndex(slcan_index)
 
         group.setLayout(layout)
         return group
@@ -306,12 +338,49 @@ class ReducerMonitorWindow(QMainWindow):
 
         return widget
 
-    def _refresh_ports(self):
-        """Refresh the list of available COM ports"""
-        self.port_combo.clear()
-        ports = list_serial_ports()
-        for device, desc in ports:
-            self.port_combo.addItem(f"{device} - {desc[:40]}", device)
+    def _on_interface_changed(self, _index: int):
+        self._refresh_channels()
+        self._update_connection_options()
+
+    def _refresh_channels(self):
+        """Refresh the list of available CAN channels"""
+        interface = self.interface_combo.currentData()
+        selected_channel = self._selected_channel()
+        self.channel_combo.clear()
+        for channel, desc in list_can_channels(interface):
+            label = channel if not desc or desc == channel else f"{channel} - {desc}"
+            self.channel_combo.addItem(label, channel)
+        if self.channel_combo.count() == 0:
+            fallback_channel = "COM1" if interface == "slcan" else "can0"
+            self.channel_combo.addItem(fallback_channel, fallback_channel)
+
+        if selected_channel:
+            existing_index = self.channel_combo.findData(selected_channel)
+            if existing_index >= 0:
+                self.channel_combo.setCurrentIndex(existing_index)
+            else:
+                self.channel_combo.setEditText(selected_channel)
+
+    def _update_connection_options(self):
+        uses_serial_adapter = self.interface_combo.currentData() == "slcan"
+        self.serial_baud_label.setEnabled(uses_serial_adapter)
+        self.serial_baud_combo.setEnabled(uses_serial_adapter)
+
+    def _selected_channel(self) -> str:
+        text = self.channel_combo.currentText().strip()
+        data = self.channel_combo.currentData()
+        current_index = self.channel_combo.currentIndex()
+
+        if current_index >= 0:
+            item_text = self.channel_combo.itemText(current_index).strip()
+            item_data = self.channel_combo.itemData(current_index)
+            expected_text = str(item_data) if item_data is not None else item_text
+            if text and text not in (item_text, expected_text):
+                return text
+
+        if data is not None:
+            return str(data).strip()
+        return text
 
     def _get_channel_color(self, ch: int) -> str:
         """Get a unique color for each channel"""
@@ -321,7 +390,8 @@ class ReducerMonitorWindow(QMainWindow):
     def _reset_measurements(self):
         with self.lock:
             self.channel_data = [ChannelData() for _ in range(NUM_CHANNELS)]
-            self.waveform_buffers = [[] for _ in range(NUM_CHANNELS)]
+            self.waveform_buffers = [deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)]
+            self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
             self.channel_stats = [
                 {'min': None, 'max': None, 'sum': 0.0, 'count': 0}
                 for _ in range(NUM_CHANNELS)
@@ -351,18 +421,22 @@ class ReducerMonitorWindow(QMainWindow):
 
     def send_command(self, cmd_type: int, param: int = 0, value: int = 0) -> bool:
         """Send command to embedded device"""
-        if not self.slcan or not self.is_connected:
+        if not self.can_bus or not self.is_connected:
             return False
-        data = struct.pack('<BB', cmd_type, param)
-        data += struct.pack('<I', value)
-        frame = CANFrame(id=CAN_ID_RX_CONFIG, data=data, is_extended=False, is_remote=False)
-        return self.slcan.send_frame(frame)
+        frame = build_command_frame(self.command_sequence, cmd_type, param, value)
+        command_name = self._command_name(cmd_type)
+        sent = self.can_bus.send_frame(frame)
+        if sent:
+            self.pending_commands[self.command_sequence] = command_name
+            self.pending_command_deadlines[self.command_sequence] = time.monotonic() + COMMAND_ACK_TIMEOUT_S
+            self.command_sequence = (self.command_sequence + 1) & 0xFF
+        return sent
 
     def on_zero_clicked(self):
         """Handle Zero Sensor button click - saves zero offset to Flash"""
         if self.send_command(CAN_CMD_ZERO_DATUM):
-            self.status_bar.showMessage("Zero calibration saved to Flash")
-            logger.info("Zero calibration saved to Flash")
+            self.status_bar.showMessage("Zero command sent, waiting for device ACK")
+            logger.info("Zero command sent")
         else:
             self.status_bar.showMessage("Failed to send zero command")
             logger.warning("Failed to send zero command")
@@ -370,7 +444,7 @@ class ReducerMonitorWindow(QMainWindow):
     def on_calib_clicked(self):
         """Handle Calibrate button click"""
         if self.send_command(CAN_CMD_START_CALIB):
-            self.status_bar.showMessage("Calibration command sent")
+            self.status_bar.showMessage("Calibration command sent, waiting for device ACK")
             logger.info("Calibration command sent")
         else:
             self.status_bar.showMessage("Failed to send calibration command")
@@ -384,11 +458,26 @@ class ReducerMonitorWindow(QMainWindow):
             self.status_bar.showMessage("Failed to send filter size command")
             logger.warning("Failed to send filter size command")
 
+    def on_sample_rate_changed(self, index: int):
+        """Handle sample rate combobox change"""
+        if index < 0 or not self.is_connected:
+            return
+
+        sample_rate = self.sample_rate_combo.currentData()
+        if sample_rate is None:
+            return
+
+        if self.send_command(CAN_CMD_SET_SAMPLE_RATE, param=0, value=int(sample_rate)):
+            logger.info("Sample rate set to %s SPS", sample_rate)
+        else:
+            self.status_bar.showMessage("Failed to send sample rate command")
+            logger.warning("Failed to send sample rate command")
+
     def on_save_zero_clicked(self):
         """Handle Save Zero button click - saves current offsets to Flash"""
         if self.send_command(CAN_CMD_SAVE_ZERO):
-            self.status_bar.showMessage("Zero offset saved to Flash")
-            logger.info("Zero offset saved to Flash")
+            self.status_bar.showMessage("Save Zero command sent, waiting for device ACK")
+            logger.info("Save Zero command sent")
         else:
             self.status_bar.showMessage("Failed to save zero offset")
             logger.warning("Failed to save zero offset")
@@ -396,8 +485,8 @@ class ReducerMonitorWindow(QMainWindow):
     def on_load_zero_clicked(self):
         """Handle Load Zero button click - loads offsets from Flash"""
         if self.send_command(CAN_CMD_LOAD_ZERO):
-            self.status_bar.showMessage("Zero offset loaded from Flash")
-            logger.info("Zero offset loaded from Flash")
+            self.status_bar.showMessage("Load Zero command sent, waiting for device ACK")
+            logger.info("Load Zero command sent")
         else:
             self.status_bar.showMessage("Failed to load zero offset")
             logger.warning("Failed to load zero offset")
@@ -405,8 +494,8 @@ class ReducerMonitorWindow(QMainWindow):
     def on_clear_zero_clicked(self):
         """Handle Clear Zero button click - clears offsets from Flash"""
         if self.send_command(CAN_CMD_CLEAR_ZERO):
-            self.status_bar.showMessage("Zero offset cleared from Flash")
-            logger.info("Zero offset cleared from Flash")
+            self.status_bar.showMessage("Clear Zero command sent, waiting for device ACK")
+            logger.info("Clear Zero command sent")
         else:
             self.status_bar.showMessage("Failed to clear zero offset")
             logger.warning("Failed to clear zero offset")
@@ -443,6 +532,16 @@ class ReducerMonitorWindow(QMainWindow):
         layout.addWidget(self.clear_zero_btn)
 
         # Filter size control
+        layout.addWidget(QLabel("Sample Rate:"))
+        self.sample_rate_combo = QComboBox()
+        for sample_rate in SUPPORTED_SAMPLE_RATES:
+            self.sample_rate_combo.addItem(f"{sample_rate} SPS", sample_rate)
+        self.sample_rate_combo.setCurrentText("100 SPS")
+        self.sample_rate_combo.setEnabled(False)
+        self.sample_rate_combo.currentIndexChanged.connect(self.on_sample_rate_changed)
+        layout.addWidget(self.sample_rate_combo)
+
+        # Filter size control
         layout.addWidget(QLabel("Filter Size:"))
         self.filter_size_spin = QSpinBox()
         self.filter_size_spin.setMinimum(2)
@@ -459,30 +558,44 @@ class ReducerMonitorWindow(QMainWindow):
 
     def connect(self):
         """Connect to the CAN adapter"""
-        port = self.port_combo.currentData()
-        if not port:
-            QMessageBox.warning(self, "Error", "Please select a COM port")
+        interface = self.interface_combo.currentData()
+        channel = self._selected_channel()
+        if not channel:
+            QMessageBox.warning(self, "Error", "Please select a CAN channel or serial port")
             return
 
         baudrate = self.baud_combo.currentData()
+        tty_baudrate = int(self.serial_baud_combo.currentData() or DEFAULT_SLCAN_TTY_BAUDRATE)
 
         try:
-            self.slcan = SLCANProtocol()
-            if not self.slcan.connect(port, baudrate):
-                QMessageBox.critical(self, "Error", f"Failed to connect to {port}")
-                return
-
-            if not self.slcan.open():
-                QMessageBox.critical(self, "Error", "Failed to open CAN channel")
-                self.slcan.disconnect()
-                self.slcan = None
+            self.can_bus = PythonCANInterface()
+            if not self.can_bus.connect(
+                interface,
+                channel,
+                baudrate,
+                tty_baudrate=tty_baudrate,
+            ):
+                interface_help = (
+                    "Check the COM port name, adapter baudrate, and CAN bitrate."
+                    if interface == "slcan"
+                    else "If using socketcan, make sure the interface is already up."
+                )
+                QMessageBox.critical(
+                    self,
+                    "Error",
+                    f"Failed to connect to {interface}:{channel}\n"
+                    f"{interface_help}",
+                )
+                self.can_bus = None
                 return
 
             # Start receiver thread
-            self.can_receiver = CANReceiver(self.slcan)
+            self.can_receiver = CANReceiver(self.can_bus)
             self.can_receiver.frame_received.connect(self.on_can_frame_received)
             self.can_receiver.start()
             self._reset_measurements()
+            self.pending_commands.clear()
+            self.command_sequence = 0
 
             self.is_connected = True
             self.connect_btn.setText("Disconnect")
@@ -492,31 +605,49 @@ class ReducerMonitorWindow(QMainWindow):
             self.save_zero_btn.setEnabled(True)
             self.load_zero_btn.setEnabled(True)
             self.clear_zero_btn.setEnabled(True)
+            self.sample_rate_combo.setEnabled(True)
             self.filter_size_spin.setEnabled(True)
-            self.status_bar.showMessage(f"Connected to {port} at {baudrate.bps} bps")
+            if interface == "slcan":
+                self.status_bar.showMessage(
+                    f"Connected to {channel} via slcan (adapter {tty_baudrate}, CAN {baudrate.bps} bps)"
+                )
+            else:
+                self.status_bar.showMessage(
+                    f"Connected to {interface}:{channel} at {baudrate.bps} bps"
+                )
 
-            logger.info(f"Connected to {port}")
+            logger.info(
+                "Connected to %s:%s (adapter baud %s, CAN bitrate %s)",
+                interface,
+                channel,
+                tty_baudrate if interface == "slcan" else "n/a",
+                baudrate.bps,
+            )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Connection failed: {e}")
             logger.error(f"Connection failed: {e}")
-            if self.slcan:
-                self.slcan.disconnect()
-                self.slcan = None
+            if self.can_bus:
+                self.can_bus.disconnect()
+                self.can_bus = None
 
     def disconnect(self):
         """Disconnect from the CAN adapter"""
+        if self.logging_enabled:
+            self.stop_logging()
+
         if self.can_receiver:
             self.can_receiver.stop()
             self.can_receiver.wait(1000)
             self.can_receiver = None
 
-        if self.slcan:
-            self.slcan.close()
-            self.slcan.disconnect()
-            self.slcan = None
+        if self.can_bus:
+            self.can_bus.disconnect()
+            self.can_bus = None
 
         self.is_connected = False
+        self.pending_commands.clear()
+        self.pending_command_deadlines.clear()
         self._reset_measurements()
         self.connect_btn.setText("Connect")
         self.log_btn.setEnabled(False)
@@ -525,54 +656,36 @@ class ReducerMonitorWindow(QMainWindow):
         self.save_zero_btn.setEnabled(False)
         self.load_zero_btn.setEnabled(False)
         self.clear_zero_btn.setEnabled(False)
+        self.sample_rate_combo.setEnabled(False)
         self.filter_size_spin.setEnabled(False)
         self.status_bar.showMessage("Disconnected")
         logger.info("Disconnected")
 
     def on_can_frame_received(self, frame: CANFrame):
-        """Handle received CAN frame - only combined frame format (0x05)"""
-        if frame.id != CAN_ID_TX_DATA:
+        """Handle received CAN frames from the adapter"""
+        status = parse_status_frame(frame)
+        if status is not None:
+            self._handle_status_frame(status)
             return
 
-        if len(frame.data) < 8:
-            logger.warning(f"Short frame received: {len(frame.data)} bytes")
+        telemetry = parse_telemetry_frame(frame)
+        if telemetry is None:
+            if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS):
+                logger.warning("Rejected malformed protocol frame on CAN ID 0x%03X", frame.id)
             return
 
-        frame_type = frame.data[0]
-        channel = frame.data[1]
+        channel = telemetry.channel
 
         if channel >= NUM_CHANNELS:
             logger.warning(f"Invalid channel: {channel}")
             return
 
-        # Only handle combined frame format (frame_type=0x05)
-        if frame_type != CAN_FRAME_COMBINED:
-            logger.warning(f"Unknown frame type: 0x{frame_type:02X}")
-            return
-
-        # Combined frame format: all data in one frame
-        # Byte 0: frame_type (0x05)
-        # Byte 1: channel
-        # Bytes 2-3: voltage (int16, BE, 0.1 mV)
-        # Bytes 4-5: strain (int16, BE, µε)
-        # Byte 6: stress (int8, signed, 0.1 MPa)
-        # Byte 7: crc8 (XOR checksum of bytes 0-6)
-
-        # Verify CRC-8
-        received_crc = frame.data[7]
-        calculated_crc = crc8_xor(frame.data[:7])
-        if received_crc != calculated_crc:
-            logger.warning(f"CRC-8 mismatch: received=0x{received_crc:02X}, calculated=0x{calculated_crc:02X}")
-            return
-
-        voltage_01mv = int.from_bytes(frame.data[2:4], byteorder='big', signed=True)
-        strain_ue = int.from_bytes(frame.data[4:6], byteorder='big', signed=True)
-        stress_01mpa = struct.unpack('>b', bytes([frame.data[6]]))[0]  # signed int8
-
         with self.lock:
-            self.channel_data[channel].voltage = voltage_01mv / 10.0  # Convert 0.1mV to mV
-            self.channel_data[channel].strain = float(strain_ue)
-            self.channel_data[channel].stress = stress_01mpa / 10.0  # Convert 0.1MPa to MPa
+            self.channel_data[channel].voltage = telemetry.voltage_01mv / 10.0
+            self.channel_data[channel].strain = float(telemetry.strain_ue)
+            self.channel_data[channel].stress = (
+                self.channel_data[channel].strain * DEFAULT_ELASTIC_MODULUS_MPA / 1_000_000.0
+            )
             self.channel_data[channel].displacement = self.channel_data[channel].stress * 0.01
 
         self.data_updated.emit(channel, {
@@ -586,8 +699,7 @@ class ReducerMonitorWindow(QMainWindow):
         """Handle data update signal"""
         # Update waveform buffer
         self.waveform_buffers[channel].append(data['voltage'])
-        if len(self.waveform_buffers[channel]) > WAVEFORM_BUFFER_SIZE:
-            self.waveform_buffers[channel].pop(0)
+        self.plot_dirty[channel] = True
 
         # Update data table
         if channel < self.data_table.rowCount():
@@ -620,8 +732,9 @@ class ReducerMonitorWindow(QMainWindow):
         """Update waveform plots (called by timer)"""
         with self.lock:
             for ch in range(NUM_CHANNELS):
-                if self.waveform_buffers[ch]:
-                    self.plot_curves[ch].setData(self.waveform_buffers[ch])
+                if self.plot_dirty[ch]:
+                    self.plot_curves[ch].setData(list(self.waveform_buffers[ch]))
+                    self.plot_dirty[ch] = False
 
     def on_log_clicked(self):
         """Handle logging button click"""
@@ -680,6 +793,54 @@ class ReducerMonitorWindow(QMainWindow):
             self.disconnect()
 
         event.accept()
+
+    def _command_name(self, cmd_type: int) -> str:
+        command_names = {
+            CAN_CMD_SET_SAMPLE_RATE: "Set Sample Rate",
+            CAN_CMD_SET_FILTER_SIZE: "Set Filter Size",
+            CAN_CMD_ZERO_DATUM: "Zero Sensor",
+            CAN_CMD_START_CALIB: "Calibrate",
+            CAN_CMD_SAVE_ZERO: "Save Zero",
+            CAN_CMD_LOAD_ZERO: "Load Zero",
+            CAN_CMD_CLEAR_ZERO: "Clear Zero",
+        }
+        return command_names.get(cmd_type, f"Command 0x{cmd_type:02X}")
+
+    def _handle_status_frame(self, status: StatusFrame) -> None:
+        command_name = self.pending_commands.pop(status.sequence, self._command_name(status.cmd_type))
+        self.pending_command_deadlines.pop(status.sequence, None)
+        if status.status == CAN_STATUS_OK:
+            self.status_bar.showMessage(f"{command_name} acknowledged")
+            logger.info("%s acknowledged, value=%u", command_name, status.value)
+            return
+
+        reason = {
+            CAN_STATUS_BAD_CRC: "CRC mismatch",
+            CAN_STATUS_BAD_TYPE: "invalid frame type",
+            CAN_STATUS_BAD_CMD: "unsupported command",
+            CAN_STATUS_BAD_VALUE: "invalid value",
+            CAN_STATUS_STORAGE_ERROR: "storage error",
+        }.get(status.status, f"status 0x{status.status:02X}")
+        self.status_bar.showMessage(f"{command_name} rejected: {reason}")
+        logger.warning(
+            "%s rejected: %s (detail=0x%02X, value=%u)",
+            command_name,
+            reason,
+            status.detail,
+            status.value,
+        )
+
+    def _check_command_timeouts(self) -> None:
+        now = time.monotonic()
+        expired = [
+            sequence for sequence, deadline in self.pending_command_deadlines.items()
+            if deadline <= now
+        ]
+        for sequence in expired:
+            self.pending_command_deadlines.pop(sequence, None)
+            command_name = self.pending_commands.pop(sequence, f"Command sequence {sequence}")
+            self.status_bar.showMessage(f"{command_name} timed out waiting for ACK")
+            logger.warning("%s timed out waiting for ACK", command_name)
 
 
 def main():

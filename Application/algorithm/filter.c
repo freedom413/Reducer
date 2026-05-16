@@ -1,5 +1,6 @@
 #include "filter.h"
 #include "flash_storage.h"
+#include <stddef.h>
 
 static moving_avg_filter_t filters[FILTER_CHANNEL_COUNT];
 static uint8_t current_window_size = FILTER_WINDOW_SIZE_DEFAULT;
@@ -75,8 +76,10 @@ int32_t filter_apply(uint8_t ch, int32_t raw)
     f->buffer[f->index] = raw;
     f->sum += raw;
 
-    // Advance index
-    f->index = (f->index + 1) % win_size;
+    f->index++;
+    if (f->index >= win_size) {
+        f->index = 0;
+    }
 
     // Update count (only needed at start)
     if (f->count < win_size) {
@@ -85,7 +88,7 @@ int32_t filter_apply(uint8_t ch, int32_t raw)
 
     // Return average - use fixed point for precision
     // Subtract zero offset to get calibrated value
-    int32_t filtered = f->sum / (int32_t)f->count;
+    int32_t filtered = (int32_t)(f->sum / (int64_t)f->count);
     return filtered - f->zero_offset;
 }
 
@@ -97,27 +100,29 @@ void filter_set_zero_offset(uint8_t ch, int32_t offset)
 
 void filter_get_zero_offset(uint8_t ch, int32_t *offset)
 {
-    if (ch >= FILTER_CHANNEL_COUNT) return;
+    if (ch >= FILTER_CHANNEL_COUNT || offset == NULL) return;
     *offset = filters[ch].zero_offset;
 }
 
-void filter_save_zero_to_flash(void)
+int filter_save_zero_to_flash(void)
 {
     int32_t offsets[FILTER_CHANNEL_COUNT];
     for (uint8_t i = 0; i < FILTER_CHANNEL_COUNT; i++) {
         offsets[i] = filters[i].zero_offset;
     }
-    flash_storage_save_zero(offsets);
+    return flash_storage_save_zero(offsets);
 }
 
-void filter_load_zero_from_flash(void)
+int filter_load_zero_from_flash(void)
 {
     int32_t offsets[FILTER_CHANNEL_COUNT];
     if (flash_storage_load_zero(offsets) == 0) {
         for (uint8_t i = 0; i < FILTER_CHANNEL_COUNT; i++) {
             filters[i].zero_offset = offsets[i];
         }
+        return 0;
     }
+    return -1;
 }
 
 int32_t filter_get_raw_filtered(uint8_t ch)
@@ -128,5 +133,5 @@ int32_t filter_get_raw_filtered(uint8_t ch)
     if (f->count == 0) {
         return 0;
     }
-    return f->sum / (int32_t)f->count;
+    return (int32_t)(f->sum / (int64_t)f->count);
 }

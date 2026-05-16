@@ -2,7 +2,6 @@
 #include <math.h>
 #include <stdbool.h>
 #include <string.h>
-#include "dbg.h"
 #include "delay.h"
 #include "can.h"
 #include "fdcan.h"
@@ -15,8 +14,6 @@
 #include "flexspline_math.h"
 #include "stm32g4xx_hal_flash.h"
 #include "stm32g4xx_hal_flash_ex.h"
-
-void ads1256_int_enable(void);
 
 // ============================================================================
 // Flash Hardware Operations (must be provided by user)
@@ -82,50 +79,62 @@ void flash_storage_register_user_ops(void)
     flash_storage_register_ops(&flash_hw_ops);
 }
 
-void ads1256_int_enable(void);
-
 // ============================================================================
 // Constants and Configuration
 // ============================================================================
 #define ADC_CHANNEL_COUNT   6
 #define ADC_ALL_CH_MASK     0x3F
+#define ADC_CHIP_COUNT      2
+#define CAN_COMMANDS_PER_LOOP 4
 
 // ============================================================================
-// ADC Channel Mapping Optimization
+// ADC Channel Mapping
 // ============================================================================
-// Lookup table for O(1) channel mapping
-// Index: encoded channel (pid<<4 | p<<1 | n>>3) -> logical channel 0-5
-// A chip channels: 0-2, B chip channels: 3-5
+#define ADC_CH_KEY(p, n)  ((((uint8_t)(p)) << 4) | ((uint8_t)(n) & 0x0FU))
 
-// Helper macro to encode channel key
-#define ADC_CH_KEY(pid, p, n)  (((pid) << 4) | (((p) << 1) | ((n) >> 3)))
+static int8_t adc_ch_lookup[ADC_CHIP_COUNT][256];
 
-// Initialize lookup table at runtime for better compatibility
-static int8_t adc_ch_lookup[256];
+static int8_t adc_pid_to_index(uint8_t pid)
+{
+    switch (pid) {
+        case ADS1256_A:
+            return 0;
+        case ADS1256_B:
+            return 1;
+        default:
+            return -1;
+    }
+}
 
 static void adc_ch_lookup_init(void)
 {
-    // Initialize all entries to -1 (invalid)
-    for (int i = 0; i < 256; i++) {
-        adc_ch_lookup[i] = -1;
+    for (uint8_t chip = 0; chip < ADC_CHIP_COUNT; chip++) {
+        for (uint16_t i = 0; i < 256U; i++) {
+            adc_ch_lookup[chip][i] = -1;
+        }
     }
+
     // ADS1256_A channel 0: AIN0-AIN1 -> logical channel 0
-    adc_ch_lookup[ADC_CH_KEY(ADS1256_A, ADS1256_AIN0, ADS1256_AIN1)] = 0;
+    adc_ch_lookup[0][ADC_CH_KEY(ADS1256_AIN0, ADS1256_AIN1)] = 0;
     // ADS1256_A channel 1: AIN2-AIN3 -> logical channel 1
-    adc_ch_lookup[ADC_CH_KEY(ADS1256_A, ADS1256_AIN2, ADS1256_AIN3)] = 1;
+    adc_ch_lookup[0][ADC_CH_KEY(ADS1256_AIN2, ADS1256_AIN3)] = 1;
     // ADS1256_A channel 2: AIN4-AIN5 -> logical channel 2
-    adc_ch_lookup[ADC_CH_KEY(ADS1256_A, ADS1256_AIN4, ADS1256_AIN5)] = 2;
+    adc_ch_lookup[0][ADC_CH_KEY(ADS1256_AIN4, ADS1256_AIN5)] = 2;
     // ADS1256_B channel 0: AIN0-AIN1 -> logical channel 3
-    adc_ch_lookup[ADC_CH_KEY(ADS1256_B, ADS1256_AIN0, ADS1256_AIN1)] = 3;
+    adc_ch_lookup[1][ADC_CH_KEY(ADS1256_AIN0, ADS1256_AIN1)] = 3;
     // ADS1256_B channel 1: AIN2-AIN3 -> logical channel 4
-    adc_ch_lookup[ADC_CH_KEY(ADS1256_B, ADS1256_AIN2, ADS1256_AIN3)] = 4;
+    adc_ch_lookup[1][ADC_CH_KEY(ADS1256_AIN2, ADS1256_AIN3)] = 4;
     // ADS1256_B channel 2: AIN4-AIN5 -> logical channel 5
-    adc_ch_lookup[ADC_CH_KEY(ADS1256_B, ADS1256_AIN4, ADS1256_AIN5)] = 5;
+    adc_ch_lookup[1][ADC_CH_KEY(ADS1256_AIN4, ADS1256_AIN5)] = 5;
 }
 
-static inline int8_t adc_encode_ch(uint8_t pid, ads1256_ain_t p, ads1256_ain_t n)
+static int8_t adc_logical_channel(uint8_t pid, ads1256_ain_t p, ads1256_ain_t n)
 {
-    return (int8_t)((pid << 4) | (((p) << 1) | ((n) >> 3)));
+    int8_t chip = adc_pid_to_index(pid);
+    if (chip < 0) {
+        return -1;
+    }
+    return adc_ch_lookup[(uint8_t)chip][ADC_CH_KEY(p, n)];
 }
 
 // ============================================================================
@@ -220,9 +229,48 @@ static void reset_statistics(void)
     }
 }
 
-static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
+static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
+                            uint16_t value, uint8_t detail)
+{
+    can_tx_status_frame_t frame;
+    can_build_status_frame(&frame, sequence, cmd_type, status, value, detail);
+    can_classic_data_frame_send(CAN_ID_TX_STATUS, (uint8_t *)&frame, sizeof(frame));
+}
+
+static int16_t clamp_i16_from_float(float value)
+{
+    long rounded = lrintf(value);
+    if (rounded > INT16_MAX) {
+        return INT16_MAX;
+    }
+    if (rounded < INT16_MIN) {
+        return INT16_MIN;
+    }
+    return (int16_t)rounded;
+}
+
+static int8_t clamp_i8_from_float(float value)
+{
+    long rounded = lrintf(value);
+    if (rounded > INT8_MAX) {
+        return INT8_MAX;
+    }
+    if (rounded < INT8_MIN) {
+        return INT8_MIN;
+    }
+    return (int8_t)rounded;
+}
+
+static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t value,
+                                   uint16_t *applied_value, uint8_t *detail)
 {
     (void)param;
+    if (applied_value != NULL) {
+        *applied_value = value;
+    }
+    if (detail != NULL) {
+        *detail = 0;
+    }
 
     switch (cmd_type) {
         case CAN_CMD_ZERO_DATUM:
@@ -231,57 +279,93 @@ static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
                 int32_t raw_filtered = filter_get_raw_filtered(i);
                 filter_set_zero_offset(i, raw_filtered);
             }
-            filter_save_zero_to_flash();
+            if (filter_save_zero_to_flash() != 0) {
+                if (detail != NULL) {
+                    *detail = 1;
+                }
+                return CAN_STATUS_STORAGE_ERROR;
+            }
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
 
         case CAN_CMD_SET_FILTER_SIZE:
-            // param: channel (unused, applies to all)
-            // value: new filter window size
+            if (value < 2U || value > 64U) {
+                if (detail != NULL) {
+                    *detail = (uint8_t)value;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
             filter_set_window_size((uint8_t)value);
-            break;
+            if (applied_value != NULL) {
+                *applied_value = value;
+            }
+            return CAN_STATUS_OK;
 
         case CAN_CMD_SET_SAMPLE_RATE:
-            // param: ADC chip (0=ADS1256_A, 1=ADS1256_B, 2=both)
-            // value: SPS code (see ads1256_sps_t)
-            // Note: This requires reconfiguration and is hardware dependent
-            // For now, we acknowledge but don't actually change rate
-            // Future: implement if needed
-            break;
+            if (adc_ads1256_set_sample_rate(value) != 0) {
+                if (detail != NULL) {
+                    *detail = 1;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
+            if (applied_value != NULL) {
+                *applied_value = adc_ads1256_get_sample_rate();
+            }
+            filter_reset_all();
+            reset_statistics();
+            return CAN_STATUS_OK;
 
         case CAN_CMD_START_CALIB:
-            // Trigger ADS1256 self-calibration
-            adc_ads1256_calibrate();
-            // Also reset filters and statistics after calibration
+            if (adc_ads1256_calibrate() != 0 || adc_ads1256_restart() != 0) {
+                if (detail != NULL) {
+                    *detail = 2;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
 
         case CAN_CMD_SAVE_ZERO:
-            // Save current zero offsets to Flash
-            filter_save_zero_to_flash();
-            break;
+            if (filter_save_zero_to_flash() != 0) {
+                if (detail != NULL) {
+                    *detail = 1;
+                }
+                return CAN_STATUS_STORAGE_ERROR;
+            }
+            return CAN_STATUS_OK;
 
         case CAN_CMD_LOAD_ZERO:
-            // Reload zero offsets from Flash
-            filter_load_zero_from_flash();
+            if (filter_load_zero_from_flash() != 0) {
+                if (detail != NULL) {
+                    *detail = 2;
+                }
+                return CAN_STATUS_STORAGE_ERROR;
+            }
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
 
         case CAN_CMD_CLEAR_ZERO:
-            // Clear zero offsets from Flash and reset to 0
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
                 filter_set_zero_offset(i, 0);
             }
-            flash_storage_clear();
+            if (flash_storage_clear() != 0) {
+                if (detail != NULL) {
+                    *detail = 3;
+                }
+                return CAN_STATUS_STORAGE_ERROR;
+            }
             filter_reset_all();
             reset_statistics();
-            break;
+            return CAN_STATUS_OK;
 
         default:
-            break;
+            if (detail != NULL) {
+                *detail = cmd_type;
+            }
+            return CAN_STATUS_BAD_CMD;
     }
 }
 
@@ -290,25 +374,37 @@ static void process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value)
 // ============================================================================
 void loop(void)
 {
-    /* Process incoming CAN commands FIRST */
     can_msg_t msg;
-    // Use timeout=0 for non-blocking check
-    if (can_recv(&msg, 1) == (int)sizeof(can_msg_t)) {
+    for (uint8_t cmd_count = 0; cmd_count < CAN_COMMANDS_PER_LOOP; cmd_count++) {
+        if (can_recv(&msg, 1) != (int)sizeof(can_msg_t)) {
+            break;
+        }
+
         int dlc_bytes = can_data_len_get(msg.RxHeader.DataLength);
-        if (msg.RxHeader.Identifier == CAN_ID_RX_CONFIG &&
-            dlc_bytes >= (int)sizeof(can_rx_frame_t)) {
-            /* Parse command frame (matches can_rx_frame_t) */
-            uint8_t cmd_type = msg.data[0];
-            uint8_t param = msg.data[1];
-            uint32_t value = ((uint32_t)msg.data[2]) |
-                             ((uint32_t)msg.data[3] << 8) |
-                             ((uint32_t)msg.data[4] << 16) |
-                             ((uint32_t)msg.data[5] << 24);
-            process_can_command(cmd_type, param, value);
+        if (msg.RxHeader.Identifier == CAN_ID_RX_COMMAND &&
+            dlc_bytes >= (int)sizeof(can_rx_command_frame_t)) {
+            const can_rx_command_frame_t *frame = (const can_rx_command_frame_t *)msg.data;
+            uint8_t expected_crc = can_calc_crc8(msg.data, 7);
+            uint16_t value = can_frame_u16_le_get(frame->value_le);
+            uint8_t detail = 0;
+
+            if (frame->frame_type != CAN_FRAME_TYPE_COMMAND) {
+                send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_TYPE,
+                                value, frame->frame_type);
+            } else if (frame->crc8 != expected_crc) {
+                send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_CRC,
+                                value, expected_crc);
+            } else {
+                uint16_t applied_value = value;
+                uint8_t status = process_can_command(frame->cmd_type, frame->param, value,
+                                                     &applied_value, &detail);
+                send_can_status(frame->sequence, frame->cmd_type, status,
+                                applied_value, detail);
+            }
         }
     }
 
-    ads1256_drdy_callback();
+    adc_ads1256_poll();
 
     int recv_count = adc_ads1256_get_data(adc_ads1256_data, ADC_CHANNEL_COUNT);
 
@@ -318,7 +414,7 @@ void loop(void)
         ads1256_data_get_ch(&adc_ads1256_data[i], &ch);
 
         // O(1) lookup instead of O(n) search
-        int8_t logical_ch = adc_ch_lookup[adc_encode_ch(pid, ch.p, ch.n)];
+        int8_t logical_ch = adc_logical_channel(pid, ch.p, ch.n);
         if (logical_ch >= 0 && logical_ch < ADC_CHANNEL_COUNT) {
             adc_raw_value[logical_ch] = adc_ads1256_data[i].raw_value;
             adc_all_ch_mask |= (1U << logical_ch);
@@ -347,17 +443,17 @@ void loop(void)
             flexspline_calculate(filtered, &flexspline_params, &result);
 
             /* Use combined CAN frame to reduce bus load (1 frame per channel instead of 3) */
-            can_tx_combined_frame_t frame;
+            can_tx_telemetry_frame_t frame;
 
             // voltage in 0.1 mV units (e.g., 123.4 mV -> 1234)
-            int16_t voltage_01mv = (int16_t)lrintf(result.voltage * 10);
+            int16_t voltage_01mv = clamp_i16_from_float(result.voltage * 10.0f);
             // strain in micro-strain units
-            int16_t strain_ue = (int16_t)result.strain;
-            // stress in 0.1 MPa units (e.g., 12.3 MPa -> 123)
-            int8_t stress_01mpa = (int8_t)lrintf(result.stress * 10);
+            int16_t strain_ue = clamp_i16_from_float(result.strain);
+            // stress preview in 0.1 MPa units, clipped to fit the compact 1-byte field
+            int8_t stress_01mpa = clamp_i8_from_float(result.stress * 10.0f);
 
-            can_build_combined_frame(&frame, i, voltage_01mv, strain_ue, stress_01mpa);
-            can_classic_data_frame_send(CAN_ID_TX_DATA, (uint8_t *)&frame, sizeof(frame));
+            can_build_telemetry_frame(&frame, i, voltage_01mv, strain_ue, stress_01mpa);
+            can_classic_data_frame_send(CAN_ID_TX_TELEMETRY, (uint8_t *)&frame, sizeof(frame));
         }
     }
 }

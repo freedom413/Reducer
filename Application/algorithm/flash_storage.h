@@ -25,9 +25,13 @@ typedef struct __attribute__((packed)) {
     int32_t zero_offset[6];     // Zero offset for each channel
     uint16_t crc16;             // CRC-16 of zero_offset data
     uint16_t magic;             // Magic number for validation
+    uint8_t reserved[2];        // Pad to 32 bytes for 64-bit flash programming
 } calib_data_t;
 
 #define CALIB_MAGIC             0xCA1B  // Calibration valid marker
+
+_Static_assert(sizeof(calib_data_t) == FLASH_STORAGE_SIZE,
+               "calib_data_t must match flash storage size");
 
 // ============================================================================
 // Flash Hardware Abstraction Interface (function pointers)
