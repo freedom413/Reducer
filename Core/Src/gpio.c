@@ -60,13 +60,13 @@ void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : ADC1_DRDY_Pin */
   GPIO_InitStruct.Pin = ADC1_DRDY_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(ADC1_DRDY_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : ADC2_DRDY_Pin */
   GPIO_InitStruct.Pin = ADC2_DRDY_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(ADC2_DRDY_GPIO_Port, &GPIO_InitStruct);
 
@@ -104,6 +104,9 @@ void MX_GPIO_Init(void)
   // HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
   // HAL_NVIC_EnableIRQ(EXTI1_IRQn);
 
+  HAL_NVIC_DisableIRQ(EXTI0_IRQn);
+  HAL_NVIC_DisableIRQ(EXTI1_IRQn);
+
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
@@ -112,11 +115,7 @@ void MX_GPIO_Init(void)
 /* USER CODE BEGIN 2 */
 void ads1256_int_enable(void)
 {
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+  HAL_NVIC_DisableIRQ(EXTI0_IRQn);
+  HAL_NVIC_DisableIRQ(EXTI1_IRQn);
 }
 /* USER CODE END 2 */

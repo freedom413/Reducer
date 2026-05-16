@@ -1,12 +1,3 @@
-[submodule "components/printf"]
-	path = components/printf
-	url = git@github.com:mpaland/printf.git
-[submodule "components/cJSON"]
-	path = components/cJSON
-	url = git@github.com:DaveGamble/cJSON.git
-[submodule "components/FlashDB"]
-	path = components/FlashDB
-	url = https://github.com/armink/FlashDB.git
 [submodule "components/lwrb"]
 	path = components/lwrb
 	url = https://github.com/MaJerle/lwrb.git

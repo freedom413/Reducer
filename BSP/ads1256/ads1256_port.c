@@ -172,11 +172,11 @@ int adc_ads1256_init(void)
     }
 
     // 配置采样速率
-    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_2_5);
+    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_100);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_2_5);
+    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_100);
     if (ret < 0) {
         return ret;
     }
