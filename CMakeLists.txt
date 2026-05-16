@@ -49,15 +49,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/ads1256/ads1256_port.c
     BSP/ads1256/ads1256_raw_data_recv.c
     BSP/can.c
-    BSP/dbg.c
     BSP/delay.c
     Application/user.c
-    Application/algorithm/adc_conversion.c
     components/lwrb/lwrb/src/lwrb/lwrb.c
-    components/lwrb/lwrb/src/lwrb/lwrb_ex.c
-    components/cJSON/cJSON.c
-    components/cJSON/cJSON_Utils.c
-    components/printf/printf.c
     Application/algorithm/can_data.c
     Application/algorithm/filter.c
     Application/algorithm/flash_storage.c
@@ -73,8 +67,6 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/ads1256/driver
     Application
     Application/algorithm
-    components/cJSON
-    components/printf
     components/lwrb/lwrb/src/include/lwrb
     components/lwrb/lwrb/src/include
 )
@@ -82,8 +74,6 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
-    # Enable component debug printf
-    COM_DBG_PRINTF
     LWRB_DEV
 )
 

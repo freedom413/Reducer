@@ -1,14 +1,15 @@
 """
 can_protocol.py - python-can transport and Reducer CAN protocol helpers.
 
-Supports candleLight-compatible adapters through python-can backends such as
-socketcan (Linux) and gs_usb.
+Supports SLCAN serial adapters and keeps compatibility with other python-can
+backends already used by this project.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import struct
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -19,11 +20,9 @@ except ImportError:  # pragma: no cover - handled at runtime on user machine
     can = None
 
 try:
-    import usb.core
-except ImportError:  # pragma: no cover - optional for gs_usb enumeration
-    usb = None
-else:
-    usb = usb.core
+    from serial.tools import list_ports
+except ImportError:  # pragma: no cover - handled at runtime on user machine
+    list_ports = None
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +40,18 @@ CAN_STATUS_BAD_CRC = 0xE1
 CAN_STATUS_BAD_TYPE = 0xE2
 CAN_STATUS_BAD_CMD = 0xE3
 CAN_STATUS_BAD_VALUE = 0xE4
+CAN_STATUS_STORAGE_ERROR = 0xE5
+
+DEFAULT_SLCAN_TTY_BAUDRATE = 115200
+DEFAULT_SLCAN_OPEN_DELAY = 2.0
+SUPPORTED_SLCAN_SERIAL_BAUDRATES = (
+    115200,
+    230400,
+    460800,
+    921600,
+    1000000,
+    2000000,
+)
 
 
 class Baudrate(Enum):
@@ -119,7 +130,7 @@ def build_command_frame(sequence: int, cmd_type: int, param: int = 0, value: int
 
 
 def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
-    if frame.id != CAN_ID_TX_STATUS or len(frame.data) < 8:
+    if frame.id != CAN_ID_TX_STATUS or len(frame.data) != 8:
         return None
     if frame.data[0] != CAN_FRAME_TYPE_STATUS:
         return None
@@ -135,23 +146,28 @@ def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
 
 
 def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
-    if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) < 8:
+    if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) != 8:
         return None
     if frame.data[0] != CAN_FRAME_TYPE_TELEMETRY:
         return None
     if crc8_xor(frame.data[:7]) != frame.data[7]:
         return None
+    _, channel, voltage_01mv, strain_ue, stress_01mpa, _ = struct.unpack(">BBhhbB", frame.data)
     return TelemetryFrame(
-        channel=frame.data[1],
-        voltage_01mv=int.from_bytes(frame.data[2:4], byteorder="big", signed=True),
-        strain_ue=int.from_bytes(frame.data[4:6], byteorder="big", signed=True),
-        stress_01mpa=int.from_bytes(frame.data[6:7], byteorder="big", signed=True),
+        channel=channel,
+        voltage_01mv=voltage_01mv,
+        strain_ue=strain_ue,
+        stress_01mpa=stress_01mpa,
     )
 
 
-class _PythonCanListener:
+class _PythonCanListener(can.Listener if can is not None else object):
     def __init__(self, callbacks: List[Callable[[CANFrame], None]]):
+        super().__init__()
         self._callbacks = callbacks
+
+    def __call__(self, msg) -> None:
+        self.on_message_received(msg)
 
     def on_message_received(self, msg) -> None:
         frame = CANFrame(
@@ -175,9 +191,18 @@ class PythonCANInterface:
         self.interface: Optional[str] = None
         self.channel: Optional[str] = None
         self.bitrate: Optional[Baudrate] = None
+        self.tty_baudrate: Optional[int] = None
         self._rx_callbacks: List[Callable[[CANFrame], None]] = []
 
-    def connect(self, interface: str, channel: str, bitrate: Baudrate) -> bool:
+    def connect(
+        self,
+        interface: str,
+        channel: str,
+        bitrate: Baudrate,
+        *,
+        tty_baudrate: int = DEFAULT_SLCAN_TTY_BAUDRATE,
+        sleep_after_open: float = DEFAULT_SLCAN_OPEN_DELAY,
+    ) -> bool:
         if can is None:
             raise RuntimeError("python-can is not installed")
 
@@ -185,7 +210,11 @@ class PythonCANInterface:
             "interface": interface,
             "channel": self._normalize_channel(interface, channel),
         }
-        if interface != "socketcan":
+        if interface == "slcan":
+            kwargs["bitrate"] = bitrate.bps
+            kwargs["tty_baudrate"] = int(tty_baudrate)
+            kwargs["sleep_after_open"] = sleep_after_open
+        elif interface != "socketcan":
             kwargs["bitrate"] = bitrate.bps
 
         try:
@@ -195,6 +224,7 @@ class PythonCANInterface:
             self.interface = interface
             self.channel = channel
             self.bitrate = bitrate
+            self.tty_baudrate = int(tty_baudrate) if interface == "slcan" else None
             return True
         except Exception as exc:
             logger.error("Failed to connect CAN bus (%s/%s): %s", interface, channel, exc)
@@ -219,6 +249,7 @@ class PythonCANInterface:
         self.interface = None
         self.channel = None
         self.bitrate = None
+        self.tty_baudrate = None
 
     def send_frame(self, frame: CANFrame) -> bool:
         if can is None:
@@ -249,25 +280,49 @@ class PythonCANInterface:
 
     @staticmethod
     def _normalize_channel(interface: str, channel: str):
-        if interface == "gs_usb":
-            if channel.isdigit():
-                return int(channel)
         return channel
 
 
 def available_interfaces() -> List[Tuple[str, str]]:
     return [
+        ("slcan", "SLCAN (serial USB-CAN)"),
         ("socketcan", "SocketCAN (Linux canX/vcanX)"),
-        ("gs_usb", "gs_usb (candleLight / CANable)"),
     ]
 
 
 def list_can_channels(interface: str) -> List[Tuple[str, str]]:
+    if interface == "slcan":
+        return _list_slcan_channels()
     if interface == "socketcan":
         return _list_socketcan_channels()
-    if interface == "gs_usb":
-        return _list_gs_usb_channels()
     return []
+
+
+def _list_slcan_channels() -> List[Tuple[str, str]]:
+    fallback_port = "COM1" if os.name == "nt" else "/dev/ttyUSB0"
+    if list_ports is None:
+        return [(fallback_port, fallback_port)]
+
+    try:
+        ports = list(list_ports.comports())
+    except Exception:
+        return [(fallback_port, fallback_port)]
+
+    result = []
+    for port in ports:
+        device = getattr(port, "device", "") or fallback_port
+        description = getattr(port, "description", "") or "Serial adapter"
+        vid = getattr(port, "vid", None)
+        pid = getattr(port, "pid", None)
+        if vid is not None and pid is not None:
+            label = f"{description} (VID:PID={vid:04X}:{pid:04X})"
+        elif description and description != device:
+            label = description
+        else:
+            label = device
+        result.append((device, label))
+
+    return result or [(fallback_port, fallback_port)]
 
 
 def _list_socketcan_channels() -> List[Tuple[str, str]]:
@@ -281,21 +336,3 @@ def _list_socketcan_channels() -> List[Tuple[str, str]]:
             return devices
     return [("can0", "can0")]
 
-
-def _list_gs_usb_channels() -> List[Tuple[str, str]]:
-    if usb is None:
-        return [("0", "device 0")]
-
-    try:
-        devices = list(usb.find(find_all=True))
-    except Exception:
-        return [("0", "device 0")]
-
-    result = []
-    for index, dev in enumerate(devices):
-        vendor = getattr(dev, "idVendor", 0)
-        product = getattr(dev, "idProduct", 0)
-        if vendor == 0x1D50 and product == 0x606F:
-            result.append((str(index), f"gs_usb #{index}"))
-
-    return result or [("0", "device 0")]

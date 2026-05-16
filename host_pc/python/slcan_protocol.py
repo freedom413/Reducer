@@ -1,8 +1,5 @@
 """
-Compatibility shim.
-
-The project now uses python-can instead of the old serial SLCAN transport.
-Keep this module so existing imports do not break immediately.
+Compatibility re-export for the project's python-can based SLCAN transport.
 """
 
 from can_protocol import *  # noqa: F401,F403
