@@ -8,9 +8,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
@@ -23,8 +24,14 @@ from can_protocol import (
     CAN_ID_TX_TELEMETRY,
     CAN_STATUS_BAD_VALUE,
     CAN_STATUS_OK,
+    CAN_STATUS_STORAGE_ERROR,
+    Baudrate,
+    PythonCANInterface,
+    _PythonCanListener,
+    available_interfaces,
     build_command_frame,
     crc8_xor,
+    list_can_channels,
     parse_status_frame,
     parse_telemetry_frame,
 )
@@ -117,6 +124,73 @@ class TestProtocolHelpers(unittest.TestCase):
 
         self.assertIsNone(parse_telemetry_frame(frame))
 
+    def test_parse_rejects_wrong_protocol_length(self):
+        payload = build_telemetry_payload(channel=0, voltage_01mv=100, strain_ue=50, stress_01mpa=5)
+
+        self.assertIsNone(parse_telemetry_frame(CANFrame(id=CAN_ID_TX_TELEMETRY, data=payload + b"\x00")))
+        self.assertIsNone(parse_status_frame(CANFrame(id=CAN_ID_TX_STATUS, data=payload[:7])))
+
+    def test_available_interfaces_prioritizes_slcan(self):
+        interfaces = available_interfaces()
+
+        self.assertGreaterEqual(len(interfaces), 1)
+        self.assertEqual(interfaces[0][0], "slcan")
+
+    def test_list_slcan_channels_uses_serial_ports(self):
+        fake_port = MagicMock()
+        fake_port.device = "COM9"
+        fake_port.description = "USB-CAN Adapter"
+        fake_port.vid = 0x1D50
+        fake_port.pid = 0x606F
+
+        with patch("can_protocol.list_ports.comports", return_value=[fake_port]):
+            channels = list_can_channels("slcan")
+
+        self.assertEqual(channels, [("COM9", "USB-CAN Adapter (VID:PID=1D50:606F)")])
+
+    def test_python_can_interface_connect_slcan_passes_serial_settings(self):
+        bus_instance = MagicMock()
+        notifier_instance = MagicMock()
+
+        with patch("can_protocol.can.Bus", return_value=bus_instance) as mock_bus, patch(
+            "can_protocol.can.Notifier",
+            return_value=notifier_instance,
+        ):
+            interface = PythonCANInterface()
+            connected = interface.connect(
+                "slcan",
+                "COM7",
+                Baudrate.BAUD_500K,
+                tty_baudrate=460800,
+                sleep_after_open=0.25,
+            )
+
+        self.assertTrue(connected)
+        mock_bus.assert_called_once_with(
+            interface="slcan",
+            channel="COM7",
+            bitrate=500000,
+            tty_baudrate=460800,
+            sleep_after_open=0.25,
+        )
+        self.assertEqual(interface.tty_baudrate, 460800)
+
+    def test_python_can_listener_is_callable_by_notifier(self):
+        received = []
+        listener = _PythonCanListener([received.append])
+        msg = MagicMock()
+        msg.arbitration_id = 0x123
+        msg.data = bytes([1, 2, 3])
+        msg.is_extended_id = False
+        msg.is_remote_frame = False
+        msg.timestamp = 1.25
+
+        listener(msg)
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].id, 0x123)
+        self.assertEqual(received[0].data, bytes([1, 2, 3]))
+
 
 class TestChannelData(unittest.TestCase):
     def test_default_values(self):
@@ -195,6 +269,30 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.on_can_frame_received(frame)
 
         self.assertIn("rejected", self.window.status_bar.currentMessage())
+
+    def test_storage_error_status_updates_status_bar(self):
+        self.window.pending_commands[8] = "Save Zero"
+        frame = CANFrame(
+            id=CAN_ID_TX_STATUS,
+            data=build_status_payload(
+                sequence=8,
+                cmd_type=CAN_CMD_SAVE_ZERO,
+                status=CAN_STATUS_STORAGE_ERROR,
+                value=0,
+                detail=1,
+            ),
+        )
+
+        self.window.on_can_frame_received(frame)
+
+        self.assertIn("storage error", self.window.status_bar.currentMessage())
+
+    def test_manual_channel_text_takes_precedence(self):
+        self.window.channel_combo.clear()
+        self.window.channel_combo.addItem("COM1 - Existing Adapter", "COM1")
+        self.window.channel_combo.setEditText("COM9")
+
+        self.assertEqual(self.window._selected_channel(), "COM9")
 
     def test_zero_datum_command(self):
         self.window.on_zero_clicked()

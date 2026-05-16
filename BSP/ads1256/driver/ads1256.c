@@ -272,7 +272,7 @@ nopin:
         if (ret < 0) {
             return ret;
         }
-        return (reg & ADS1256_REG_STATUS_DRDY_MASK) ? 1 : 0;
+        return (reg & ADS1256_REG_STATUS_DRDY_MASK) ? 0 : 1;
     }
 }
 

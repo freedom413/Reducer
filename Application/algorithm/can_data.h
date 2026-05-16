@@ -25,6 +25,7 @@
 #define CAN_STATUS_BAD_TYPE       0xE2
 #define CAN_STATUS_BAD_CMD        0xE3
 #define CAN_STATUS_BAD_VALUE      0xE4
+#define CAN_STATUS_STORAGE_ERROR  0xE5
 
 // ============================================================================
 // Telemetry CAN TX Frame - 8-byte classic CAN
