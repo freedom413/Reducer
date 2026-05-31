@@ -32,7 +32,7 @@
 // ============================================================================
 // Byte 0: frame_type = 0x51
 // Byte 1: channel (0-5)
-// Bytes 2-3: voltage (int16, in 0.1 mV units, big-endian)
+// Bytes 2-3: voltage (int16, in 0.01 mV units, big-endian)
 // Bytes 4-5: strain (int16, in micro-strain units, big-endian)
 // Byte 6: stress preview (int8, in 0.1 MPa units, signed, clipped on overflow)
 // Byte 7: crc8 (XOR checksum of bytes 0-6)
@@ -118,12 +118,12 @@ uint8_t can_calc_crc8(const uint8_t *data, uint8_t len);
  * @brief Build telemetry CAN frame with all sensor data
  * @param frame Pointer to frame structure
  * @param channel Channel number (0-5)
- * @param voltage_01mv Voltage in 0.1 mV units (e.g., 1234 = 123.4 mV)
+ * @param voltage_001mv Voltage in 0.01 mV units (e.g., 1234 = 12.34 mV)
  * @param strain_ue Strain in micro-strain units
  * @param stress_01mpa Stress preview in 0.1 MPa units (signed, clipped)
  */
 void can_build_telemetry_frame(can_tx_telemetry_frame_t *frame, uint8_t channel,
-                               int16_t voltage_01mv, int16_t strain_ue, int8_t stress_01mpa);
+                               int16_t voltage_001mv, int16_t strain_ue, int8_t stress_01mpa);
 void can_build_status_frame(can_tx_status_frame_t *frame, uint8_t sequence,
                             uint8_t cmd_type, uint8_t status, uint16_t value,
                             uint8_t detail);

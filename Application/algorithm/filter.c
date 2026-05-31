@@ -135,3 +135,8 @@ int32_t filter_get_raw_filtered(uint8_t ch)
     }
     return (int32_t)(f->sum / (int64_t)f->count);
 }
+
+bool filter_has_samples(uint8_t ch)
+{
+    return ch < FILTER_CHANNEL_COUNT && filters[ch].count > 0U;
+}
