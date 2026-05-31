@@ -25,6 +25,7 @@ from can_protocol import (
     CAN_STATUS_BAD_VALUE,
     CAN_STATUS_OK,
     CAN_STATUS_STORAGE_ERROR,
+    DEFAULT_CAN_SEND_TIMEOUT_S,
     Baudrate,
     PythonCANInterface,
     _PythonCanListener,
@@ -43,19 +44,19 @@ from reducer_monitor import (
     CAN_CMD_SET_FILTER_SIZE,
     CAN_CMD_START_CALIB,
     CAN_CMD_ZERO_DATUM,
-    DEFAULT_ELASTIC_MODULUS_MPA,
     NUM_CHANNELS,
     ChannelData,
+    OfflineWaveformWindow,
     ReducerMonitorWindow,
 )
 
 
-def build_telemetry_payload(channel: int, voltage_01mv: int, strain_ue: int, stress_01mpa: int) -> bytes:
+def build_telemetry_payload(channel: int, voltage_001mv: int, strain_ue: int, stress_01mpa: int) -> bytes:
     payload = bytes([
         CAN_FRAME_TYPE_TELEMETRY,
         channel,
-        (voltage_01mv >> 8) & 0xFF,
-        voltage_01mv & 0xFF,
+        (voltage_001mv >> 8) & 0xFF,
+        voltage_001mv & 0xFF,
         (strain_ue >> 8) & 0xFF,
         strain_ue & 0xFF,
         stress_01mpa & 0xFF,
@@ -93,14 +94,14 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(frame.data[7], crc8_xor(frame.data[:7]))
 
     def test_parse_telemetry_frame(self):
-        payload = build_telemetry_payload(channel=2, voltage_01mv=1234, strain_ue=-456, stress_01mpa=-12)
+        payload = build_telemetry_payload(channel=2, voltage_001mv=1234, strain_ue=-456, stress_01mpa=-12)
         frame = CANFrame(id=CAN_ID_TX_TELEMETRY, data=payload)
 
         parsed = parse_telemetry_frame(frame)
 
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.channel, 2)
-        self.assertEqual(parsed.voltage_01mv, 1234)
+        self.assertEqual(parsed.voltage_001mv, 1234)
         self.assertEqual(parsed.strain_ue, -456)
         self.assertEqual(parsed.stress_01mpa, -12)
 
@@ -118,17 +119,32 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(parsed.detail, 0x55)
 
     def test_parse_rejects_bad_crc(self):
-        payload = bytearray(build_telemetry_payload(channel=0, voltage_01mv=100, strain_ue=50, stress_01mpa=5))
+        payload = bytearray(build_telemetry_payload(channel=0, voltage_001mv=100, strain_ue=50, stress_01mpa=5))
         payload[-1] ^= 0xFF
         frame = CANFrame(id=CAN_ID_TX_TELEMETRY, data=bytes(payload))
 
         self.assertIsNone(parse_telemetry_frame(frame))
 
     def test_parse_rejects_wrong_protocol_length(self):
-        payload = build_telemetry_payload(channel=0, voltage_01mv=100, strain_ue=50, stress_01mpa=5)
+        payload = build_telemetry_payload(channel=0, voltage_001mv=100, strain_ue=50, stress_01mpa=5)
 
         self.assertIsNone(parse_telemetry_frame(CANFrame(id=CAN_ID_TX_TELEMETRY, data=payload + b"\x00")))
         self.assertIsNone(parse_status_frame(CANFrame(id=CAN_ID_TX_STATUS, data=payload[:7])))
+
+    def test_parse_rejects_extended_and_remote_frames(self):
+        telemetry = build_telemetry_payload(
+            channel=0, voltage_001mv=100, strain_ue=50, stress_01mpa=5
+        )
+        status = build_status_payload(
+            sequence=1, cmd_type=CAN_CMD_ZERO_DATUM, status=CAN_STATUS_OK, value=0
+        )
+
+        self.assertIsNone(parse_telemetry_frame(
+            CANFrame(id=CAN_ID_TX_TELEMETRY, data=telemetry, is_extended=True)
+        ))
+        self.assertIsNone(parse_status_frame(
+            CANFrame(id=CAN_ID_TX_STATUS, data=status, is_remote=True)
+        ))
 
     def test_available_interfaces_prioritizes_slcan(self):
         interfaces = available_interfaces()
@@ -191,15 +207,30 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(received[0].id, 0x123)
         self.assertEqual(received[0].data, bytes([1, 2, 3]))
 
+    def test_python_can_send_uses_bounded_timeout(self):
+        bus_instance = MagicMock()
+        message = MagicMock()
+        interface = PythonCANInterface()
+        interface.bus = bus_instance
+
+        with patch("can_protocol.can.Message", return_value=message):
+            sent = interface.send_frame(CANFrame(id=0x123, data=b"\x01\x02"))
+
+        self.assertTrue(sent)
+        bus_instance.send.assert_called_once_with(
+            message, timeout=DEFAULT_CAN_SEND_TIMEOUT_S
+        )
+
 
 class TestChannelData(unittest.TestCase):
     def test_default_values(self):
         data = ChannelData()
-        self.assertEqual(data.voltage, 0.0)
-        self.assertEqual(data.strain, 0.0)
-        self.assertEqual(data.stress, 0.0)
-        self.assertEqual(data.displacement, 0.0)
-        self.assertEqual(data.raw_value, 0)
+        self.assertEqual(data.voltage_mv, 0.0)
+        self.assertEqual(data.strain_ue, 0.0)
+        self.assertEqual(data.stress_mpa, 0.0)
+        self.assertEqual(data.voltage_001mv, 0)
+        self.assertEqual(data.stress_01mpa, 0)
+        self.assertEqual(data.samples, 0)
 
 
 class TestReducerMonitorWindow(unittest.TestCase):
@@ -223,24 +254,24 @@ class TestReducerMonitorWindow(unittest.TestCase):
     def test_parse_valid_telemetry_updates_channel(self):
         frame = CANFrame(
             id=CAN_ID_TX_TELEMETRY,
-            data=build_telemetry_payload(channel=1, voltage_01mv=2345, strain_ue=321, stress_01mpa=45),
+            data=build_telemetry_payload(channel=1, voltage_001mv=2345, strain_ue=321, stress_01mpa=45),
         )
 
         self.window.on_can_frame_received(frame)
 
-        self.assertAlmostEqual(self.window.channel_data[1].voltage, 234.5, places=1)
-        self.assertEqual(self.window.channel_data[1].strain, 321.0)
-        expected_stress = 321.0 * DEFAULT_ELASTIC_MODULUS_MPA / 1_000_000.0
-        self.assertAlmostEqual(self.window.channel_data[1].stress, expected_stress, places=3)
+        self.assertAlmostEqual(self.window.channel_data[1].voltage_mv, 23.45, places=2)
+        self.assertEqual(self.window.channel_data[1].strain_ue, 321.0)
+        self.assertAlmostEqual(self.window.channel_data[1].stress_mpa, 67.41, places=3)
+        self.assertEqual(self.window.channel_data[1].samples, 1)
 
     def test_bad_telemetry_crc_is_rejected(self):
-        payload = bytearray(build_telemetry_payload(channel=0, voltage_01mv=1000, strain_ue=100, stress_01mpa=10))
+        payload = bytearray(build_telemetry_payload(channel=0, voltage_001mv=1000, strain_ue=100, stress_01mpa=10))
         payload[-1] ^= 0xAA
         frame = CANFrame(id=CAN_ID_TX_TELEMETRY, data=bytes(payload))
 
         self.window.on_can_frame_received(frame)
 
-        self.assertEqual(self.window.channel_data[0].voltage, 0.0)
+        self.assertEqual(self.window.channel_data[0].voltage_mv, 0.0)
 
     def test_status_frame_updates_status_bar(self):
         self.window.pending_commands[7] = "Set Filter Size"
@@ -251,7 +282,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.window.on_can_frame_received(frame)
 
-        self.assertEqual(self.window.status_bar.currentMessage(), "Set Filter Size acknowledged")
+        self.assertEqual(self.window.status_bar.currentMessage(), "Set Filter Size acknowledged (value=32)")
 
     def test_rejected_status_frame_updates_status_bar(self):
         self.window.pending_commands[5] = "Set Filter Size"
@@ -294,6 +325,41 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertEqual(self.window._selected_channel(), "COM9")
 
+    def test_language_can_switch_between_english_and_chinese(self):
+        self.window.on_data_updated(0, {
+            "voltage": 12.5,
+            "strain": 34.0,
+            "stress": 56.0,
+            "samples": 1,
+        })
+        self.window._show_status(
+            "command_acknowledged", command="Set Filter Size", value=32
+        )
+
+        self.window.language_combo.setCurrentIndex(
+            self.window.language_combo.findData("zh")
+        )
+
+        self.assertEqual(self.window.windowTitle(), "减速器柔轮监视器")
+        self.assertEqual(self.window.connect_btn.text(), "断开连接")
+        self.assertEqual(self.window.tabs.tabText(0), "波形")
+        self.assertEqual(self.window.data_table.horizontalHeaderItem(0).text(), "通道")
+        self.assertEqual(self.window.stats_labels[0][0].text(), "最小值: 12.500 mV")
+        self.assertEqual(
+            self.window.status_bar.currentMessage(), "设置滤波长度 已确认（值=32）"
+        )
+
+        self.window.language_combo.setCurrentIndex(
+            self.window.language_combo.findData("en")
+        )
+
+        self.assertEqual(self.window.windowTitle(), "Reducer Flexspline Monitor")
+        self.assertEqual(self.window.tabs.tabText(0), "Waveforms")
+        self.assertEqual(
+            self.window.status_bar.currentMessage(),
+            "Set Filter Size acknowledged (value=32)",
+        )
+
     def test_zero_datum_command(self):
         self.window.on_zero_clicked()
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
@@ -328,16 +394,45 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(sent_frame.data[5], 0)
 
     def test_sample_rate_command(self):
+        self.window.serial_baud_combo.setCurrentText("460800")
         self.window.sample_rate_combo.setCurrentText("500 SPS")
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
         self.assertEqual(sent_frame.data[2], CAN_CMD_SET_SAMPLE_RATE)
         self.assertEqual(sent_frame.data[4], 0xF4)
         self.assertEqual(sent_frame.data[5], 0x01)
 
+    def test_high_sample_rate_requires_faster_slcan_adapter(self):
+        self.window.serial_baud_combo.setCurrentText("115200")
+
+        self.window.sample_rate_combo.setCurrentText("500 SPS")
+
+        self.window.can_bus.send_frame.assert_not_called()
+        self.assertEqual(self.window.sample_rate_combo.currentData(), 100)
+        self.assertIn("460800", self.window.status_bar.currentMessage())
+
+    def test_connection_options_can_be_locked(self):
+        self.window.is_connected = False
+        self.window._set_connection_controls_enabled(False)
+
+        self.assertFalse(self.window.interface_combo.isEnabled())
+        self.assertFalse(self.window.channel_combo.isEnabled())
+        self.assertFalse(self.window.serial_baud_combo.isEnabled())
+        self.assertFalse(self.window.baud_combo.isEnabled())
+        self.assertFalse(self.window.refresh_btn.isEnabled())
+        self.assertTrue(self.window.language_combo.isEnabled())
+
     def test_command_fails_when_disconnected(self):
         self.window.is_connected = False
         self.window.can_bus = None
         self.assertFalse(self.window.send_command(CAN_CMD_ZERO_DATUM))
+
+    def test_command_fails_when_all_sequences_are_pending(self):
+        self.window.pending_commands = {
+            sequence: "Pending" for sequence in range(256)
+        }
+
+        self.assertFalse(self.window.send_command(CAN_CMD_ZERO_DATUM))
+        self.window.can_bus.send_frame.assert_not_called()
 
     def test_waveform_buffer_limit(self):
         from reducer_monitor import WAVEFORM_BUFFER_SIZE
@@ -347,10 +442,64 @@ class TestReducerMonitorWindow(unittest.TestCase):
                 "voltage": float(i),
                 "strain": 0.0,
                 "stress": 0.0,
-                "displacement": 0.0,
+                "samples": i + 1,
             })
 
         self.assertEqual(len(self.window.waveform_buffers[0]), WAVEFORM_BUFFER_SIZE)
+
+    def test_auto_scale_defaults_on_and_can_be_disabled(self):
+        self.assertTrue(self.window.auto_scale_checkbox.isChecked())
+
+        self.window.auto_scale_checkbox.setChecked(False)
+        self.window.on_data_updated(0, {
+            "voltage": 12.0,
+            "strain": 0.0,
+            "stress": 0.0,
+            "samples": 1,
+        })
+        self.window.update_plots()
+
+        self.assertFalse(self.window.auto_scale_checkbox.isChecked())
+
+    def test_plot_refresh_rate_is_fixed_at_60_hz(self):
+        self.assertFalse(hasattr(self.window, "plot_refresh_combo"))
+        self.assertEqual(self.window.update_timer.interval(), 17)
+
+    def test_clear_plots_keeps_current_values(self):
+        self.window.on_data_updated(0, {
+            "voltage": 12.0,
+            "strain": 34.0,
+            "stress": 56.0,
+            "samples": 1,
+        })
+        self.window.update_plots()
+
+        self.window._clear_plots()
+
+        self.assertTrue(all(len(buffer) == 0 for buffer in self.window.waveform_buffers))
+        self.assertEqual(self.window.data_table.item(0, 1).text(), "12.000")
+        for curve in self.window.plot_curves:
+            x_data, y_data = curve.getData()
+            self.assertTrue(x_data is None or len(x_data) == 0)
+            self.assertTrue(y_data is None or len(y_data) == 0)
+
+    def test_plot_maximize_toggle(self):
+        self.assertIsNone(self.window.maximized_plot_channel)
+
+        self.window._toggle_plot_maximize(2)
+        self.assertEqual(self.window.maximized_plot_channel, 2)
+        self.assertFalse(self.window.plot_widgets[2].isHidden())
+        self.assertTrue(self.window.plot_widgets[0].isHidden())
+
+        self.window._toggle_plot_maximize(2)
+        self.assertIsNone(self.window.maximized_plot_channel)
+        self.assertTrue(all(not plot.isHidden() for plot in self.window.plot_widgets))
+        self.assertEqual(self.window.waveform_layout.count(), NUM_CHANNELS)
+        for channel, plot in enumerate(self.window.plot_widgets):
+            index = self.window.waveform_layout.indexOf(plot)
+            row, column, row_span, column_span = self.window.waveform_layout.getItemPosition(index)
+            self.assertEqual((row, column, row_span, column_span),
+                             (channel // 3, channel % 3, 1, 1))
 
 
 class TestCsvLogging(unittest.TestCase):
@@ -380,7 +529,7 @@ class TestCsvLogging(unittest.TestCase):
             "voltage": 123.45,
             "strain": 500.0,
             "stress": 10.5,
-            "displacement": 2.5,
+            "samples": 1,
         })
 
         self.window.csv_file.close()
@@ -390,6 +539,43 @@ class TestCsvLogging(unittest.TestCase):
 
         self.assertEqual(len(rows), 2)
         self.assertIn("123.45", rows[1][2])
+
+    def test_csv_import_opens_offline_window_without_changing_live_waveforms(self):
+        with open(self.csv_path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "timestamp", "channel", "voltage_mv",
+                "strain_ue", "stress_mpa", "samples",
+            ])
+            writer.writerow(["2026-05-31T12:00:00", 0, 1.25, 2.0, 3.0, 1])
+            writer.writerow(["2026-05-31T12:00:01", 1, -4.5, -5.0, -6.0, 1])
+            writer.writerow(["2026-05-31T12:00:02", 0, 7.75, 8.0, 9.0, 2])
+
+        with patch(
+            "reducer_monitor.QFileDialog.getOpenFileName",
+            return_value=(self.csv_path, "CSV Files (*.csv)"),
+        ):
+            self.window.import_csv()
+
+        self.assertEqual(len(self.window.offline_waveform_windows), 1)
+        offline_window = self.window.offline_waveform_windows[0]
+        self.assertIsInstance(offline_window, OfflineWaveformWindow)
+        self.assertEqual(offline_window.waveform_buffers[0], [1.25, 7.75])
+        self.assertEqual(offline_window.waveform_buffers[1], [-4.5])
+        self.assertTrue(all(len(buffer) == 0 for buffer in self.window.waveform_buffers))
+
+        self.window.language_combo.setCurrentIndex(
+            self.window.language_combo.findData("zh")
+        )
+        self.assertTrue(offline_window.windowTitle().startswith("减速器波形记录"))
+        self.assertEqual(offline_window.auto_scale_checkbox.text(), "自动缩放")
+
+        offline_window._toggle_plot_maximize(0)
+        self.assertEqual(offline_window.maximized_plot_channel, 0)
+        offline_window._toggle_plot_maximize(0)
+        self.assertIsNone(offline_window.maximized_plot_channel)
+        self.assertEqual(offline_window.waveform_layout.count(), NUM_CHANNELS)
+        offline_window.close()
 
 
 def run_tests():

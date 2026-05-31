@@ -23,12 +23,12 @@ uint16_t can_frame_u16_le_get(const uint8_t value_le[2])
 // ============================================================================
 
 void can_build_telemetry_frame(can_tx_telemetry_frame_t *frame, uint8_t channel,
-                               int16_t voltage_01mv, int16_t strain_ue, int8_t stress_01mpa)
+                               int16_t voltage_001mv, int16_t strain_ue, int8_t stress_01mpa)
 {
     frame->frame_type = CAN_FRAME_TYPE_TELEMETRY;
     frame->channel = channel;
-    frame->voltage_be[0] = (uint8_t)(((uint16_t)voltage_01mv >> 8) & 0xFF);
-    frame->voltage_be[1] = (uint8_t)((uint16_t)voltage_01mv & 0xFF);
+    frame->voltage_be[0] = (uint8_t)(((uint16_t)voltage_001mv >> 8) & 0xFF);
+    frame->voltage_be[1] = (uint8_t)((uint16_t)voltage_001mv & 0xFF);
     frame->strain_be[0] = (uint8_t)(((uint16_t)strain_ue >> 8) & 0xFF);
     frame->strain_be[1] = (uint8_t)((uint16_t)strain_ue & 0xFF);
     frame->stress = stress_01mpa;

@@ -1,6 +1,7 @@
 #ifndef __FILTER_H__
 #define __FILTER_H__
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // Default filter window size
@@ -35,5 +36,6 @@ void filter_get_zero_offset(uint8_t ch, int32_t *offset);
 int filter_save_zero_to_flash(void);
 int filter_load_zero_from_flash(void);
 int32_t filter_get_raw_filtered(uint8_t ch);
+bool filter_has_samples(uint8_t ch);
 
 #endif // __FILTER_H__

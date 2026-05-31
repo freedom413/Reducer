@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/ads1256/ads1256_raw_data_recv.c
     BSP/can.c
     BSP/delay.c
+    BSP/flash_storage_port.c
     Application/user.c
     components/lwrb/lwrb/src/lwrb/lwrb.c
     Application/algorithm/can_data.c

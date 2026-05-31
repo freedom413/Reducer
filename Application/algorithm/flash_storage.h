@@ -8,11 +8,11 @@
 // Flash Storage Configuration
 // ============================================================================
 // STM32G431CB: 128KB Flash, 2KB pages
-// Using last page (page 127) at 0x0801F800 for calibration data
+// Using last page (page 63) at 0x0801F800 for calibration data
 
-#define FLASH_STORAGE_PAGE     127
-#define FLASH_STORAGE_ADDR     0x0801F800
-#define FLASH_STORAGE_SIZE      32  // bytes reserved
+#define FLASH_STORAGE_PAGE      63U
+#define FLASH_STORAGE_ADDR      0x0801F800U
+#define FLASH_STORAGE_SIZE      32U  // bytes reserved
 
 // Calibration data version
 #define CALIB_DATA_VERSION     0x0001
@@ -75,6 +75,11 @@ typedef struct {
  * @param ops Pointer to flash hardware operations structure
  */
 void flash_storage_register_ops(const flash_hw_ops_t *ops);
+
+/**
+ * @brief Register the board-specific STM32 flash operations.
+ */
+void flash_storage_register_user_ops(void);
 
 /**
  * @brief Initialize flash storage
