@@ -57,22 +57,20 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define ADC1_DRDY_Pin GPIO_PIN_0
-#define ADC1_DRDY_GPIO_Port GPIOA
-#define ADC1_DRDY_EXTI_IRQn EXTI0_IRQn
-#define ADC2_DRDY_Pin GPIO_PIN_1
+#define ADC2_DRDY_Pin GPIO_PIN_0
 #define ADC2_DRDY_GPIO_Port GPIOA
-#define ADC2_DRDY_EXTI_IRQn EXTI1_IRQn
+#define ADC1_DRDY_Pin GPIO_PIN_1
+#define ADC1_DRDY_GPIO_Port GPIOA
 #define ADC_SYNC_Pin GPIO_PIN_2
 #define ADC_SYNC_GPIO_Port GPIOA
 #define ADC_RESET_Pin GPIO_PIN_3
 #define ADC_RESET_GPIO_Port GPIOA
-#define ADC1_CS_Pin GPIO_PIN_4
-#define ADC1_CS_GPIO_Port GPIOA
-#define ADC2_CS_Pin GPIO_PIN_0
-#define ADC2_CS_GPIO_Port GPIOB
-#define OUT_Pin GPIO_PIN_9
-#define OUT_GPIO_Port GPIOA
+#define ADC2_CS_Pin GPIO_PIN_4
+#define ADC2_CS_GPIO_Port GPIOA
+#define ADC1_CS_Pin GPIO_PIN_0
+#define ADC1_CS_GPIO_Port GPIOB
+#define MCU_LED_Pin GPIO_PIN_5
+#define MCU_LED_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

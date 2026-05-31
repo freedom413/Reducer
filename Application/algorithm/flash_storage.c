@@ -78,9 +78,10 @@ int flash_storage_save_zero(const int32_t *offset)
     uint32_t total_dwords;
     int ret;
 
-    if (flash_ops == NULL || flash_ops->unlock == NULL ||
+    if (offset == NULL ||
+        flash_ops == NULL || flash_ops->unlock == NULL ||
         flash_ops->lock == NULL || flash_ops->erase_page == NULL ||
-        flash_ops->program_doubleword == NULL) {
+        flash_ops->program_doubleword == NULL || flash_ops->read == NULL) {
         return -1;  // Ops not registered
     }
 
@@ -121,12 +122,16 @@ int flash_storage_save_zero(const int32_t *offset)
     // Lock Flash
     flash_ops->lock();
 
-    return 0;
+    return flash_storage_is_valid() ? 0 : -4;
 }
 
 int flash_storage_load_zero(int32_t *offset)
 {
     calib_data_t data;
+
+    if (offset == NULL) {
+        return -1;
+    }
 
     if (!flash_storage_is_valid()) {
         // Return zeros if no valid calibration
