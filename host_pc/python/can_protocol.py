@@ -42,8 +42,28 @@ CAN_STATUS_BAD_CMD = 0xE3
 CAN_STATUS_BAD_VALUE = 0xE4
 CAN_STATUS_STORAGE_ERROR = 0xE5
 
+COMMAND_NAMES = {
+    0x01: "Set Sample Rate",
+    0x02: "Set Filter Size",
+    0x03: "Zero Datum",
+    0x04: "Calibrate",
+    0x05: "Save Zero",
+    0x06: "Load Zero",
+    0x07: "Clear Zero",
+}
+
+STATUS_NAMES = {
+    CAN_STATUS_OK: "OK",
+    CAN_STATUS_BAD_CRC: "CRC mismatch",
+    CAN_STATUS_BAD_TYPE: "invalid frame type",
+    CAN_STATUS_BAD_CMD: "unsupported command",
+    CAN_STATUS_BAD_VALUE: "invalid value",
+    CAN_STATUS_STORAGE_ERROR: "storage error",
+}
+
 DEFAULT_SLCAN_TTY_BAUDRATE = 115200
 DEFAULT_SLCAN_OPEN_DELAY = 2.0
+DEFAULT_CAN_SEND_TIMEOUT_S = 0.2
 SUPPORTED_SLCAN_SERIAL_BAUDRATES = (
     115200,
     230400,
@@ -95,7 +115,7 @@ class StatusFrame:
 @dataclass
 class TelemetryFrame:
     channel: int
-    voltage_01mv: int
+    voltage_001mv: int
     strain_ue: int
     stress_01mpa: int
 
@@ -130,6 +150,8 @@ def build_command_frame(sequence: int, cmd_type: int, param: int = 0, value: int
 
 
 def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
+    if frame.is_extended or frame.is_remote:
+        return None
     if frame.id != CAN_ID_TX_STATUS or len(frame.data) != 8:
         return None
     if frame.data[0] != CAN_FRAME_TYPE_STATUS:
@@ -146,16 +168,18 @@ def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
 
 
 def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
+    if frame.is_extended or frame.is_remote:
+        return None
     if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) != 8:
         return None
     if frame.data[0] != CAN_FRAME_TYPE_TELEMETRY:
         return None
     if crc8_xor(frame.data[:7]) != frame.data[7]:
         return None
-    _, channel, voltage_01mv, strain_ue, stress_01mpa, _ = struct.unpack(">BBhhbB", frame.data)
+    _, channel, voltage_001mv, strain_ue, stress_01mpa, _ = struct.unpack(">BBhhbB", frame.data)
     return TelemetryFrame(
         channel=channel,
-        voltage_01mv=voltage_01mv,
+        voltage_001mv=voltage_001mv,
         strain_ue=strain_ue,
         stress_01mpa=stress_01mpa,
     )
@@ -265,7 +289,7 @@ class PythonCANInterface:
                 is_extended_id=frame.is_extended,
                 is_remote_frame=frame.is_remote,
             )
-            self.bus.send(message)
+            self.bus.send(message, timeout=DEFAULT_CAN_SEND_TIMEOUT_S)
             return True
         except Exception as exc:
             logger.error("Failed to send CAN frame: %s", exc)

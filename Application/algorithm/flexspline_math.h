@@ -4,6 +4,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define FLEXSPLINE_GAUGE_RESISTANCE_OHM  350U
+#define FLEXSPLINE_GAUGE_FACTOR          2.11f
+#define FLEXSPLINE_MAX_STRAIN_UE         20000.0f
+#define FLEXSPLINE_ADC_REF_VOLTAGE       2.5f
+#define FLEXSPLINE_ADC_PGA_GAIN          16U
+#define FLEXSPLINE_BRIDGE_EXCITATION_V   5.0f
+#define FLEXSPLINE_ELASTIC_MODULUS_MPA   210000.0f
+
 typedef struct {
     float ref_voltage;
     uint8_t pga;

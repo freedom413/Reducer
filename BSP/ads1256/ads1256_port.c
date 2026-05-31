@@ -1,5 +1,5 @@
 #include "ads1256.h"
-#include "cmsis_gcc.h"
+#include "ads1256_config.h"
 #include "main.h"
 #include "spi.h"
 #include "stm32g4xx_hal_gpio.h"
@@ -7,28 +7,26 @@
 #include <stdint.h>
 #include "delay.h"
 
-/* ads1256 HAL适配层 */
-
+#define ADS1256_SPI_TIMEOUT_MS  10U
 static int ads1256_write(uint8_t *p_data, uint8_t nbytes)
 {
-    HAL_StatusTypeDef ret;
-    ret = HAL_SPI_Transmit(&hspi1, p_data, nbytes, 0xf);
-    if(ret != HAL_OK) {
-        return -1;
-    } else {
-        return nbytes;
-    }
+    HAL_StatusTypeDef ret = HAL_SPI_Transmit(&hspi1, p_data, nbytes, ADS1256_SPI_TIMEOUT_MS);
+    return (ret == HAL_OK) ? (int)nbytes : -1;
 }
 
 static int ads1256_read(uint8_t *p_data, uint8_t nbytes)
 {
     HAL_StatusTypeDef ret;
-    ret = HAL_SPI_Receive(&hspi1, p_data, nbytes, 0xf);
-    if(ret != HAL_OK) {
-        return -1;
-    } else {
-        return nbytes;
+    uint8_t dummy = 0xFF;
+
+    for (uint8_t i = 0; i < nbytes; i++) {
+        ret = HAL_SPI_TransmitReceive(&hspi1, &dummy, &p_data[i], 1, ADS1256_SPI_TIMEOUT_MS);
+        if (ret != HAL_OK) {
+            return -1;
+        }
     }
+
+    return (int)nbytes;
 }
 
 static int ads1256_delay_us(uint32_t us)
@@ -37,69 +35,42 @@ static int ads1256_delay_us(uint32_t us)
     return 0;
 }
 
-static int ads1256_a_pin_op(ads1256_pin_t pin ,ads1256_pin_op_t op)
+static void ads1256_all_cs_high(void)
 {
-    uint16_t      gpio_pin;
+    HAL_GPIO_WritePin(ADC1_CS_GPIO_Port, ADC1_CS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(ADC2_CS_GPIO_Port, ADC2_CS_Pin, GPIO_PIN_SET);
+}
+
+static int ads1256_pin_op(ads1256_pin_t pin, ads1256_pin_op_t op)
+{
+    uint16_t gpio_pin;
     GPIO_TypeDef *gpio_port;
+
     switch (pin) {
-        case ADS1256_Pin_CS:
+        case ADS1256_Pin_CS_A:
             gpio_pin = ADC1_CS_Pin;
             gpio_port = ADC1_CS_GPIO_Port;
             break;
-        case ADS1256_Pin_DRDY:
-            gpio_pin = ADC1_DRDY_Pin;
-            gpio_port = ADC1_DRDY_GPIO_Port;
-            break;
-        case ADS1256_Pin_RST:
-            gpio_pin = ADC_RESET_Pin;
-            gpio_port = ADC_RESET_GPIO_Port;
-            break;
-        // case ADS1256_Pin_SYNC:
-        //     gpio_pin = ADC_SYNC_Pin;
-        //     gpio_port = ADC_SYNC_GPIO_Port;
-        //     break;
-        default:
-            // mcu未控制该引脚
-            return 2;
-    }
-
-    switch (op) {
-        case ADS1256_PIN_OP_HIGH:
-            HAL_GPIO_WritePin(gpio_port, gpio_pin, GPIO_PIN_SET);
-            break;
-        case ADS1256_PIN_OP_LOW:
-            HAL_GPIO_WritePin(gpio_port, gpio_pin, GPIO_PIN_RESET);
-            break;
-        case ADS1256_PIN_OP_READ:
-            return (int)HAL_GPIO_ReadPin(gpio_port, gpio_pin);
-            break;
-        default:
-            return -1;
-    }
-    return 0;
-}
-
-static int ads1256_b_pin_op(ads1256_pin_t pin ,ads1256_pin_op_t op)
-{
-    uint16_t      gpio_pin;
-    GPIO_TypeDef *gpio_port;
-    switch (pin) {
-        case ADS1256_Pin_CS:
+        case ADS1256_Pin_CS_B:
             gpio_pin = ADC2_CS_Pin;
             gpio_port = ADC2_CS_GPIO_Port;
             break;
-        case ADS1256_Pin_DRDY:
+        case ADS1256_Pin_DRDY_A:
+            gpio_pin = ADC1_DRDY_Pin;
+            gpio_port = ADC1_DRDY_GPIO_Port;
+            break;
+        case ADS1256_Pin_DRDY_B:
             gpio_pin = ADC2_DRDY_Pin;
             gpio_port = ADC2_DRDY_GPIO_Port;
             break;
         case ADS1256_Pin_RST:
-            gpio_pin = ADC_RESET_Pin;
-            gpio_port = ADC_RESET_GPIO_Port;
-            break;
-        // case ADS1256_Pin_SYNC:
-        //     gpio_pin = ADC_SYNC_Pin;
-        //     gpio_port = ADC_SYNC_GPIO_Port;
-        //     break;
+        case ADS1256_Pin_SYNC:
+            /*
+             * RESET and SYNC are shared between the two ADS1256 devices on this
+             * board. Report them as unsupported so the generic driver uses
+             * per-chip SPI commands under CS instead of disturbing the other ADC.
+             */
+            return 2;
         default:
             return 2;
     }
@@ -113,92 +84,90 @@ static int ads1256_b_pin_op(ads1256_pin_t pin ,ads1256_pin_op_t op)
             break;
         case ADS1256_PIN_OP_READ:
             return (int)HAL_GPIO_ReadPin(gpio_port, gpio_pin);
-            break;
         default:
             return -1;
     }
+
     return 0;
 }
 
 ADS1256_t ads1256_a;
 ADS1256_t ads1256_b;
 
+static int ads1256_config_one(ADS1256_t *ads1256)
+{
+    ads1256_pga_t pga;
+    ads1256_sps_t sps;
+    int ret;
+
+    ret = ads1256_reset(ads1256);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = ads1256_set_pga(ads1256, ADS1256_PGA_16);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_get_pga(ads1256, &pga);
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (pga != ADS1256_PGA_16) {
+        return -11;
+    }
+
+    ret = ads1256_set_sps(ads1256, ADS1256_SPS_100);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ads1256_get_sps(ads1256, &sps);
+    if (ret < 0) {
+        return ret;
+    }
+    if (sps != ADS1256_SPS_100) {
+        return -12;
+    }
+
+    return ads1256_calibration(ads1256, ADS1256_CAL_SELF);
+}
+
 int adc_ads1256_init(void)
 {
     int ret;
-    ads1256_init(&ads1256_a, 
-                    ads1256_read, 
-                   ads1256_write, 
-                  ads1256_a_pin_op, 
-                ads1256_delay_us);
 
-
-
-    ads1256_init( &ads1256_b, 
-                     ads1256_read, 
-                    ads1256_write, 
-                   ads1256_b_pin_op, 
+    ads1256_init(&ads1256_a,
+                 ads1256_read,
+                 ads1256_write,
+                 ADS1256_Pin_CS_A,
+                 ADS1256_Pin_DRDY_A,
+                 ads1256_pin_op,
                  ads1256_delay_us);
 
-    
-    // 复位
-    ret = ads1256_reset(&ads1256_a);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256_reset(&ads1256_b);
-    if (ret < 0) {
-        return ret;
-    }
+    ads1256_init(&ads1256_b,
+                 ads1256_read,
+                 ads1256_write,
+                 ADS1256_Pin_CS_B,
+                 ADS1256_Pin_DRDY_B,
+                 ads1256_pin_op,
+                 ads1256_delay_us);
 
-    // 配置放大增益
-    ret = ads1256_set_gpa(&ads1256_a, ADS1256_GPA_64);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256_set_gpa(&ads1256_b, ADS1256_GPA_64);
-    if (ret < 0) {
-        return ret;
-    }
+    ads1256_all_cs_high();
 
-    ads1256_gpa_t gpa;
-    ret = ads1256_get_gpa(&ads1256_b, &gpa);
+#if ADS1256_ENABLE_A
+    ret = ads1256_config_one(&ads1256_a);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256_get_gpa(&ads1256_a, &gpa);
-    if (ret < 0) {
-        return ret;
-    }
+#endif
 
-    // 配置采样速率
-    ret = ads1256_set_sps(&ads1256_a, ADS1256_SPS_100);
+#if ADS1256_ENABLE_B
+    ret = ads1256_config_one(&ads1256_b);
     if (ret < 0) {
         return ret;
     }
-    ret = ads1256_set_sps(&ads1256_b, ADS1256_SPS_100);
-    if (ret < 0) {
-        return ret;
-    }
-    ads1256_sps_t sps;
-    ret = ads1256_get_sps(&ads1256_a, &sps);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256_get_sps(&ads1256_b, &sps);
-    if (ret < 0) {
-        return ret;
-    }
+#endif
 
-    // 自校准
-    ret = ads1256_calibration(&ads1256_a, ADS1256_CAL_SELF);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256_calibration(&ads1256_b, ADS1256_CAL_SELF);
-    if (ret < 0) {
-        return ret;
-    }
-    
     return 0;
 }

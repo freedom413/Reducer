@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"from slcan_protocol import SLCANProtocol, CANFrame, Baudrate, list_serial_ports, CAN_ID_TX_DATA, CAN_ID_RX_CONFIG; print\\(''Import OK''\\)\")",
-      "Bash(.venv/Scripts/python.exe -c \"from PyQt6.QtWidgets import QApplication; from PyQt6.QtCore import QHeaderView; print\\(''Import OK''\\)\")",
-      "Bash(.venv/Scripts/python.exe python/reducer_monitor.py)"
-    ]
-  }
-}

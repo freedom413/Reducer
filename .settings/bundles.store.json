@@ -27,6 +27,10 @@
     {
       "name": "gnu-tools-for-stm32-13_3_1-description",
       "version": "1.0.1+st.1"
+    },
+    {
+      "name": "jlink-gdbserver",
+      "version": "9.14.1+st.1"
     }
   ]
 }
