@@ -12,20 +12,21 @@
 
 #define FLASH_STORAGE_PAGE      63U
 #define FLASH_STORAGE_ADDR      0x0801F800U
-#define FLASH_STORAGE_SIZE      32U  // bytes reserved
+#define FLASH_STORAGE_SIZE      40U  // bytes reserved
 
 // Calibration data version
-#define CALIB_DATA_VERSION     0x0001
+#define CALIB_DATA_VERSION     0x0002
+#define FLASH_STORAGE_CHANNEL_COUNT  8U
 
 // ============================================================================
 // Calibration Data Structure (stored in Flash)
 // ============================================================================
 typedef struct __attribute__((packed)) {
     uint16_t version;           // Data structure version
-    int32_t zero_offset[6];     // Zero offset for each channel
+    int32_t zero_offset[FLASH_STORAGE_CHANNEL_COUNT];
     uint16_t crc16;             // CRC-16 of zero_offset data
     uint16_t magic;             // Magic number for validation
-    uint8_t reserved[2];        // Pad to 32 bytes for 64-bit flash programming
+    uint8_t reserved[2];        // Pad to 40 bytes for 64-bit flash programming
 } calib_data_t;
 
 #define CALIB_MAGIC             0xCA1B  // Calibration valid marker
@@ -95,14 +96,14 @@ bool flash_storage_is_valid(void);
 
 /**
  * @brief Save zero offset to flash
- * @param offset Array of 6 channel zero offsets
+ * @param offset Array of 8 channel zero offsets
  * @return 0 on success, negative on error
  */
 int flash_storage_save_zero(const int32_t *offset);
 
 /**
  * @brief Load zero offset from flash
- * @param offset Array to store 6 channel zero offsets
+ * @param offset Array to store 8 channel zero offsets
  * @return 0 on success, negative on error
  */
 int flash_storage_load_zero(int32_t *offset);

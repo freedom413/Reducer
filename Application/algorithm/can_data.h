@@ -31,7 +31,7 @@
 // Telemetry CAN TX Frame - 8-byte classic CAN
 // ============================================================================
 // Byte 0: frame_type = 0x51
-// Byte 1: channel (0-5)
+// Byte 1: channel (0-7)
 // Bytes 2-3: voltage (int16, in 0.01 mV units, big-endian)
 // Bytes 4-5: strain (int16, in micro-strain units, big-endian)
 // Byte 6: stress preview (int8, in 0.1 MPa units, signed, clipped on overflow)
@@ -101,6 +101,7 @@ _Static_assert(sizeof(can_tx_status_frame_t) == 8, "can_tx_status_frame_t must b
 #define CAN_CMD_SAVE_ZERO        0x05  // Save zero offset to Flash
 #define CAN_CMD_LOAD_ZERO        0x06  // Load zero offset from Flash
 #define CAN_CMD_CLEAR_ZERO       0x07  // Clear zero offset from Flash
+#define CAN_CMD_SET_CHANNEL_MASK 0x08  // Select ADC channels to scan
 
 // ============================================================================
 // Helper functions
@@ -117,7 +118,7 @@ uint8_t can_calc_crc8(const uint8_t *data, uint8_t len);
 /**
  * @brief Build telemetry CAN frame with all sensor data
  * @param frame Pointer to frame structure
- * @param channel Channel number (0-5)
+ * @param channel Channel number (0-7)
  * @param voltage_001mv Voltage in 0.01 mV units (e.g., 1234 = 12.34 mV)
  * @param strain_ue Strain in micro-strain units
  * @param stress_01mpa Stress preview in 0.1 MPa units (signed, clipped)

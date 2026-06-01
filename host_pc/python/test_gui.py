@@ -40,10 +40,14 @@ from reducer_monitor import (
     CAN_CMD_CLEAR_ZERO,
     CAN_CMD_LOAD_ZERO,
     CAN_CMD_SAVE_ZERO,
+    CAN_CMD_SET_CHANNEL_MASK,
     CAN_CMD_SET_SAMPLE_RATE,
     CAN_CMD_SET_FILTER_SIZE,
     CAN_CMD_START_CALIB,
     CAN_CMD_ZERO_DATUM,
+    DEFAULT_VISIBLE_PLOTS,
+    FIXED_CAN_BITRATE,
+    MAX_VISIBLE_PLOTS,
     NUM_CHANNELS,
     ChannelData,
     OfflineWaveformWindow,
@@ -251,6 +255,106 @@ class TestReducerMonitorWindow(unittest.TestCase):
     def test_available_channel_count(self):
         self.assertEqual(len(self.window.channel_data), NUM_CHANNELS)
 
+    def test_default_waveform_plot_count(self):
+        self.assertEqual(len(self.window.plot_panels), DEFAULT_VISIBLE_PLOTS)
+        self.assertEqual(self.window.plot_channels, [0, 1, 2, 3])
+
+    def test_waveform_plot_defaults_to_voltage_curve(self):
+        checkboxes = self.window.plot_metric_checkboxes[0]
+
+        self.assertTrue(checkboxes["voltage"].isChecked())
+        self.assertFalse(checkboxes["strain"].isChecked())
+        self.assertFalse(checkboxes["stress"].isChecked())
+
+    def test_waveform_plot_can_overlay_multiple_metrics(self):
+        self.window.plot_metric_checkboxes[0]["strain"].setChecked(True)
+        self.window.plot_metric_checkboxes[0]["stress"].setChecked(True)
+        self.window.on_data_updated(0, {
+            "voltage": 12.5,
+            "strain": 34.0,
+            "stress": 56.0,
+            "samples": 1,
+        })
+        self.window.update_plots()
+
+        curves = self.window.plot_metric_curves[0]
+        self.assertEqual(list(curves["voltage"].getData()[1]), [12.5])
+        self.assertEqual(list(curves["strain"].getData()[1]), [34.0])
+        self.assertEqual(list(curves["stress"].getData()[1]), [56.0])
+        self.assertTrue(all(curve.isVisible() for curve in curves.values()))
+
+    def test_waveform_plot_keeps_at_least_one_metric_selected(self):
+        checkbox = self.window.plot_metric_checkboxes[0]["voltage"]
+
+        checkbox.setChecked(False)
+
+        self.assertTrue(checkbox.isChecked())
+
+    def test_waveform_plots_can_be_added_up_to_eight_cards(self):
+        while len(self.window.plot_panels) < MAX_VISIBLE_PLOTS:
+            self.window._add_waveform_plot()
+
+        self.assertEqual(len(self.window.plot_panels), MAX_VISIBLE_PLOTS)
+        self.assertEqual(self.window.plot_channels, [0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertFalse(self.window.add_plot_btn.isEnabled())
+
+        self.window._add_waveform_plot()
+        self.assertEqual(len(self.window.plot_panels), MAX_VISIBLE_PLOTS)
+
+    def test_adding_plot_subscribes_mcu_channel(self):
+        self.window._add_waveform_plot()
+
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
+        self.assertEqual(sent_frame.data[4], 0x1F)
+
+    def test_waveform_plot_can_change_bound_channel(self):
+        self.window.plot_channel_combos[0].setCurrentIndex(5)
+        self.window.on_data_updated(5, {
+            "voltage": 12.5,
+            "strain": 0.0,
+            "stress": 0.0,
+            "samples": 1,
+        })
+        self.window.update_plots()
+
+        self.assertEqual(self.window.plot_channels[0], 5)
+        _, y_data = self.window.plot_curves[0].getData()
+        self.assertEqual(list(y_data), [12.5])
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
+        self.assertEqual(sent_frame.data[4], 0x2E)
+
+    def test_waveform_plot_can_be_removed(self):
+        panel = self.window.plot_panels[-1]
+
+        self.window._remove_waveform_plot(panel)
+
+        self.assertEqual(len(self.window.plot_panels), DEFAULT_VISIBLE_PLOTS - 1)
+        self.assertNotIn(panel, self.window.plot_panels)
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
+        self.assertEqual(sent_frame.data[4], 0x07)
+
+    def test_removing_all_waveform_plots_stops_mcu_sampling(self):
+        for panel in list(self.window.plot_panels):
+            self.window._remove_waveform_plot(panel)
+
+        self.assertEqual(self.window.plot_panels, [])
+        self.assertEqual(self.window._displayed_channel_mask(), 0)
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
+        self.assertEqual(sent_frame.data[4], 0x00)
+
+    def test_duplicate_plots_subscribe_mcu_channel_once(self):
+        self.window._sync_mcu_channel_mask()
+        self.window.can_bus.send_frame.reset_mock()
+
+        self.window._add_waveform_plot(channel=0)
+
+        self.assertEqual(self.window._displayed_channel_mask(), 0x0F)
+        self.window.can_bus.send_frame.assert_not_called()
+
     def test_parse_valid_telemetry_updates_channel(self):
         frame = CANFrame(
             id=CAN_ID_TX_TELEMETRY,
@@ -408,7 +512,19 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.window.can_bus.send_frame.assert_not_called()
         self.assertEqual(self.window.sample_rate_combo.currentData(), 100)
-        self.assertIn("460800", self.window.status_bar.currentMessage())
+        self.assertIn("230400", self.window.status_bar.currentMessage())
+
+    def test_slcan_bandwidth_estimate_counts_active_adc_devices(self):
+        self.assertEqual(self.window._minimum_slcan_tty_baudrate(1000), 460800)
+
+        self.window._add_waveform_plot()
+        self.assertEqual(self.window._minimum_slcan_tty_baudrate(1000), 921600)
+
+        for panel in list(self.window.plot_panels[1:]):
+            self.window._remove_waveform_plot(panel)
+
+        self.assertEqual(self.window.plot_channels, [0])
+        self.assertEqual(self.window._minimum_slcan_tty_baudrate(1000), 460800)
 
     def test_connection_options_can_be_locked(self):
         self.window.is_connected = False
@@ -417,9 +533,15 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertFalse(self.window.interface_combo.isEnabled())
         self.assertFalse(self.window.channel_combo.isEnabled())
         self.assertFalse(self.window.serial_baud_combo.isEnabled())
-        self.assertFalse(self.window.baud_combo.isEnabled())
+        self.assertFalse(hasattr(self.window, "baud_combo"))
+        self.assertEqual(self.window.can_baud_value.text(), "500K")
         self.assertFalse(self.window.refresh_btn.isEnabled())
         self.assertTrue(self.window.language_combo.isEnabled())
+
+    def test_can_bitrate_is_fixed_to_match_mcu_firmware(self):
+        self.assertEqual(FIXED_CAN_BITRATE, Baudrate.BAUD_500K)
+        self.assertFalse(hasattr(self.window, "baud_combo"))
+        self.assertEqual(self.window.can_baud_value.text(), "500K")
 
     def test_command_fails_when_disconnected(self):
         self.window.is_connected = False
@@ -478,28 +600,29 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertTrue(all(len(buffer) == 0 for buffer in self.window.waveform_buffers))
         self.assertEqual(self.window.data_table.item(0, 1).text(), "12.000")
-        for curve in self.window.plot_curves:
-            x_data, y_data = curve.getData()
-            self.assertTrue(x_data is None or len(x_data) == 0)
-            self.assertTrue(y_data is None or len(y_data) == 0)
+        for curves in self.window.plot_metric_curves:
+            for curve in curves.values():
+                x_data, y_data = curve.getData()
+                self.assertTrue(x_data is None or len(x_data) == 0)
+                self.assertTrue(y_data is None or len(y_data) == 0)
 
     def test_plot_maximize_toggle(self):
         self.assertIsNone(self.window.maximized_plot_channel)
 
         self.window._toggle_plot_maximize(2)
         self.assertEqual(self.window.maximized_plot_channel, 2)
-        self.assertFalse(self.window.plot_widgets[2].isHidden())
-        self.assertTrue(self.window.plot_widgets[0].isHidden())
+        self.assertFalse(self.window.plot_panels[2].isHidden())
+        self.assertTrue(self.window.plot_panels[0].isHidden())
 
         self.window._toggle_plot_maximize(2)
         self.assertIsNone(self.window.maximized_plot_channel)
-        self.assertTrue(all(not plot.isHidden() for plot in self.window.plot_widgets))
-        self.assertEqual(self.window.waveform_layout.count(), NUM_CHANNELS)
-        for channel, plot in enumerate(self.window.plot_widgets):
-            index = self.window.waveform_layout.indexOf(plot)
+        self.assertTrue(all(not panel.isHidden() for panel in self.window.plot_panels))
+        self.assertEqual(self.window.waveform_layout.count(), DEFAULT_VISIBLE_PLOTS)
+        for plot_index, panel in enumerate(self.window.plot_panels):
+            index = self.window.waveform_layout.indexOf(panel)
             row, column, row_span, column_span = self.window.waveform_layout.getItemPosition(index)
             self.assertEqual((row, column, row_span, column_span),
-                             (channel // 3, channel % 3, 1, 1))
+                             (plot_index // 2, plot_index % 2, 1, 1))
 
 
 class TestCsvLogging(unittest.TestCase):

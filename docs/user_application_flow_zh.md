@@ -132,6 +132,7 @@ filtered = filter_apply(channel, adc_raw_value[channel]);
 - `CAN_CMD_SAVE_ZERO`：保存当前零点到 Flash。
 - `CAN_CMD_LOAD_ZERO`：从 Flash 重新加载零点。
 - `CAN_CMD_CLEAR_ZERO`：清空内存零点，并擦除 Flash 中的零点记录。
+- `CAN_CMD_SET_CHANNEL_MASK`：设置运行时 ADS1256 扫描通道掩码。
 
 注意：`filter_reset_all()` 只清空滑动平均窗口，不会清除零点偏移。
 
@@ -286,6 +287,11 @@ byte 7: crc8 XOR(bytes 0..6)
 `CAN_CMD_CLEAR_ZERO` (`0x07`)
 
 将内存中的零点偏移清零，擦除 Flash 中的校准页，并重置滤波器和异常值统计。
+
+`CAN_CMD_SET_CHANNEL_MASK` (`0x08`)
+
+使用 `value` 设置运行时 ADS1256 扫描掩码。MCU 只扫描上位机图表正在展示的通道。
+掩码为 `0` 时停止 ADC 通道轮询。启用状态发生变化的通道会重置滤波器和统计量。
 
 ## CAN 遥测发送流程
 
