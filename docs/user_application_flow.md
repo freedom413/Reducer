@@ -311,6 +311,12 @@ successful load.
 Sets all in-memory zero offsets to zero, erases the Flash calibration page, and
 resets filters and outlier statistics.
 
+`CAN_CMD_SET_CHANNEL_MASK` (`0x08`)
+
+Sets the runtime ADS1256 scan mask using `value`. Only channels selected by the
+host waveform plots are scanned. A zero mask stops ADC channel polling. Channels
+whose enabled state changes have their filters and statistics reset.
+
 ## CAN Telemetry Flow
 
 After all channels in a batch are processed, `loop()` sends one telemetry frame

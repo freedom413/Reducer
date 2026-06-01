@@ -36,6 +36,7 @@ typedef struct {
 static lwrb_t ads1256_data_rb;
 static char ads1256_data_buf[ADS1256_DATA_BUFF_SIZE];
 static uint16_t ads1256_sample_rate_sps = 100;
+static uint16_t ads1256_channel_mask = ADS1256_ALL_CHANNEL_MASK;
 static bool ads1256_started = false;
 static uint8_t ads1256_poll_error_count = 0;
 static uint32_t ads1256_last_recovery_tick = 0;
@@ -44,12 +45,14 @@ static const ads1256_ch_t ads1256_a_channels[ADS1256_CHANNELS_PER_DEVICE] = {
     {.p = ADS1256_AIN0, .n = ADS1256_AIN1},
     {.p = ADS1256_AIN2, .n = ADS1256_AIN3},
     {.p = ADS1256_AIN4, .n = ADS1256_AIN5},
+    {.p = ADS1256_AIN6, .n = ADS1256_AIN7},
 };
 
 static const ads1256_ch_t ads1256_b_channels[ADS1256_CHANNELS_PER_DEVICE] = {
     {.p = ADS1256_AIN0, .n = ADS1256_AIN1},
     {.p = ADS1256_AIN2, .n = ADS1256_AIN3},
     {.p = ADS1256_AIN4, .n = ADS1256_AIN5},
+    {.p = ADS1256_AIN6, .n = ADS1256_AIN7},
 };
 
 static ads1256_scan_device_t ads1256_devices[] = {
@@ -132,23 +135,56 @@ static int ads1256_device_select_current(ads1256_scan_device_t *dev)
     return ads1256_device_select_channel(dev, dev->current);
 }
 
+static bool ads1256_device_channel_enabled(const ads1256_scan_device_t *dev,
+                                           uint8_t channel)
+{
+    uint8_t logical_channel = (uint8_t)(dev->logical_base + channel);
+    return (ads1256_channel_mask & (1U << logical_channel)) != 0U;
+}
+
+static bool ads1256_device_find_enabled_channel(const ads1256_scan_device_t *dev,
+                                                uint8_t start,
+                                                uint8_t *channel)
+{
+    for (uint8_t offset = 0; offset < dev->channel_count; offset++) {
+        uint8_t candidate = (uint8_t)(start + offset);
+        if (candidate >= dev->channel_count) {
+            candidate = (uint8_t)(candidate - dev->channel_count);
+        }
+        if (ads1256_device_channel_enabled(dev, candidate)) {
+            *channel = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static int ads1256_device_restart(ads1256_scan_device_t *dev)
 {
-    dev->current = 0;
+    if (!ads1256_device_find_enabled_channel(dev, 0, &dev->current)) {
+        return 0;
+    }
     return ads1256_device_select_current(dev);
 }
 
 static int ads1256_device_poll(ads1256_scan_device_t *dev)
 {
+    if (!ads1256_device_channel_enabled(dev, dev->current)) {
+        return 0;
+    }
+
     int ready = ads1256_is_data_ready(dev->adc);
     if (ready <= 0) {
         return ready;
     }
 
     uint8_t ready_channel = dev->current;
-    uint8_t next_channel = (uint8_t)(ready_channel + 1U);
-    if (next_channel >= dev->channel_count) {
-        next_channel = 0;
+    uint8_t next_channel = 0;
+    if (!ads1256_device_find_enabled_channel(
+            dev, (uint8_t)((ready_channel + 1U) % dev->channel_count),
+            &next_channel)) {
+        return 0;
     }
 
     int ret = ads1256_device_select_channel(dev, next_channel);
@@ -320,4 +356,26 @@ int adc_ads1256_set_sample_rate(uint16_t sps)
 uint16_t adc_ads1256_get_sample_rate(void)
 {
     return ads1256_sample_rate_sps;
+}
+
+int adc_ads1256_set_channel_mask(uint16_t channel_mask)
+{
+    if ((channel_mask & ~ADS1256_ALL_CHANNEL_MASK) != 0U) {
+        return -1;
+    }
+
+    uint16_t previous_mask = ads1256_channel_mask;
+    ads1256_channel_mask = channel_mask;
+    if (adc_ads1256_restart() < 0) {
+        ads1256_channel_mask = previous_mask;
+        (void)adc_ads1256_restart();
+        return -1;
+    }
+
+    return 0;
+}
+
+uint16_t adc_ads1256_get_channel_mask(void)
+{
+    return ads1256_channel_mask;
 }

@@ -100,13 +100,18 @@ static void update_statistics(uint8_t ch, int32_t value)
     running_m2[ch] += delta * delta2;
 }
 
+static void reset_channel_statistics(uint8_t ch)
+{
+    running_mean[ch] = 0;
+    running_m2[ch] = 0;
+    adc_filtered_value[ch] = 0;
+    sample_count[ch] = 0;
+}
+
 static void reset_statistics(void)
 {
     for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
-        running_mean[i] = 0;
-        running_m2[i] = 0;
-        adc_filtered_value[i] = 0;
-        sample_count[i] = 0;
+        reset_channel_statistics(i);
     }
 }
 
@@ -209,7 +214,14 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
         case CAN_CMD_ZERO_DATUM: {
             // Save current filtered values as zero offset, then reset
             int32_t previous_offsets[ADC_CHANNEL_COUNT];
+            uint16_t channel_mask = adc_ads1256_get_channel_mask();
+            if (channel_mask == 0U) {
+                return CAN_STATUS_BAD_VALUE;
+            }
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
+                if ((channel_mask & (1U << i)) == 0U) {
+                    continue;
+                }
                 if (!filter_has_samples(i)) {
                     if (detail != NULL) {
                         *detail = i;
@@ -219,11 +231,17 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
                 filter_get_zero_offset(i, &previous_offsets[i]);
             }
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
+                if ((channel_mask & (1U << i)) == 0U) {
+                    continue;
+                }
                 int32_t raw_filtered = filter_get_raw_filtered(i);
                 filter_set_zero_offset(i, raw_filtered);
             }
             if (filter_save_zero_to_flash() != 0) {
                 for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
+                    if ((channel_mask & (1U << i)) == 0U) {
+                        continue;
+                    }
                     filter_set_zero_offset(i, previous_offsets[i]);
                 }
                 if (detail != NULL) {
@@ -233,6 +251,27 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
             }
             filter_reset_all();
             reset_statistics();
+            return CAN_STATUS_OK;
+        }
+
+        case CAN_CMD_SET_CHANNEL_MASK: {
+            uint16_t previous_mask = adc_ads1256_get_channel_mask();
+            if (adc_ads1256_set_channel_mask(value) != 0) {
+                if (detail != NULL) {
+                    *detail = (uint8_t)value;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
+            if (applied_value != NULL) {
+                *applied_value = adc_ads1256_get_channel_mask();
+            }
+            uint16_t changed_mask = previous_mask ^ value;
+            for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
+                if ((changed_mask & (1U << i)) != 0U) {
+                    filter_reset(i);
+                    reset_channel_statistics(i);
+                }
+            }
             return CAN_STATUS_OK;
         }
 

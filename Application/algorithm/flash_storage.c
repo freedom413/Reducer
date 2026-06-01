@@ -135,7 +135,7 @@ int flash_storage_load_zero(int32_t *offset)
 
     if (!flash_storage_is_valid()) {
         // Return zeros if no valid calibration
-        memset(offset, 0, sizeof(int32_t) * 6);
+        memset(offset, 0, sizeof(int32_t) * FLASH_STORAGE_CHANNEL_COUNT);
         return -1;
     }
 
@@ -145,7 +145,8 @@ int flash_storage_load_zero(int32_t *offset)
 
     // Read from Flash
     flash_ops->read(FLASH_STORAGE_ADDR, &data, sizeof(calib_data_t));
-    memcpy(offset, data.zero_offset, sizeof(int32_t) * 6);
+    memcpy(offset, data.zero_offset,
+           sizeof(int32_t) * FLASH_STORAGE_CHANNEL_COUNT);
 
     return 0;
 }
