@@ -23,8 +23,9 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QPushButton, QComboBox,
     QSpinBox, QStatusBar, QFileDialog, QCheckBox,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem,
+    QColorDialog,
 )
-from PyQt6.QtCore import QSignalBlocker, QTimer, pyqtSignal, QThread, Qt
+from PyQt6.QtCore import QEvent, QSignalBlocker, QTimer, pyqtSignal, QThread, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 
 # Plotting
@@ -93,23 +94,6 @@ THEME_COLORS = {
         "disabled_bg": "#42536a",
         "disabled_text": "#a8b4c2",
         "selection_bg": "#315f91",
-        "plot_bg": "#080d15",
-        "plot_axis": "#b9c8d8",
-    },
-    "light": {
-        "window_bg": "#f4f7fb",
-        "panel_bg": "#ffffff",
-        "panel_alt": "#eaf1f8",
-        "border": "#d7e0ea",
-        "text": "#24415f",
-        "strong_text": "#17324d",
-        "muted_text": "#315b7d",
-        "input_bg": "#ffffff",
-        "accent": "#2878c8",
-        "accent_hover": "#1f68ae",
-        "disabled_bg": "#b8c6d4",
-        "disabled_text": "#ffffff",
-        "selection_bg": "#dcecff",
         "plot_bg": "#080d15",
         "plot_axis": "#b9c8d8",
     },
@@ -242,6 +226,42 @@ def apply_plot_theme(plot: pg.PlotWidget, theme: str) -> None:
         axis.setTextPen(pg.mkPen(colors["plot_axis"]))
 
 
+def curve_color_button_stylesheet(color: str) -> str:
+    return (
+        f"background: {color}; border: 1px solid #b9c8d8; "
+        "border-radius: 3px; padding: 0px;"
+    )
+
+
+def create_plot_hover_items(plot: pg.PlotWidget) -> dict[str, object]:
+    line = pg.InfiniteLine(
+        angle=90,
+        movable=False,
+        pen=pg.mkPen("#6f8fab", width=1, style=Qt.PenStyle.DashLine),
+    )
+    marker = pg.ScatterPlotItem(
+        size=9,
+        pen=pg.mkPen("#ffffff", width=1),
+        brush=pg.mkBrush(PLOT_METRICS["voltage"]["color"]),
+    )
+    label = pg.TextItem(
+        anchor=(0, 1),
+        color=THEME_COLORS[DEFAULT_THEME]["text"],
+        fill=pg.mkBrush(24, 36, 54, 235),
+        border=pg.mkPen(THEME_COLORS[DEFAULT_THEME]["border"]),
+    )
+    for item in (line, marker, label):
+        item.setZValue(100)
+        item.hide()
+        plot.addItem(item)
+    return {"line": line, "marker": marker, "label": label}
+
+
+def hide_plot_hover_items(items: dict[str, object]) -> None:
+    for item in items.values():
+        item.hide()
+
+
 def status_icon_pixmap(state: str) -> QPixmap:
     pixmap = QPixmap(14, 14)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -268,9 +288,6 @@ TRANSLATIONS = {
         "start_logging": "Start Logging",
         "stop_logging": "Stop Logging",
         "language": "Language:",
-        "theme": "Theme:",
-        "theme_dark": "Dark",
-        "theme_light": "Light",
         "waveforms": "Waveforms",
         "data_panel": "Data Panel",
         "auto_scale": "Auto Scale",
@@ -379,9 +396,6 @@ TRANSLATIONS = {
         "start_logging": "开始记录",
         "stop_logging": "停止记录",
         "language": "语言：",
-        "theme": "主题：",
-        "theme_dark": "暗黑",
-        "theme_light": "白色",
         "waveforms": "波形",
         "data_panel": "数据面板",
         "auto_scale": "自动缩放",
@@ -542,7 +556,6 @@ class OfflineWaveformWindow(QMainWindow):
         filename: str,
         waveform_buffers: List[List[float]],
         language: str = "en",
-        theme: str = DEFAULT_THEME,
     ):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -550,7 +563,7 @@ class OfflineWaveformWindow(QMainWindow):
         self.filename = filename
         self.waveform_buffers = waveform_buffers
         self.language = language
-        self.theme = theme
+        self.theme = DEFAULT_THEME
         self.maximized_plot_channel: Optional[int] = None
 
         self.setGeometry(140, 140, 1200, 800)
@@ -576,8 +589,10 @@ class OfflineWaveformWindow(QMainWindow):
 
         self.plot_widgets = []
         self.plot_curves = []
+        self.plot_hover_items = []
         for channel in range(NUM_CHANNELS):
             plot = pg.PlotWidget()
+            plot.installEventFilter(self)
             apply_plot_theme(plot, self.theme)
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.disableAutoRange()
@@ -587,21 +602,25 @@ class OfflineWaveformWindow(QMainWindow):
                 lambda event, selected_channel=channel:
                     self._on_plot_mouse_clicked(selected_channel, event)
             )
+            hover_items = create_plot_hover_items(plot)
+            plot.scene().sigMouseMoved.connect(
+                lambda scene_pos, selected_channel=channel:
+                    self._on_plot_mouse_moved(selected_channel, scene_pos)
+            )
             curve = plot.plot(
                 waveform_buffers[channel],
                 pen=pg.mkPen(color=self._get_channel_color(channel), width=1.5),
             )
             self.plot_widgets.append(plot)
             self.plot_curves.append(curve)
+            self.plot_hover_items.append(hover_items)
 
         self._refresh_waveform_layout()
         self._fit_all_plots()
         self._retranslate_ui()
 
     @classmethod
-    def from_csv(
-        cls, filename: str, language: str = "en", theme: str = DEFAULT_THEME
-    ):
+    def from_csv(cls, filename: str, language: str = "en"):
         waveform_buffers = [[] for _ in range(NUM_CHANNELS)]
         with open(filename, "r", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -614,17 +633,10 @@ class OfflineWaveformWindow(QMainWindow):
                 if 0 <= channel < NUM_CHANNELS:
                     waveform_buffers[channel].append(float(row["voltage_mv"]))
 
-        return cls(filename, waveform_buffers, language, theme)
+        return cls(filename, waveform_buffers, language)
 
     def set_language(self, language: str):
         self.language = language
-        self._retranslate_ui()
-
-    def set_theme(self, theme: str):
-        self.theme = theme
-        self.setStyleSheet(theme_stylesheet(theme))
-        for plot in self.plot_widgets:
-            apply_plot_theme(plot, theme)
         self._retranslate_ui()
 
     def _retranslate_ui(self):
@@ -653,6 +665,52 @@ class OfflineWaveformWindow(QMainWindow):
     def _on_plot_mouse_clicked(self, channel: int, event):
         if event.double():
             self._toggle_plot_maximize(channel)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Leave and watched in self.plot_widgets:
+            channel = self.plot_widgets.index(watched)
+            hide_plot_hover_items(self.plot_hover_items[channel])
+        return super().eventFilter(watched, event)
+
+    def _on_plot_mouse_moved(self, channel: int, scene_pos):
+        plot = self.plot_widgets[channel]
+        hover_items = self.plot_hover_items[channel]
+        if not plot.getPlotItem().sceneBoundingRect().contains(scene_pos):
+            hide_plot_hover_items(hover_items)
+            return
+
+        mouse = plot.getPlotItem().vb.mapSceneToView(scene_pos)
+        sample = int(round(mouse.x()))
+        values = self.waveform_buffers[channel]
+        if not 0 <= sample < len(values):
+            hide_plot_hover_items(hover_items)
+            return
+
+        x_range, y_range = plot.viewRange()
+        x_tolerance = max(1.0, (x_range[1] - x_range[0]) * 12.0 / max(plot.width(), 1))
+        y_tolerance = max(0.05, (y_range[1] - y_range[0]) * 0.08)
+        value = values[sample]
+        if (
+            abs(mouse.x() - sample) > x_tolerance
+            or abs(mouse.y() - value) > y_tolerance
+        ):
+            hide_plot_hover_items(hover_items)
+            return
+
+        color = self._get_channel_color(channel)
+        hover_items["line"].setPos(sample)
+        hover_items["marker"].setData([sample], [value], brush=pg.mkBrush(color))
+        hover_items["label"].setText(
+            f"{translate(self.language, 'voltage')}\n"
+            f"{translate(self.language, 'sample')}: {sample}\n"
+            f"{value:.3f} mV"
+        )
+        hover_items["label"].setAnchor(
+            (1, 1) if sample > sum(x_range) / 2.0 else (0, 1)
+        )
+        hover_items["label"].setPos(sample, value)
+        for item in hover_items.values():
+            item.show()
 
     def _toggle_plot_maximize(self, channel: int):
         self.maximized_plot_channel = (
@@ -874,14 +932,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.log_btn.setEnabled(False)
         layout.addWidget(self.log_btn)
 
-        self.theme_label = QLabel()
-        layout.addWidget(self.theme_label)
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem("", "dark")
-        self.theme_combo.addItem("", "light")
-        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
-        layout.addWidget(self.theme_combo)
-
         self.language_label = QLabel()
         layout.addWidget(self.language_label)
         self.language_combo = QComboBox()
@@ -936,7 +986,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_source_labels = []
         self.plot_metrics_labels = []
         self.plot_metric_checkboxes = []
+        self.plot_metric_color_buttons = []
+        self.plot_metric_colors = []
         self.plot_metric_curves = []
+        self.plot_hover_items = []
         self.plot_remove_buttons = []
         self.plot_channels = []
 
@@ -1005,32 +1058,6 @@ class ReducerMonitorWindow(QMainWindow):
         for window in self.offline_waveform_windows:
             window.set_language(self.language)
 
-    def _on_theme_changed(self, _index: int):
-        theme = self.theme_combo.currentData()
-        if theme is None:
-            return
-
-        self._apply_theme(str(theme))
-        for window in self.offline_waveform_windows:
-            window.set_theme(self.theme)
-
-    def _apply_theme(self, theme: str):
-        self.theme = theme
-        colors = THEME_COLORS[theme]
-        self.setStyleSheet(theme_stylesheet(theme))
-        if hasattr(self, "stream_summary_label"):
-            self.stream_summary_label.setStyleSheet(
-                f"color: {colors['muted_text']}; font-weight: 600;"
-            )
-        if hasattr(self, "health_summary_label"):
-            self.health_summary_label.setStyleSheet(
-                f"color: {colors['muted_text']};"
-            )
-        for plot_index, plot in enumerate(getattr(self, "plot_widgets", [])):
-            apply_plot_theme(plot, theme)
-            self._update_plot_presentation(plot_index)
-        self._refresh_health_panel(update_rx_rate=False)
-
     def _retranslate_ui(self):
         self.setWindowTitle(self._tr("window_title"))
         self.conn_group.setTitle(self._tr("can_connection"))
@@ -1043,13 +1070,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.refresh_btn.setText(self._tr("refresh"))
         self.log_btn.setText(
             self._tr("stop_logging") if self.logging_enabled else self._tr("start_logging")
-        )
-        self.theme_label.setText(self._tr("theme"))
-        self.theme_combo.setItemText(
-            self.theme_combo.findData("dark"), self._tr("theme_dark")
-        )
-        self.theme_combo.setItemText(
-            self.theme_combo.findData("light"), self._tr("theme_light")
         )
         self.language_label.setText(self._tr("language"))
 
@@ -1277,11 +1297,20 @@ class ReducerMonitorWindow(QMainWindow):
         metrics_label = QLabel()
         header.addWidget(metrics_label)
         metric_checkboxes = {}
+        metric_color_buttons = {}
+        metric_colors = {
+            metric: config["color"] for metric, config in PLOT_METRICS.items()
+        }
         for metric in PLOT_METRICS:
             checkbox = QCheckBox()
             checkbox.setChecked(metric == "voltage")
             metric_checkboxes[metric] = checkbox
             header.addWidget(checkbox)
+            color_button = QPushButton()
+            color_button.setFixedSize(18, 18)
+            color_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            metric_color_buttons[metric] = color_button
+            header.addWidget(color_button)
         header.addStretch()
 
         remove_button = QPushButton()
@@ -1293,6 +1322,7 @@ class ReducerMonitorWindow(QMainWindow):
         panel_layout.addLayout(header)
 
         plot = pg.PlotWidget()
+        plot.installEventFilter(self)
         apply_plot_theme(plot, self.theme)
         plot.showGrid(x=True, y=True, alpha=0.3)
         plot.disableAutoRange()
@@ -1302,10 +1332,15 @@ class ReducerMonitorWindow(QMainWindow):
             lambda event, selected_panel=panel:
                 self._on_plot_mouse_clicked(selected_panel, event)
         )
+        hover_items = create_plot_hover_items(plot)
+        plot.scene().sigMouseMoved.connect(
+            lambda scene_pos, selected_plot=plot:
+                self._on_plot_mouse_moved(selected_plot, scene_pos)
+        )
         metric_curves = {}
         for metric, config in PLOT_METRICS.items():
             curve = plot.plot(
-                pen=pg.mkPen(color=config["color"], width=1.5)
+                pen=pg.mkPen(color=metric_colors[metric], width=1.5)
             )
             curve.setVisible(metric == "voltage")
             metric_curves[metric] = curve
@@ -1318,7 +1353,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_source_labels.append(source_label)
         self.plot_metrics_labels.append(metrics_label)
         self.plot_metric_checkboxes.append(metric_checkboxes)
+        self.plot_metric_color_buttons.append(metric_color_buttons)
+        self.plot_metric_colors.append(metric_colors)
         self.plot_metric_curves.append(metric_curves)
+        self.plot_hover_items.append(hover_items)
         self.plot_remove_buttons.append(remove_button)
         self.plot_channels.append(channel)
 
@@ -1331,7 +1369,12 @@ class ReducerMonitorWindow(QMainWindow):
                 lambda checked, selected_plot=plot, selected_metric=metric:
                     self._on_plot_metric_toggled(
                         selected_plot, selected_metric, checked
-                    )
+                )
+            )
+        for metric, button in metric_color_buttons.items():
+            button.clicked.connect(
+                lambda _checked=False, selected_plot=plot, selected_metric=metric:
+                    self._choose_plot_metric_color(selected_plot, selected_metric)
             )
 
         plot_index = len(self.plot_widgets) - 1
@@ -1361,7 +1404,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_source_labels.pop(plot_index)
         self.plot_metrics_labels.pop(plot_index)
         self.plot_metric_checkboxes.pop(plot_index)
+        self.plot_metric_color_buttons.pop(plot_index)
+        self.plot_metric_colors.pop(plot_index)
         self.plot_metric_curves.pop(plot_index)
+        self.plot_hover_items.pop(plot_index)
         self.plot_remove_buttons.pop(plot_index)
         self.plot_channels.pop(plot_index)
         panel.deleteLater()
@@ -1380,6 +1426,7 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         self.plot_channels[plot_index] = int(channel)
+        hide_plot_hover_items(self.plot_hover_items[plot_index])
         self._refresh_plot_data(plot_index)
         if self.auto_scale_checkbox.isChecked():
             self._update_plot_range(plot_index)
@@ -1404,6 +1451,7 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         self.plot_metric_curves[plot_index][metric].setVisible(enabled)
+        hide_plot_hover_items(self.plot_hover_items[plot_index])
         self._refresh_plot_data(plot_index)
         self._update_plot_presentation(plot_index)
         if self.auto_scale_checkbox.isChecked():
@@ -1415,6 +1463,93 @@ class ReducerMonitorWindow(QMainWindow):
             for metric, checkbox in self.plot_metric_checkboxes[plot_index].items()
             if checkbox.isChecked()
         ]
+
+    def _choose_plot_metric_color(self, plot: pg.PlotWidget, metric: str):
+        if plot not in self.plot_widgets:
+            return
+
+        plot_index = self.plot_widgets.index(plot)
+        selected = QColorDialog.getColor(
+            QColor(self.plot_metric_colors[plot_index][metric]),
+            self,
+            self._tr(PLOT_METRICS[metric]["label_key"]),
+        )
+        if selected.isValid():
+            self._set_plot_metric_color(plot_index, metric, selected.name())
+
+    def _set_plot_metric_color(self, plot_index: int, metric: str, color: str):
+        selected = QColor(color)
+        if not selected.isValid():
+            return
+
+        normalized = selected.name()
+        self.plot_metric_colors[plot_index][metric] = normalized
+        self.plot_metric_curves[plot_index][metric].setPen(
+            pg.mkPen(normalized, width=1.5)
+        )
+        self.plot_metric_color_buttons[plot_index][metric].setStyleSheet(
+            curve_color_button_stylesheet(normalized)
+        )
+        self.plot_metric_checkboxes[plot_index][metric].setStyleSheet(
+            f"color: {normalized};"
+        )
+
+    def _on_plot_mouse_moved(self, plot: pg.PlotWidget, scene_pos):
+        if plot not in self.plot_widgets:
+            return
+
+        plot_index = self.plot_widgets.index(plot)
+        hover_items = self.plot_hover_items[plot_index]
+        if not plot.getPlotItem().sceneBoundingRect().contains(scene_pos):
+            hide_plot_hover_items(hover_items)
+            return
+
+        mouse = plot.getPlotItem().vb.mapSceneToView(scene_pos)
+        sample = int(round(mouse.x()))
+        x_range, y_range = plot.viewRange()
+        x_tolerance = max(1.0, (x_range[1] - x_range[0]) * 12.0 / max(plot.width(), 1))
+        y_tolerance = max(0.05, (y_range[1] - y_range[0]) * 0.08)
+        if abs(mouse.x() - sample) > x_tolerance:
+            hide_plot_hover_items(hover_items)
+            return
+
+        channel = self.plot_channels[plot_index]
+        nearest = None
+        for metric in self._selected_plot_metrics(plot_index):
+            values = self.waveform_metric_buffers[metric][channel]
+            if not 0 <= sample < len(values):
+                continue
+            value = values[sample]
+            distance = abs(mouse.y() - value)
+            if nearest is None or distance < nearest[0]:
+                nearest = (distance, metric, value)
+
+        if nearest is None or nearest[0] > y_tolerance:
+            hide_plot_hover_items(hover_items)
+            return
+
+        _, metric, value = nearest
+        config = PLOT_METRICS[metric]
+        color = self.plot_metric_colors[plot_index][metric]
+        hover_items["line"].setPos(sample)
+        hover_items["marker"].setData([sample], [value], brush=pg.mkBrush(color))
+        hover_items["label"].setText(
+            f"{self._tr(config['axis_key'])}\n"
+            f"{self._tr('sample')}: {sample}\n"
+            f"{value:.3f} {config['units']}"
+        )
+        hover_items["label"].setAnchor(
+            (1, 1) if sample > sum(x_range) / 2.0 else (0, 1)
+        )
+        hover_items["label"].setPos(sample, value)
+        for item in hover_items.values():
+            item.show()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Leave and watched in self.plot_widgets:
+            plot_index = self.plot_widgets.index(watched)
+            hide_plot_hover_items(self.plot_hover_items[plot_index])
+        return super().eventFilter(watched, event)
 
     def _refresh_plot_data(self, plot_index: int):
         channel = self.plot_channels[plot_index]
@@ -1445,9 +1580,13 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_metrics_labels[plot_index].setText(self._tr("plot_metrics"))
         for metric, checkbox in self.plot_metric_checkboxes[plot_index].items():
             config = PLOT_METRICS[metric]
+            color = self.plot_metric_colors[plot_index][metric]
             checkbox.setText(self._tr(config["label_key"]))
             checkbox.setToolTip(self._tr("plot_metrics_tooltip"))
-            checkbox.setStyleSheet(f"color: {config['color']};")
+            checkbox.setStyleSheet(f"color: {color};")
+            color_button = self.plot_metric_color_buttons[plot_index][metric]
+            color_button.setStyleSheet(curve_color_button_stylesheet(color))
+            color_button.setToolTip(self._tr("plot_metrics_tooltip"))
         self.plot_remove_buttons[plot_index].setText(self._tr("remove_plot"))
         self.plot_remove_buttons[plot_index].setToolTip(
             self._tr("remove_plot_tooltip")
@@ -1518,6 +1657,8 @@ class ReducerMonitorWindow(QMainWindow):
         for curves in self.plot_metric_curves:
             for curve in curves.values():
                 curve.setData([], [])
+        for hover_items in self.plot_hover_items:
+            hide_plot_hover_items(hover_items)
 
         self._show_status("waveforms_cleared")
 
@@ -1528,7 +1669,7 @@ class ReducerMonitorWindow(QMainWindow):
         if filename:
             try:
                 window = OfflineWaveformWindow.from_csv(
-                    filename, self.language, self.theme
+                    filename, self.language
                 )
             except Exception as exc:
                 QMessageBox.critical(
