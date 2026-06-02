@@ -342,13 +342,20 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(len(self.window.plot_panels), DEFAULT_VISIBLE_PLOTS)
         self.assertEqual(self.window.plot_channels, [0, 1, 2, 3])
 
-    def test_light_theme_explicitly_sets_readable_text_colors(self):
+    def test_dark_theme_is_default_and_can_switch_to_light(self):
         stylesheet = self.window.styleSheet()
 
-        self.assertIn("QLabel, QCheckBox { color: #24415f; }", stylesheet)
-        self.assertIn("background: white; color: #24415f;", stylesheet)
-        self.assertIn("QTabBar::tab:selected { background: white; color: #17324d; }",
-                      stylesheet)
+        self.assertEqual(self.window.theme, "dark")
+        self.assertEqual(self.window.theme_combo.currentData(), "dark")
+        self.assertIn("background: #101826", stylesheet)
+        self.assertFalse(self.window.windowIcon().isNull())
+
+        self.window.theme_combo.setCurrentIndex(
+            self.window.theme_combo.findData("light")
+        )
+
+        self.assertEqual(self.window.theme, "light")
+        self.assertIn("background: #f4f7fb", self.window.styleSheet())
 
     def test_empty_waveform_plots_have_consistent_initial_ranges(self):
         for plot in self.window.plot_widgets:
@@ -638,6 +645,31 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(self.window.sample_rate_sps, 30000)
         self.assertIn("TX drops 4", self.window.health_summary_label.text())
         self.assertIn("ADC overflows 5", self.window.health_summary_label.text())
+        self.assertEqual(
+            self.window.health_icon_label.pixmap().toImage()
+            .pixelColor(7, 7).name(),
+            "#ed8b2c",
+        )
+
+    def test_health_summary_is_in_status_bar_with_waiting_icon(self):
+        self.assertIs(self.window.health_summary_label.parent(), self.window.status_bar)
+        self.assertFalse(hasattr(self.window, "health_group"))
+        self.assertFalse(self.window.health_icon_label.pixmap().isNull())
+        self.assertIn("Waiting", self.window.health_summary_label.text())
+
+    def test_healthy_adc_frame_sets_green_status_icon(self):
+        self.window.on_can_frame_received(
+            CANFrame(
+                id=CAN_ID_TX_HEALTH,
+                data=build_health_payload(tx_drop=0, overflow=0, recovery=0),
+            )
+        )
+
+        self.assertEqual(
+            self.window.health_icon_label.pixmap().toImage()
+            .pixelColor(7, 7).name(),
+            "#35b66a",
+        )
 
     def test_high_sample_rate_is_available_over_canable2_usb_cdc(self):
         self.window.sample_rate_combo.setCurrentText("30000 SPS")
@@ -804,9 +836,15 @@ class TestCsvLogging(unittest.TestCase):
         self.assertEqual(len(self.window.offline_waveform_windows), 1)
         offline_window = self.window.offline_waveform_windows[0]
         self.assertIsInstance(offline_window, OfflineWaveformWindow)
+        self.assertEqual(offline_window.theme, "dark")
         self.assertEqual(offline_window.waveform_buffers[0], [1.25, 7.75])
         self.assertEqual(offline_window.waveform_buffers[1], [-4.5])
         self.assertTrue(all(len(buffer) == 0 for buffer in self.window.waveform_buffers))
+
+        self.window.theme_combo.setCurrentIndex(
+            self.window.theme_combo.findData("light")
+        )
+        self.assertEqual(offline_window.theme, "light")
 
         self.window.language_combo.setCurrentIndex(
             self.window.language_combo.findData("zh")
