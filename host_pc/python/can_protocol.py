@@ -1,9 +1,4 @@
-"""
-can_protocol.py - python-can transport and Reducer CAN protocol helpers.
-
-Supports SLCAN serial adapters and keeps compatibility with other python-can
-backends already used by this project.
-"""
+"""python-can transport and Reducer CAN FD protocol helpers."""
 
 from __future__ import annotations
 
@@ -30,10 +25,13 @@ logger = logging.getLogger(__name__)
 CAN_ID_RX_COMMAND = 0x100
 CAN_ID_TX_TELEMETRY = 0x101
 CAN_ID_TX_STATUS = 0x102
+CAN_ID_TX_HEALTH = 0x103
 
 CAN_FRAME_TYPE_TELEMETRY = 0x51
 CAN_FRAME_TYPE_COMMAND = 0xA0
 CAN_FRAME_TYPE_STATUS = 0xA1
+CAN_FRAME_TYPE_HEALTH = 0x52
+CAN_HEALTH_VERSION = 0x01
 
 CAN_STATUS_OK = 0x00
 CAN_STATUS_BAD_CRC = 0xE1
@@ -65,14 +63,7 @@ STATUS_NAMES = {
 DEFAULT_SLCAN_TTY_BAUDRATE = 115200
 DEFAULT_SLCAN_OPEN_DELAY = 2.0
 DEFAULT_CAN_SEND_TIMEOUT_S = 0.2
-SUPPORTED_SLCAN_SERIAL_BAUDRATES = (
-    115200,
-    230400,
-    460800,
-    921600,
-    1000000,
-    2000000,
-)
+CAN_FD_DATA_BITRATE = 2000000
 
 
 class Baudrate(Enum):
@@ -93,6 +84,8 @@ class CANFrame:
     data: bytes
     is_extended: bool = False
     is_remote: bool = False
+    is_fd: bool = True
+    bitrate_switch: bool = True
     timestamp: Optional[float] = None
 
 
@@ -119,6 +112,17 @@ class TelemetryFrame:
     voltage_001mv: int
     strain_ue: int
     stress_01mpa: int
+
+
+@dataclass
+class HealthFrame:
+    sample_rate_sps: float
+    telemetry_decimation: int
+    tx_drop_count: int
+    adc_overflow_count: int
+    adc_recovery_count: int
+    active_adc_count: int
+    adc_running: bool
 
 
 def crc8_xor(data: bytes) -> int:
@@ -151,7 +155,7 @@ def build_command_frame(sequence: int, cmd_type: int, param: int = 0, value: int
 
 
 def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
-    if frame.is_extended or frame.is_remote:
+    if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
         return None
     if frame.id != CAN_ID_TX_STATUS or len(frame.data) != 8:
         return None
@@ -169,7 +173,7 @@ def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
 
 
 def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
-    if frame.is_extended or frame.is_remote:
+    if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
         return None
     if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) != 8:
         return None
@@ -183,6 +187,31 @@ def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
         voltage_001mv=voltage_001mv,
         strain_ue=strain_ue,
         stress_01mpa=stress_01mpa,
+    )
+
+
+def parse_health_frame(frame: CANFrame) -> Optional[HealthFrame]:
+    if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
+        return None
+    if frame.id != CAN_ID_TX_HEALTH or len(frame.data) != 16:
+        return None
+    if frame.data[0] != CAN_FRAME_TYPE_HEALTH or frame.data[1] != CAN_HEALTH_VERSION:
+        return None
+    if crc8_xor(frame.data[:15]) != frame.data[15]:
+        return None
+
+    sample_rate_x10, decimation, tx_drop, overflow, recovery = struct.unpack(
+        "<IHHHH", frame.data[2:14]
+    )
+    flags = frame.data[14]
+    return HealthFrame(
+        sample_rate_sps=sample_rate_x10 / 10.0,
+        telemetry_decimation=decimation,
+        tx_drop_count=tx_drop,
+        adc_overflow_count=overflow,
+        adc_recovery_count=recovery,
+        active_adc_count=(flags >> 4) & 0x0F,
+        adc_running=(flags & 0x01) != 0,
     )
 
 
@@ -200,6 +229,8 @@ class _PythonCanListener(can.Listener if can is not None else object):
             data=bytes(msg.data),
             is_extended=msg.is_extended_id,
             is_remote=msg.is_remote_frame,
+            is_fd=msg.is_fd,
+            bitrate_switch=msg.bitrate_switch,
             timestamp=msg.timestamp,
         )
         for callback in list(self._callbacks):
@@ -235,12 +266,19 @@ class PythonCANInterface:
             "interface": interface,
             "channel": self._normalize_channel(interface, channel),
         }
-        if interface == "slcan":
-            kwargs["bitrate"] = bitrate.bps
+        if interface == "socketcan":
+            kwargs["fd"] = True
+        elif interface == "slcan":
+            kwargs["timing"] = self._can_fd_timing(bitrate)
             kwargs["tty_baudrate"] = int(tty_baudrate)
             kwargs["sleep_after_open"] = sleep_after_open
-        elif interface != "socketcan":
+        elif interface == "pcan":
+            kwargs["fd"] = True
+            kwargs["timing"] = self._can_fd_timing(bitrate)
+        else:
             kwargs["bitrate"] = bitrate.bps
+            kwargs["data_bitrate"] = CAN_FD_DATA_BITRATE
+            kwargs["fd"] = True
 
         try:
             self.bus = can.Bus(**kwargs)
@@ -289,6 +327,8 @@ class PythonCANInterface:
                 data=frame.data,
                 is_extended_id=frame.is_extended,
                 is_remote_frame=frame.is_remote,
+                is_fd=frame.is_fd,
+                bitrate_switch=frame.bitrate_switch,
             )
             self.bus.send(message, timeout=DEFAULT_CAN_SEND_TIMEOUT_S)
             return True
@@ -305,13 +345,28 @@ class PythonCANInterface:
 
     @staticmethod
     def _normalize_channel(interface: str, channel: str):
+        if interface in ("ixxat", "vector") and str(channel).isdigit():
+            return int(channel)
         return channel
+
+    @staticmethod
+    def _can_fd_timing(bitrate: Baudrate):
+        return can.BitTimingFd.from_sample_point(
+            f_clock=80000000,
+            nom_bitrate=bitrate.bps,
+            nom_sample_point=87.5,
+            data_bitrate=CAN_FD_DATA_BITRATE,
+            data_sample_point=87.5,
+        )
 
 
 def available_interfaces() -> List[Tuple[str, str]]:
     return [
-        ("slcan", "SLCAN (serial USB-CAN)"),
-        ("socketcan", "SocketCAN (Linux canX/vcanX)"),
+        ("slcan", "CANable 2.0 SLCAN FD (serial USB-CAN)"),
+        ("socketcan", "SocketCAN FD (Linux canX/vcanX)"),
+        ("pcan", "PCAN FD (Windows PCAN-Basic)"),
+        ("ixxat", "IXXAT FD (Windows VCI)"),
+        ("vector", "Vector FD (Windows XL Driver)"),
     ]
 
 
@@ -320,6 +375,10 @@ def list_can_channels(interface: str) -> List[Tuple[str, str]]:
         return _list_slcan_channels()
     if interface == "socketcan":
         return _list_socketcan_channels()
+    if interface == "pcan":
+        return [("PCAN_USBBUS1", "PCAN USB channel 1")]
+    if interface in ("ixxat", "vector"):
+        return [("0", "CAN channel 0")]
     return []
 
 

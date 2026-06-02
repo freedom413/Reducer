@@ -2,8 +2,7 @@
 reducer_monitor.py - Reducer Flexspline State Monitoring GUI
 
 A PyQt6-based real-time monitoring application for the Reducer Flexspline
-State Detection System. Uses python-can to communicate with USB-CAN adapters,
-with SLCAN serial adapters as the primary transport.
+State Detection System. Uses CANable 2.0 SLCAN FD and python-can adapters.
 """
 
 import csv
@@ -32,18 +31,20 @@ import pyqtgraph as pg
 from can_protocol import (
     Baudrate,
     CANFrame,
+    CAN_ID_TX_HEALTH,
     CAN_ID_TX_STATUS,
     CAN_ID_TX_TELEMETRY,
     CAN_STATUS_OK,
+    CAN_FD_DATA_BITRATE,
     COMMAND_NAMES,
     DEFAULT_SLCAN_TTY_BAUDRATE,
     PythonCANInterface,
     STATUS_NAMES,
     StatusFrame,
-    SUPPORTED_SLCAN_SERIAL_BAUDRATES,
     available_interfaces,
     build_command_frame,
     list_can_channels,
+    parse_health_frame,
     parse_status_frame,
     parse_telemetry_frame,
 )
@@ -88,10 +89,16 @@ PLOT_METRICS = {
     },
 }
 
-SUPPORTED_SAMPLE_RATES = [5, 10, 15, 25, 30, 50, 60, 100, 500, 1000]
-SLCAN_TELEMETRY_FRAME_BYTES = 22
-SLCAN_SERIAL_BITS_PER_BYTE = 10
-SLCAN_MAX_UTILIZATION = 0.8
+SUPPORTED_SAMPLE_RATES = [
+    2.5, 5, 10, 15, 25, 30, 50, 60, 100, 500, 1000, 2000, 3750, 7500,
+    15000, 30000,
+]
+CAN_TELEMETRY_MAX_FRAMES_PER_SECOND = 3000
+ADS1256_CYCLING_RATES = {
+    2.5: 2.5, 5: 5, 10: 10, 15: 15, 25: 25, 30: 30, 50: 50, 60: 59,
+    100: 98, 500: 456, 1000: 837, 2000: 1438, 3750: 2165, 7500: 3043,
+    15000: 3817, 30000: 4374,
+}
 
 TRANSLATIONS = {
     "en": {
@@ -100,7 +107,6 @@ TRANSLATIONS = {
         "can_connection": "CAN Connection",
         "interface": "Interface:",
         "channel": "Channel:",
-        "adapter_baud": "Adapter Baud:",
         "can_baudrate": "CAN Baudrate:",
         "connect": "Connect",
         "disconnect": "Disconnect",
@@ -158,19 +164,24 @@ TRANSLATIONS = {
         "error": "Error",
         "failed_import_csv": "Failed to import CSV: {error}",
         "please_select_channel": "Please select a CAN channel or serial port",
-        "slcan_help": "Check the COM port name, adapter baudrate, and CAN bitrate.",
+        "slcan_help": "Check the COM port and CANable 2.0 SLCAN FD firmware.",
         "socketcan_help": "If using socketcan, make sure the interface is already up.",
         "failed_connect_target": "Failed to connect to {interface}:{channel}\n{help}",
         "connection_failed": "Connection failed: {error}",
-        "connected_slcan": "Connected to {channel} via slcan (adapter {tty_baudrate}, CAN {can_baudrate} bps)",
-        "connected_generic": "Connected to {interface}:{channel} at {can_baudrate} bps",
+        "connected_slcan": "Connected to {channel} via CANable 2.0 SLCAN FD (USB CDC, CAN FD {can_baudrate}/{data_bitrate} bps, BRS)",
+        "connected_generic": "Connected to {interface}:{channel} (CAN FD {can_baudrate}/{data_bitrate} bps, BRS)",
         "zero_sent": "Zero command sent, waiting for device ACK",
         "zero_failed": "Failed to send zero command",
         "calibration_sent": "Calibration command sent, waiting for device ACK",
         "calibration_failed": "Failed to send calibration command",
         "filter_size_failed": "Failed to send filter size command",
         "sample_rate_failed": "Failed to send sample rate command",
-        "sample_rate_requires_adapter_baud": "{sample_rate} SPS requires adapter baudrate {tty_baudrate} or higher",
+        "stream_summary": "ADC {sample_rate} SPS | scan {scan_rate:.0f} fps | telemetry <= {telemetry_rate:.0f} fps | decimation x{decimation}",
+        "health": "System Health",
+        "health_waiting": "Waiting for MCU health frame | RX {rx_rate:.0f} fps | protocol errors {bad}",
+        "health_summary": "MCU {adc_state} | RX {rx_rate:.0f} fps | ADC {sample_rate} SPS | decimation x{decimation} | TX drops {tx_drop} | ADC overflows {overflow} | recoveries {recovery} | protocol errors {bad}",
+        "adc_running": "RUN",
+        "adc_stopped": "STOP",
         "save_zero_sent": "Save Zero command sent, waiting for device ACK",
         "save_zero_failed": "Failed to save zero offset",
         "load_zero_sent": "Load Zero command sent, waiting for device ACK",
@@ -204,7 +215,6 @@ TRANSLATIONS = {
         "can_connection": "CAN 连接",
         "interface": "接口：",
         "channel": "通道：",
-        "adapter_baud": "适配器波特率：",
         "can_baudrate": "CAN 波特率：",
         "connect": "连接",
         "disconnect": "断开连接",
@@ -254,19 +264,24 @@ TRANSLATIONS = {
         "error": "错误",
         "failed_import_csv": "导入 CSV 失败：{error}",
         "please_select_channel": "请选择 CAN 通道或串口",
-        "slcan_help": "请检查串口名称、适配器波特率和 CAN 波特率。",
+        "slcan_help": "请检查串口名称和 CANable 2.0 SLCAN FD 固件。",
         "socketcan_help": "使用 socketcan 时，请确认接口已经启用。",
         "failed_connect_target": "连接 {interface}:{channel} 失败\n{help}",
         "connection_failed": "连接失败：{error}",
-        "connected_slcan": "已通过 slcan 连接 {channel}（适配器 {tty_baudrate}，CAN {can_baudrate} bps）",
-        "connected_generic": "已连接 {interface}:{channel}，波特率 {can_baudrate} bps",
+        "connected_slcan": "已通过 CANable 2.0 SLCAN FD 连接 {channel}（USB CDC，CAN FD {can_baudrate}/{data_bitrate} bps BRS）",
+        "connected_generic": "已连接 {interface}:{channel}，CAN FD {can_baudrate}/{data_bitrate} bps BRS",
         "zero_sent": "调零命令已发送，正在等待设备确认",
         "zero_failed": "调零命令发送失败",
         "calibration_sent": "校准命令已发送，正在等待设备确认",
         "calibration_failed": "校准命令发送失败",
         "filter_size_failed": "滤波长度命令发送失败",
         "sample_rate_failed": "采样率命令发送失败",
-        "sample_rate_requires_adapter_baud": "{sample_rate} SPS 需要适配器波特率至少为 {tty_baudrate}",
+        "stream_summary": "ADC {sample_rate} SPS | 扫描 {scan_rate:.0f} 帧/秒 | 遥测 <= {telemetry_rate:.0f} 帧/秒 | 抽取 x{decimation}",
+        "health": "系统健康状态",
+        "health_waiting": "等待 MCU 健康帧 | 接收 {rx_rate:.0f} 帧/秒 | 协议错误 {bad}",
+        "health_summary": "MCU {adc_state} | 接收 {rx_rate:.0f} 帧/秒 | ADC {sample_rate} SPS | 抽取 x{decimation} | TX 丢弃 {tx_drop} | ADC 溢出 {overflow} | 恢复 {recovery} | 协议错误 {bad}",
+        "adc_running": "运行",
+        "adc_stopped": "停止",
         "save_zero_sent": "保存零点命令已发送，正在等待设备确认",
         "save_zero_failed": "保存零点失败",
         "load_zero_sent": "加载零点命令已发送，正在等待设备确认",
@@ -556,17 +571,19 @@ class ReducerMonitorWindow(QMainWindow):
         self.rx_telemetry_count = 0
         self.rx_status_count = 0
         self.rx_bad_protocol_count = 0
+        self.last_rx_telemetry_count = 0
+        self.rx_telemetry_rate_hz = 0.0
+        self.latest_health = None
         self.maximized_plot_channel: Optional[int] = None
         self.maximized_plot_panel: Optional[QWidget] = None
         self.last_sent_channel_mask: Optional[int] = None
         self.language = "en"
-        self.sample_rate_sps = 100
+        self.sample_rate_sps = 100.0
         self._status_message = None
 
         # Setup UI
         self.init_ui()
         self._refresh_channels()
-        self._update_connection_options()
         self._reset_measurements()
 
         # Connect signals
@@ -581,9 +598,39 @@ class ReducerMonitorWindow(QMainWindow):
         self.command_timeout_timer.timeout.connect(self._check_command_timeouts)
         self.command_timeout_timer.start(250)
 
+        self.health_timer = QTimer()
+        self.health_timer.timeout.connect(self._refresh_health_panel)
+        self.health_timer.start(1000)
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setGeometry(100, 100, 1200, 800)
+        self.setMinimumSize(1100, 720)
+        self.setStyleSheet("""
+            QMainWindow { background: #f4f7fb; }
+            QGroupBox {
+                background: white; border: 1px solid #d7e0ea;
+                border-radius: 8px; margin-top: 10px; padding: 8px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; left: 12px; padding: 0 4px;
+                color: #24415f;
+            }
+            QPushButton {
+                background: #2878c8; color: white; border: 0;
+                border-radius: 5px; padding: 6px 12px;
+            }
+            QPushButton:disabled { background: #b8c6d4; }
+            QPushButton:hover:!disabled { background: #1f68ae; }
+            QComboBox, QSpinBox {
+                background: white; border: 1px solid #b8c6d4;
+                border-radius: 4px; padding: 4px 7px;
+            }
+            QTabWidget::pane { border: 1px solid #d7e0ea; background: white; }
+            QTabBar::tab { padding: 7px 16px; }
+            QStatusBar { background: #eaf1f8; color: #24415f; }
+        """)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -597,6 +644,9 @@ class ReducerMonitorWindow(QMainWindow):
         # Command group
         self.cmd_group = self._create_command_group()
         main_layout.addWidget(self.cmd_group)
+
+        self.health_group = self._create_health_group()
+        main_layout.addWidget(self.health_group)
 
         # Tab widget for waveforms and data
         self.tabs = QTabWidget()
@@ -636,20 +686,12 @@ class ReducerMonitorWindow(QMainWindow):
         self.channel_combo.setEditable(True)
         layout.addWidget(self.channel_combo)
 
-        self.serial_baud_label = QLabel()
-        layout.addWidget(self.serial_baud_label)
-        self.serial_baud_combo = QComboBox()
-        for serial_baudrate in SUPPORTED_SLCAN_SERIAL_BAUDRATES:
-            self.serial_baud_combo.addItem(str(serial_baudrate), serial_baudrate)
-        serial_baud_index = self.serial_baud_combo.findData(DEFAULT_SLCAN_TTY_BAUDRATE)
-        if serial_baud_index >= 0:
-            self.serial_baud_combo.setCurrentIndex(serial_baud_index)
-        layout.addWidget(self.serial_baud_combo)
-
-        # MCU firmware uses a fixed classic CAN bitrate.
+        # MCU firmware uses fixed 500K nominal and 2M data-phase bitrates.
         self.can_baud_label = QLabel()
         layout.addWidget(self.can_baud_label)
-        self.can_baud_value = QLabel(f"{FIXED_CAN_BITRATE.bps // 1000}K")
+        self.can_baud_value = QLabel(
+            f"{FIXED_CAN_BITRATE.bps // 1000}K / {CAN_FD_DATA_BITRATE // 1000000}M FD+BRS"
+        )
         layout.addWidget(self.can_baud_value)
 
         # Connect button
@@ -798,7 +840,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.conn_group.setTitle(self._tr("can_connection"))
         self.interface_label.setText(self._tr("interface"))
         self.channel_label.setText(self._tr("channel"))
-        self.serial_baud_label.setText(self._tr("adapter_baud"))
         self.can_baud_label.setText(self._tr("can_baudrate"))
         self.connect_btn.setText(
             self._tr("disconnect") if self.is_connected else self._tr("connect")
@@ -817,6 +858,9 @@ class ReducerMonitorWindow(QMainWindow):
         self.clear_zero_btn.setText(self._tr("clear_zero"))
         self.sample_rate_label.setText(self._tr("sample_rate"))
         self.filter_size_label.setText(self._tr("filter_size"))
+        self.health_group.setTitle(self._tr("health"))
+        self._refresh_health_panel(update_rx_rate=False)
+        self._update_stream_summary()
 
         self.tabs.setTabText(0, self._tr("waveforms"))
         self.tabs.setTabText(1, self._tr("data_panel"))
@@ -888,7 +932,6 @@ class ReducerMonitorWindow(QMainWindow):
 
     def _on_interface_changed(self, _index: int):
         self._refresh_channels()
-        self._update_connection_options()
 
     def _refresh_channels(self):
         """Refresh the list of available CAN channels"""
@@ -899,7 +942,12 @@ class ReducerMonitorWindow(QMainWindow):
             label = channel if not desc or desc == channel else f"{channel} - {desc}"
             self.channel_combo.addItem(label, channel)
         if self.channel_combo.count() == 0:
-            fallback_channel = "COM1" if interface == "slcan" else "can0"
+            fallback_channel = {
+                "slcan": "COM1",
+                "pcan": "PCAN_USBBUS1",
+                "ixxat": "0",
+                "vector": "0",
+            }.get(interface, "can0")
             self.channel_combo.addItem(fallback_channel, fallback_channel)
 
         if selected_channel:
@@ -909,34 +957,59 @@ class ReducerMonitorWindow(QMainWindow):
             else:
                 self.channel_combo.setEditText(selected_channel)
 
-    def _update_connection_options(self):
-        uses_serial_adapter = self.interface_combo.currentData() == "slcan"
-        options_enabled = not self.is_connected and self.interface_combo.isEnabled()
-        self.serial_baud_label.setEnabled(uses_serial_adapter and options_enabled)
-        self.serial_baud_combo.setEnabled(uses_serial_adapter and options_enabled)
-
     def _set_connection_controls_enabled(self, enabled: bool):
         self.interface_combo.setEnabled(enabled)
         self.channel_combo.setEnabled(enabled)
         self.refresh_btn.setEnabled(enabled)
-        self._update_connection_options()
 
-    def _minimum_slcan_tty_baudrate(self, sample_rate: int) -> int:
+    @staticmethod
+    def _format_sample_rate(sample_rate: float) -> str:
+        return f"{sample_rate:g}"
+
+    def _active_adc_count(self) -> int:
         channel_mask = self._displayed_channel_mask()
-        active_adc_count = sum(
+        return sum(
             1 for adc_mask in ADC_CHANNEL_MASKS if channel_mask & adc_mask
         )
-        telemetry_frames_per_second = sample_rate * active_adc_count
-        required_baudrate = (
-            telemetry_frames_per_second *
-            SLCAN_TELEMETRY_FRAME_BYTES *
-            SLCAN_SERIAL_BITS_PER_BYTE /
-            SLCAN_MAX_UTILIZATION
+
+    @staticmethod
+    def _ads1256_cycling_rate(sample_rate: float) -> float:
+        return ADS1256_CYCLING_RATES.get(sample_rate, sample_rate)
+
+    def _telemetry_decimation(self, sample_rate: float) -> int:
+        source_frames_per_second = (
+            self._ads1256_cycling_rate(sample_rate) * self._active_adc_count()
         )
-        for baudrate in SUPPORTED_SLCAN_SERIAL_BAUDRATES:
-            if baudrate >= required_baudrate:
-                return baudrate
-        return SUPPORTED_SLCAN_SERIAL_BAUDRATES[-1]
+        return max(
+            1,
+            int(
+                (source_frames_per_second + CAN_TELEMETRY_MAX_FRAMES_PER_SECOND - 1)
+                // CAN_TELEMETRY_MAX_FRAMES_PER_SECOND
+            ),
+        )
+
+    def _estimated_telemetry_rate(self, sample_rate: float) -> float:
+        source_frames_per_second = (
+            self._ads1256_cycling_rate(sample_rate) * self._active_adc_count()
+        )
+        return source_frames_per_second / self._telemetry_decimation(sample_rate)
+
+    def _update_stream_summary(self):
+        if not hasattr(self, "stream_summary_label"):
+            return
+        decimation = self._telemetry_decimation(self.sample_rate_sps)
+        self.stream_summary_label.setText(
+            self._tr(
+                "stream_summary",
+                sample_rate=self._format_sample_rate(self.sample_rate_sps),
+                scan_rate=(
+                    self._ads1256_cycling_rate(self.sample_rate_sps) *
+                    self._active_adc_count()
+                ),
+                telemetry_rate=self._estimated_telemetry_rate(self.sample_rate_sps),
+                decimation=decimation,
+            )
+        )
 
     def _selected_channel(self) -> str:
         text = self.channel_combo.currentText().strip()
@@ -1186,6 +1259,7 @@ class ReducerMonitorWindow(QMainWindow):
     def _sync_mcu_channel_mask(
         self, *, show_status: bool = True, force: bool = False
     ) -> bool:
+        self._update_stream_summary()
         if not self.is_connected:
             return True
 
@@ -1316,6 +1390,9 @@ class ReducerMonitorWindow(QMainWindow):
             self.rx_telemetry_count = 0
             self.rx_status_count = 0
             self.rx_bad_protocol_count = 0
+            self.last_rx_telemetry_count = 0
+            self.rx_telemetry_rate_hz = 0.0
+            self.latest_health = None
 
         if hasattr(self, 'data_table'):
             for row in range(NUM_CHANNELS):
@@ -1329,6 +1406,7 @@ class ReducerMonitorWindow(QMainWindow):
             for curves in self.plot_metric_curves:
                 for curve in curves.values():
                     curve.setData([], [])
+        self._refresh_health_panel(update_rx_rate=False)
 
     def on_connect_clicked(self):
         """Handle connect/disconnect button click"""
@@ -1395,26 +1473,22 @@ class ReducerMonitorWindow(QMainWindow):
         if sample_rate is None:
             return
 
-        sample_rate = int(sample_rate)
-        if self.interface_combo.currentData() == "slcan":
-            tty_baudrate = int(
-                self.serial_baud_combo.currentData() or DEFAULT_SLCAN_TTY_BAUDRATE
-            )
-            minimum_baudrate = self._minimum_slcan_tty_baudrate(sample_rate)
-            if tty_baudrate < minimum_baudrate:
-                with QSignalBlocker(self.sample_rate_combo):
-                    previous_index = self.sample_rate_combo.findData(self.sample_rate_sps)
-                    if previous_index >= 0:
-                        self.sample_rate_combo.setCurrentIndex(previous_index)
-                self._show_status(
-                    "sample_rate_requires_adapter_baud",
-                    sample_rate=sample_rate,
-                    tty_baudrate=minimum_baudrate,
-                )
-                return
+        sample_rate = float(sample_rate)
 
-        if self.send_command(CAN_CMD_SET_SAMPLE_RATE, param=0, value=sample_rate):
+        if sample_rate.is_integer():
+            sample_rate_param = 0
+            sample_rate_value = int(sample_rate)
+        else:
+            sample_rate_param = 1
+            sample_rate_value = round(sample_rate * 10)
+
+        if self.send_command(
+            CAN_CMD_SET_SAMPLE_RATE,
+            param=sample_rate_param,
+            value=sample_rate_value,
+        ):
             self.sample_rate_sps = sample_rate
+            self._update_stream_summary()
             logger.info("Sample rate set to %s SPS", sample_rate)
         else:
             self._show_status("sample_rate_failed")
@@ -1483,7 +1557,9 @@ class ReducerMonitorWindow(QMainWindow):
         layout.addWidget(self.sample_rate_label)
         self.sample_rate_combo = QComboBox()
         for sample_rate in SUPPORTED_SAMPLE_RATES:
-            self.sample_rate_combo.addItem(f"{sample_rate} SPS", sample_rate)
+            self.sample_rate_combo.addItem(
+                f"{self._format_sample_rate(float(sample_rate))} SPS", sample_rate
+            )
         self.sample_rate_combo.setCurrentText("100 SPS")
         self.sample_rate_combo.setEnabled(False)
         self.sample_rate_combo.currentIndexChanged.connect(self.on_sample_rate_changed)
@@ -1500,10 +1576,60 @@ class ReducerMonitorWindow(QMainWindow):
         self.filter_size_spin.valueChanged.connect(self.on_filter_size_changed)
         layout.addWidget(self.filter_size_spin)
 
+        self.stream_summary_label = QLabel()
+        self.stream_summary_label.setStyleSheet("color: #315b7d; font-weight: 600;")
+        layout.addWidget(self.stream_summary_label)
+
         layout.addStretch()
 
         group.setLayout(layout)
         return group
+
+    def _create_health_group(self) -> QGroupBox:
+        group = QGroupBox()
+        layout = QHBoxLayout()
+        self.health_summary_label = QLabel()
+        self.health_summary_label.setStyleSheet("color: #315b7d;")
+        layout.addWidget(self.health_summary_label)
+        layout.addStretch()
+        group.setLayout(layout)
+        return group
+
+    def _refresh_health_panel(self, *, update_rx_rate: bool = True):
+        if not hasattr(self, "health_summary_label"):
+            return
+
+        if update_rx_rate:
+            telemetry_delta = self.rx_telemetry_count - self.last_rx_telemetry_count
+            self.last_rx_telemetry_count = self.rx_telemetry_count
+            self.rx_telemetry_rate_hz = float(max(0, telemetry_delta))
+
+        health = self.latest_health
+        if health is None:
+            self.health_summary_label.setText(
+                self._tr(
+                    "health_waiting",
+                    rx_rate=self.rx_telemetry_rate_hz,
+                    bad=self.rx_bad_protocol_count,
+                )
+            )
+            return
+
+        self.health_summary_label.setText(
+            self._tr(
+                "health_summary",
+                adc_state=self._tr(
+                    "adc_running" if health.adc_running else "adc_stopped"
+                ),
+                rx_rate=self.rx_telemetry_rate_hz,
+                sample_rate=self._format_sample_rate(health.sample_rate_sps),
+                decimation=health.telemetry_decimation,
+                tx_drop=health.tx_drop_count,
+                overflow=health.adc_overflow_count,
+                recovery=health.adc_recovery_count,
+                bad=self.rx_bad_protocol_count,
+            )
+        )
 
     def connect(self):
         """Connect to the CAN adapter"""
@@ -1516,7 +1642,7 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         baudrate = FIXED_CAN_BITRATE
-        tty_baudrate = int(self.serial_baud_combo.currentData() or DEFAULT_SLCAN_TTY_BAUDRATE)
+        tty_baudrate = DEFAULT_SLCAN_TTY_BAUDRATE
 
         try:
             self.can_bus = PythonCANInterface()
@@ -1573,8 +1699,8 @@ class ReducerMonitorWindow(QMainWindow):
                 self._show_status(
                     "connected_slcan",
                     channel=channel,
-                    tty_baudrate=tty_baudrate,
                     can_baudrate=baudrate.bps,
+                    data_bitrate=CAN_FD_DATA_BITRATE,
                 )
             else:
                 self._show_status(
@@ -1582,14 +1708,15 @@ class ReducerMonitorWindow(QMainWindow):
                     interface=interface,
                     channel=channel,
                     can_baudrate=baudrate.bps,
+                    data_bitrate=CAN_FD_DATA_BITRATE,
                 )
 
             logger.info(
-                "Connected to %s:%s (adapter baud %s, CAN bitrate %s)",
+                "Connected to %s:%s (CAN FD bitrate %s/%s)",
                 interface,
                 channel,
-                tty_baudrate if interface == "slcan" else "n/a",
                 baudrate.bps,
+                CAN_FD_DATA_BITRATE,
             )
 
         except Exception as e:
@@ -1641,9 +1768,23 @@ class ReducerMonitorWindow(QMainWindow):
             self._handle_status_frame(status)
             return
 
+        health = parse_health_frame(frame)
+        if health is not None:
+            self.latest_health = health
+            self.sample_rate_sps = health.sample_rate_sps
+            with QSignalBlocker(self.sample_rate_combo):
+                sample_rate_index = self.sample_rate_combo.findData(
+                    self.sample_rate_sps
+                )
+                if sample_rate_index >= 0:
+                    self.sample_rate_combo.setCurrentIndex(sample_rate_index)
+            self._update_stream_summary()
+            self._refresh_health_panel(update_rx_rate=False)
+            return
+
         telemetry = parse_telemetry_frame(frame)
         if telemetry is None:
-            if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS):
+            if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS, CAN_ID_TX_HEALTH):
                 self.rx_bad_protocol_count += 1
                 logger.warning("Rejected malformed protocol frame on CAN ID 0x%03X", frame.id)
             return

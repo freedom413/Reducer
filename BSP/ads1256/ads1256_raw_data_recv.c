@@ -29,17 +29,20 @@ typedef struct {
 } ads1256_scan_device_t;
 
 typedef struct {
-    uint16_t sps;
+    uint32_t sps_x10;
+    uint32_t cycling_rate_x10;
     ads1256_sps_t rate;
 } ads1256_rate_map_t;
 
 static lwrb_t ads1256_data_rb;
 static char ads1256_data_buf[ADS1256_DATA_BUFF_SIZE];
-static uint16_t ads1256_sample_rate_sps = 100;
+static uint32_t ads1256_sample_rate_x10 = 1000U;
 static uint16_t ads1256_channel_mask = ADS1256_ALL_CHANNEL_MASK;
 static bool ads1256_started = false;
 static uint8_t ads1256_poll_error_count = 0;
 static uint32_t ads1256_last_recovery_tick = 0;
+static uint16_t ads1256_overflow_count = 0;
+static uint16_t ads1256_recovery_count = 0;
 
 static const ads1256_ch_t ads1256_a_channels[ADS1256_CHANNELS_PER_DEVICE] = {
     {.p = ADS1256_AIN0, .n = ADS1256_AIN1},
@@ -75,22 +78,28 @@ static ads1256_scan_device_t ads1256_devices[] = {
 };
 
 static const ads1256_rate_map_t ads1256_rate_table[] = {
-    {5, ADS1256_SPS_5},
-    {10, ADS1256_SPS_10},
-    {15, ADS1256_SPS_15},
-    {25, ADS1256_SPS_25},
-    {30, ADS1256_SPS_30},
-    {50, ADS1256_SPS_50},
-    {60, ADS1256_SPS_60},
-    {100, ADS1256_SPS_100},
-    {500, ADS1256_SPS_500},
-    {1000, ADS1256_SPS_1000},
+    {25U, 25U, ADS1256_SPS_2_5},
+    {50U, 50U, ADS1256_SPS_5},
+    {100U, 100U, ADS1256_SPS_10},
+    {150U, 150U, ADS1256_SPS_15},
+    {250U, 250U, ADS1256_SPS_25},
+    {300U, 300U, ADS1256_SPS_30},
+    {500U, 500U, ADS1256_SPS_50},
+    {600U, 590U, ADS1256_SPS_60},
+    {1000U, 980U, ADS1256_SPS_100},
+    {5000U, 4560U, ADS1256_SPS_500},
+    {10000U, 8370U, ADS1256_SPS_1000},
+    {20000U, 14380U, ADS1256_SPS_2000},
+    {37500U, 21650U, ADS1256_SPS_3750},
+    {75000U, 30430U, ADS1256_SPS_7500},
+    {150000U, 38170U, ADS1256_SPS_15000},
+    {300000U, 43740U, ADS1256_SPS_30000},
 };
 
-static bool ads1256_lookup_rate(uint16_t sps, ads1256_sps_t *rate)
+static bool ads1256_lookup_rate(uint32_t sps_x10, ads1256_sps_t *rate)
 {
     for (uint32_t i = 0; i < ADS1256_ARRAY_SIZE(ads1256_rate_table); i++) {
-        if (ads1256_rate_table[i].sps == sps) {
+        if (ads1256_rate_table[i].sps_x10 == sps_x10) {
             if (rate != NULL) {
                 *rate = ads1256_rate_table[i].rate;
             }
@@ -111,6 +120,9 @@ static void ads1256_data_push(uint8_t logical_channel, int32_t raw_value)
 
     if (lwrb_get_free(&ads1256_data_rb) < record_size) {
         (void)lwrb_skip(&ads1256_data_rb, record_size);
+        if (ads1256_overflow_count < UINT16_MAX) {
+            ads1256_overflow_count++;
+        }
     }
     (void)lwrb_write(&ads1256_data_rb, &data, record_size);
 }
@@ -235,10 +247,10 @@ void adc_ads1256_start(void)
         return;
     }
 
-    if (ads1256_sample_rate_sps == 100U) {
+    if (ads1256_sample_rate_x10 == 1000U) {
         ret = adc_ads1256_restart();
     } else {
-        ret = adc_ads1256_set_sample_rate(ads1256_sample_rate_sps);
+        ret = adc_ads1256_set_sample_rate_x10(ads1256_sample_rate_x10);
     }
     if (ret < 0) {
         ads1256_last_recovery_tick = HAL_GetTick();
@@ -272,6 +284,9 @@ void adc_ads1256_poll(void)
         if ((uint32_t)(now - ads1256_last_recovery_tick) >=
             ADS1256_RECOVERY_INTERVAL_MS) {
             adc_ads1256_start();
+            if (ads1256_started && ads1256_recovery_count < UINT16_MAX) {
+                ads1256_recovery_count++;
+            }
         }
         return;
     }
@@ -331,9 +346,21 @@ int adc_ads1256_calibrate(void)
 
 int adc_ads1256_set_sample_rate(uint16_t sps)
 {
+    return adc_ads1256_set_sample_rate_x10((uint32_t)sps * 10U);
+}
+
+uint16_t adc_ads1256_get_sample_rate(void)
+{
+    return (uint16_t)(ads1256_sample_rate_x10 / 10U);
+}
+
+int adc_ads1256_set_sample_rate_x10(uint32_t sps_x10)
+{
+    ads1256_sps_t previous_rate;
     ads1256_sps_t rate;
 
-    if (!ads1256_lookup_rate(sps, &rate)) {
+    if (!ads1256_lookup_rate(sps_x10, &rate) ||
+        !ads1256_lookup_rate(ads1256_sample_rate_x10, &previous_rate)) {
         return -1;
     }
 
@@ -345,17 +372,49 @@ int adc_ads1256_set_sample_rate(uint16_t sps)
 
         int ret = ads1256_set_sps(dev->adc, rate);
         if (ret < 0) {
+            for (uint32_t rollback = 0; rollback < i; rollback++) {
+                ads1256_scan_device_t *rollback_dev = &ads1256_devices[rollback];
+                if (rollback_dev->enabled) {
+                    (void)ads1256_set_sps(rollback_dev->adc, previous_rate);
+                }
+            }
+            (void)adc_ads1256_restart();
             return ret;
         }
     }
 
-    ads1256_sample_rate_sps = sps;
+    ads1256_sample_rate_x10 = sps_x10;
     return adc_ads1256_restart();
 }
 
-uint16_t adc_ads1256_get_sample_rate(void)
+uint32_t adc_ads1256_get_sample_rate_x10(void)
 {
-    return ads1256_sample_rate_sps;
+    return ads1256_sample_rate_x10;
+}
+
+uint32_t adc_ads1256_get_cycling_rate_x10(void)
+{
+    for (uint32_t i = 0; i < ADS1256_ARRAY_SIZE(ads1256_rate_table); i++) {
+        if (ads1256_rate_table[i].sps_x10 == ads1256_sample_rate_x10) {
+            return ads1256_rate_table[i].cycling_rate_x10;
+        }
+    }
+    return 0U;
+}
+
+uint16_t adc_ads1256_get_overflow_count(void)
+{
+    return ads1256_overflow_count;
+}
+
+uint16_t adc_ads1256_get_recovery_count(void)
+{
+    return ads1256_recovery_count;
+}
+
+uint8_t adc_ads1256_is_running(void)
+{
+    return ads1256_started ? 1U : 0U;
 }
 
 int adc_ads1256_set_channel_mask(uint16_t channel_mask)

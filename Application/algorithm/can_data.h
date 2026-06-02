@@ -9,6 +9,7 @@
 #define CAN_ID_RX_COMMAND    0x100  // Uplink: PC -> STM32
 #define CAN_ID_TX_TELEMETRY  0x101  // Downlink: STM32 -> PC telemetry
 #define CAN_ID_TX_STATUS     0x102  // Downlink: STM32 -> PC command status
+#define CAN_ID_TX_HEALTH     0x103  // Downlink: STM32 -> PC health summary
 
 // ============================================================================
 // Frame type definitions
@@ -16,6 +17,8 @@
 #define CAN_FRAME_TYPE_TELEMETRY  0x51
 #define CAN_FRAME_TYPE_COMMAND    0xA0
 #define CAN_FRAME_TYPE_STATUS     0xA1
+#define CAN_FRAME_TYPE_HEALTH     0x52
+#define CAN_HEALTH_VERSION        0x01
 
 // ============================================================================
 // Command status definitions
@@ -28,7 +31,7 @@
 #define CAN_STATUS_STORAGE_ERROR  0xE5
 
 // ============================================================================
-// Telemetry CAN TX Frame - 8-byte classic CAN
+// Telemetry CAN TX Frame - 8-byte CAN FD frame with bit-rate switching
 // ============================================================================
 // Byte 0: frame_type = 0x51
 // Byte 1: channel (0-7)
@@ -92,6 +95,23 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(can_tx_status_frame_t) == 8, "can_tx_status_frame_t must be 8 bytes");
 
 // ============================================================================
+// Health frame (STM32 -> PC) - 16-byte CAN FD+BRS frame
+// ============================================================================
+typedef struct __attribute__((packed)) {
+    uint8_t  frame_type;
+    uint8_t  version;
+    uint8_t  sample_rate_x10_le[4];
+    uint8_t  telemetry_decimation_le[2];
+    uint8_t  tx_drop_count_le[2];
+    uint8_t  adc_overflow_count_le[2];
+    uint8_t  adc_recovery_count_le[2];
+    uint8_t  flags;
+    uint8_t  crc8;
+} can_tx_health_frame_t;
+
+_Static_assert(sizeof(can_tx_health_frame_t) == 16, "can_tx_health_frame_t must be 16 bytes");
+
+// ============================================================================
 // Command types for RX
 // ============================================================================
 #define CAN_CMD_SET_SAMPLE_RATE  0x01
@@ -102,6 +122,9 @@ _Static_assert(sizeof(can_tx_status_frame_t) == 8, "can_tx_status_frame_t must b
 #define CAN_CMD_LOAD_ZERO        0x06  // Load zero offset from Flash
 #define CAN_CMD_CLEAR_ZERO       0x07  // Clear zero offset from Flash
 #define CAN_CMD_SET_CHANNEL_MASK 0x08  // Select ADC channels to scan
+
+#define CAN_SAMPLE_RATE_PARAM_SPS       0x00
+#define CAN_SAMPLE_RATE_PARAM_DECI_SPS  0x01
 
 // ============================================================================
 // Helper functions
@@ -128,6 +151,10 @@ void can_build_telemetry_frame(can_tx_telemetry_frame_t *frame, uint8_t channel,
 void can_build_status_frame(can_tx_status_frame_t *frame, uint8_t sequence,
                             uint8_t cmd_type, uint8_t status, uint16_t value,
                             uint8_t detail);
+void can_build_health_frame(can_tx_health_frame_t *frame, uint32_t sample_rate_x10,
+                            uint16_t telemetry_decimation, uint16_t tx_drop_count,
+                            uint16_t adc_overflow_count, uint16_t adc_recovery_count,
+                            uint8_t active_adc_count, uint8_t flags);
 uint16_t can_frame_u16_le_get(const uint8_t value_le[2]);
 
 #endif // __CAN_DATA_H__
