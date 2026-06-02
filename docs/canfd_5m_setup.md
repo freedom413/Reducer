@@ -1,19 +1,20 @@
-# CAN FD 500K / 2M Setup
+# CAN FD 1M / 5M Setup
 
 This branch uses CAN FD with bit-rate switching (BRS) end to end:
 
-- Arbitration phase: `500000` bit/s
-- Data phase: `2000000` bit/s
+- Arbitration phase: `1000000` bit/s
+- Data phase: `5000000` bit/s
 - Standard 11-bit IDs: `0x100`, `0x101`, `0x102`, `0x103`
-- Payload size: 8 bytes for command/telemetry/status, 16 bytes for health
+- Payload size: 8 bytes for command/status, 64 bytes for batched telemetry,
+  16 bytes for health
 - Frame format: CAN FD with BRS, not classic CAN
 
 The STM32G431 FDCAN kernel clock is `170 MHz`. Firmware timing is:
 
 | Phase | Prescaler | TSEG1 | TSEG2 | SJW | Result |
 |---|---:|---:|---:|---:|---:|
-| Nominal | 20 | 14 | 2 | 1 | 500 kbit/s |
-| Data | 5 | 14 | 2 | 1 | 2 Mbit/s |
+| Nominal | 10 | 14 | 2 | 1 | 1 Mbit/s |
+| Data | 2 | 14 | 2 | 1 | 5 Mbit/s |
 
 ## Hardware
 
@@ -29,14 +30,14 @@ selected serial port and configures the adapter automatically:
 
 ```text
 C
-S6
-Y2
+S8
+Y5
 O
 ```
 
 The upstream backend may emit `O` more than once while applying timing and
-opening the bus. The meaningful configuration is close, nominal rate `S6`
-(`500K`), data rate `Y2` (`2M`), and open.
+opening the bus. The meaningful configuration is close, nominal rate `S8`
+(`1M`), data rate `Y5` (`5M`), and open.
 
 Application frames use the CANable 2.0 `b` command for standard-ID CAN FD+BRS
 frames, for example `b1008...` for the `0x100` command frame. Select
@@ -45,7 +46,7 @@ frames, for example `b1008...` for the `0x100` command frame. Select
 Standard SLCAN adapters do not provide these CANable 2.0 FD extensions.
 
 The GUI uses the upstream `python-can` SLCAN backend with `BitTimingFd`, so it
-configures `S6` and `Y2` through the maintained library implementation.
+configures `S8` and `Y5` through the maintained library implementation.
 Use `python-can>=4.6.1`: SLCAN FD support landed in `4.6.0`, and `4.6.1`
 includes the follow-up SLCAN initialization fix.
 
@@ -68,8 +69,11 @@ limit for the board's `7.68 MHz` clock. All ADS1256 DRATE values are exposed:
 With input multiplexing, effective channel-cycling throughput follows the
 ADS1256 datasheet Table 14. At the `30000 SPS` setting each converter delivers
 about `4374` conversions/s. Firmware processes every acquired conversion and
-automatically decimates only outgoing telemetry to a stable ceiling of about
-`3000` frames/s.
+packs up to ten telemetry records into one 64-byte FD+BRS frame. At the maximum
+dual-ADC cycling rate of about `8748` records/s, this needs about `875` CAN
+frames/s. A 128-record software queue smooths bursts before the three-slot
+FDCAN hardware TX FIFO. Outgoing records are decimated only if a future source
+configuration exceeds `10000` records/s.
 
 The MCU sends a 16-byte FD+BRS health frame on `0x103` every second. The GUI
 shows ADC state, effective decimation, CAN TX drops, ADC ring-buffer overflows,
@@ -81,7 +85,7 @@ Bring up a CAN FD-capable `can0` interface before starting the GUI:
 
 ```bash
 sudo ip link set can0 down
-sudo ip link set can0 type can bitrate 500000 dbitrate 2000000 fd on restart-ms 100
+sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on restart-ms 100
 sudo ip link set can0 up
 ip -details link show can0
 ```
@@ -126,7 +130,7 @@ Flash `build/Debug/Reducer.elf`.
 
 1. Flash the firmware and power-cycle the MCU.
 2. Start the GUI, select `CANable 2.0 SLCAN FD`, and choose the serial port.
-3. Connect; the GUI configures `500K / 2M`, FD, and BRS automatically.
+3. Connect; the GUI configures `1M / 5M`, FD, and BRS automatically.
 4. Confirm FD+BRS telemetry on `0x101`.
 5. Send `Calibrate` and confirm the FD+BRS ACK on `0x102`.
 6. Increase the sample rate gradually to `30000 SPS` and watch the GUI health

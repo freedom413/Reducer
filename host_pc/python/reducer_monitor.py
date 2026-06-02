@@ -48,7 +48,7 @@ from can_protocol import (
     list_can_channels,
     parse_health_frame,
     parse_status_frame,
-    parse_telemetry_frame,
+    parse_telemetry_frames,
 )
 
 # Command types (must match embedded firmware)
@@ -65,7 +65,7 @@ CAN_CMD_SET_CHANNEL_MASK = 0x08
 NUM_CHANNELS = 8
 DEFAULT_VISIBLE_PLOTS = 4
 MAX_VISIBLE_PLOTS = 8
-FIXED_CAN_BITRATE = Baudrate.BAUD_500K
+FIXED_CAN_BITRATE = Baudrate.BAUD_1M
 ADC_CHANNEL_MASKS = (0x0F, 0xF0)
 ELASTIC_MODULUS_MPA = 210000.0
 
@@ -141,7 +141,7 @@ SUPPORTED_SAMPLE_RATES = [
     2.5, 5, 10, 15, 25, 30, 50, 60, 100, 500, 1000, 2000, 3750, 7500,
     15000, 30000,
 ]
-CAN_TELEMETRY_MAX_FRAMES_PER_SECOND = 3000
+CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND = 10000
 ADS1256_CYCLING_RATES = {
     2.5: 2.5, 5: 5, 10: 10, 15: 15, 25: 25, 30: 30, 50: 50, 60: 59,
     100: 98, 500: 456, 1000: 837, 2000: 1438, 3750: 2165, 7500: 3043,
@@ -223,6 +223,14 @@ def theme_stylesheet(theme: str) -> str:
             border: 1px solid {colors["border"]};
         }}
     """
+
+
+def format_bitrate(bps: int) -> str:
+    if bps % 1000000 == 0:
+        return f"{bps // 1000000}M"
+    if bps % 1000 == 0:
+        return f"{bps // 1000}K"
+    return str(bps)
 
 
 def apply_plot_theme(plot: pg.PlotWidget, theme: str) -> None:
@@ -839,11 +847,12 @@ class ReducerMonitorWindow(QMainWindow):
         self.channel_combo.setEditable(True)
         layout.addWidget(self.channel_combo)
 
-        # MCU firmware uses fixed 500K nominal and 2M data-phase bitrates.
+        # MCU firmware uses fixed 1M nominal and 5M data-phase bitrates.
         self.can_baud_label = QLabel()
         layout.addWidget(self.can_baud_label)
         self.can_baud_value = QLabel(
-            f"{FIXED_CAN_BITRATE.bps // 1000}K / {CAN_FD_DATA_BITRATE // 1000000}M FD+BRS"
+            f"{format_bitrate(FIXED_CAN_BITRATE.bps)} / "
+            f"{format_bitrate(CAN_FD_DATA_BITRATE)} FD+BRS"
         )
         layout.addWidget(self.can_baud_value)
 
@@ -1176,8 +1185,8 @@ class ReducerMonitorWindow(QMainWindow):
         return max(
             1,
             int(
-                (source_frames_per_second + CAN_TELEMETRY_MAX_FRAMES_PER_SECOND - 1)
-                // CAN_TELEMETRY_MAX_FRAMES_PER_SECOND
+                (source_frames_per_second + CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND - 1)
+                // CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND
             ),
         )
 
@@ -1584,6 +1593,7 @@ class ReducerMonitorWindow(QMainWindow):
                 self._create_waveform_buffers()
             )
             self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
+            self.pending_table_data = [None for _ in range(NUM_CHANNELS)]
             self.channel_stats = [
                 {'min': None, 'max': None, 'sum': 0.0, 'count': 0}
                 for _ in range(NUM_CHANNELS)
@@ -1994,13 +2004,17 @@ class ReducerMonitorWindow(QMainWindow):
             self._refresh_health_panel(update_rx_rate=False)
             return
 
-        telemetry = parse_telemetry_frame(frame)
-        if telemetry is None:
+        telemetry_frames = parse_telemetry_frames(frame)
+        if telemetry_frames is None:
             if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS, CAN_ID_TX_HEALTH):
                 self.rx_bad_protocol_count += 1
                 logger.warning("Rejected malformed protocol frame on CAN ID 0x%03X", frame.id)
             return
 
+        for telemetry in telemetry_frames:
+            self._ingest_telemetry(telemetry, frame.timestamp)
+
+    def _ingest_telemetry(self, telemetry, timestamp: Optional[float]):
         channel = telemetry.channel
 
         if channel >= NUM_CHANNELS:
@@ -2016,7 +2030,7 @@ class ReducerMonitorWindow(QMainWindow):
             data.stress_01mpa = telemetry.stress_01mpa
             data.stress_mpa = telemetry.strain_ue * ELASTIC_MODULUS_MPA / 1000000.0
             data.samples += 1
-            data.last_timestamp = frame.timestamp if frame.timestamp is not None else time.time()
+            data.last_timestamp = timestamp if timestamp is not None else time.time()
             payload = {
                 'voltage': data.voltage_mv,
                 'strain': data.strain_ue,
@@ -2034,13 +2048,7 @@ class ReducerMonitorWindow(QMainWindow):
         self.waveform_metric_buffers["strain"][channel].append(data['strain'])
         self.waveform_metric_buffers["stress"][channel].append(data['stress'])
         self.plot_dirty[channel] = True
-
-        # Update data table
-        if channel < self.data_table.rowCount():
-            self.data_table.item(channel, 1).setText(f"{data['voltage']:.3f}")
-            self.data_table.item(channel, 2).setText(f"{data['strain']:.2f}")
-            self.data_table.item(channel, 3).setText(f"{data['stress']:.4f}")
-            self.data_table.item(channel, 4).setText(str(data['samples']))
+        self.pending_table_data[channel] = data
 
         stats = self.channel_stats[channel]
         voltage = data['voltage']
@@ -2048,8 +2056,6 @@ class ReducerMonitorWindow(QMainWindow):
         stats['sum'] += voltage
         stats['min'] = voltage if stats['min'] is None else min(stats['min'], voltage)
         stats['max'] = voltage if stats['max'] is None else max(stats['max'], voltage)
-        self._update_statistics_label(channel)
-
         # Write to CSV if logging
         if self.logging_enabled and self.csv_writer:
             timestamp = datetime.datetime.now().isoformat()
@@ -2071,6 +2077,20 @@ class ReducerMonitorWindow(QMainWindow):
                         self._update_plot_range(plot_index)
             for channel in dirty_channels:
                 self.plot_dirty[channel] = False
+                self._update_data_table_row(channel)
+                self._update_statistics_label(channel)
+
+    def _update_data_table_row(self, channel: int):
+        if channel >= self.data_table.rowCount():
+            return
+
+        data = self.pending_table_data[channel]
+        if data is None:
+            return
+        self.data_table.item(channel, 1).setText(f"{data['voltage']:.3f}")
+        self.data_table.item(channel, 2).setText(f"{data['strain']:.2f}")
+        self.data_table.item(channel, 3).setText(f"{data['stress']:.4f}")
+        self.data_table.item(channel, 4).setText(str(data['samples']))
 
     def _update_plot_range(self, plot_index: int):
         channel = self.plot_channels[plot_index]
