@@ -342,6 +342,26 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(len(self.window.plot_panels), DEFAULT_VISIBLE_PLOTS)
         self.assertEqual(self.window.plot_channels, [0, 1, 2, 3])
 
+    def test_light_theme_explicitly_sets_readable_text_colors(self):
+        stylesheet = self.window.styleSheet()
+
+        self.assertIn("QLabel, QCheckBox { color: #24415f; }", stylesheet)
+        self.assertIn("background: white; color: #24415f;", stylesheet)
+        self.assertIn("QTabBar::tab:selected { background: white; color: #17324d; }",
+                      stylesheet)
+
+    def test_empty_waveform_plots_have_consistent_initial_ranges(self):
+        for plot in self.window.plot_widgets:
+            x_range, y_range = plot.viewRange()
+            self.assertAlmostEqual(x_range[0], 0.0)
+            self.assertAlmostEqual(x_range[1], 100.0)
+            self.assertAlmostEqual(y_range[0], -1.0)
+            self.assertAlmostEqual(y_range[1], 1.0)
+
+    def test_stream_summary_has_its_own_command_row(self):
+        self.assertEqual(self.window.cmd_group.layout().count(), 2)
+        self.assertIn("decimation x1", self.window.stream_summary_label.text())
+
     def test_waveform_plot_defaults_to_voltage_curve(self):
         checkboxes = self.window.plot_metric_checkboxes[0]
 

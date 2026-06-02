@@ -415,6 +415,8 @@ class OfflineWaveformWindow(QMainWindow):
             plot = pg.PlotWidget()
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.disableAutoRange()
+            plot.setXRange(0, 100, padding=0.0)
+            plot.setYRange(-1.0, 1.0, padding=0.0)
             plot.scene().sigMouseClicked.connect(
                 lambda event, selected_channel=channel:
                     self._on_plot_mouse_clicked(selected_channel, event)
@@ -624,11 +626,30 @@ class ReducerMonitorWindow(QMainWindow):
             QPushButton:disabled { background: #b8c6d4; }
             QPushButton:hover:!disabled { background: #1f68ae; }
             QComboBox, QSpinBox {
-                background: white; border: 1px solid #b8c6d4;
+                background: white; color: #24415f; border: 1px solid #b8c6d4;
                 border-radius: 4px; padding: 4px 7px;
             }
+            QComboBox QAbstractItemView {
+                background: white; color: #24415f;
+                selection-background-color: #dcecff;
+                selection-color: #17324d;
+            }
+            QLineEdit { background: white; color: #24415f; }
+            QLabel, QCheckBox { color: #24415f; }
             QTabWidget::pane { border: 1px solid #d7e0ea; background: white; }
-            QTabBar::tab { padding: 7px 16px; }
+            QTabBar::tab {
+                background: #eaf1f8; color: #24415f;
+                border: 1px solid #d7e0ea; padding: 7px 16px;
+            }
+            QTabBar::tab:selected { background: white; color: #17324d; }
+            QTableWidget {
+                background: white; color: #24415f;
+                gridline-color: #d7e0ea;
+            }
+            QHeaderView::section {
+                background: #eaf1f8; color: #24415f;
+                border: 1px solid #d7e0ea; padding: 4px;
+            }
             QStatusBar { background: #eaf1f8; color: #24415f; }
         """)
 
@@ -1093,6 +1114,8 @@ class ReducerMonitorWindow(QMainWindow):
         plot = pg.PlotWidget()
         plot.showGrid(x=True, y=True, alpha=0.3)
         plot.disableAutoRange()
+        plot.setXRange(0, 100, padding=0.0)
+        plot.setYRange(-1.0, 1.0, padding=0.0)
         plot.scene().sigMouseClicked.connect(
             lambda event, selected_panel=panel:
                 self._on_plot_mouse_clicked(selected_panel, event)
@@ -1524,37 +1547,38 @@ class ReducerMonitorWindow(QMainWindow):
     def _create_command_group(self) -> QGroupBox:
         """Create the command control group"""
         group = QGroupBox()
-        layout = QHBoxLayout()
+        layout = QVBoxLayout()
+        controls = QHBoxLayout()
 
         self.zero_btn = QPushButton()
         self.zero_btn.clicked.connect(self.on_zero_clicked)
         self.zero_btn.setEnabled(False)
-        layout.addWidget(self.zero_btn)
+        controls.addWidget(self.zero_btn)
 
         self.calib_btn = QPushButton()
         self.calib_btn.clicked.connect(self.on_calib_clicked)
         self.calib_btn.setEnabled(False)
-        layout.addWidget(self.calib_btn)
+        controls.addWidget(self.calib_btn)
 
         # Zero offset Flash storage controls
         self.save_zero_btn = QPushButton()
         self.save_zero_btn.clicked.connect(self.on_save_zero_clicked)
         self.save_zero_btn.setEnabled(False)
-        layout.addWidget(self.save_zero_btn)
+        controls.addWidget(self.save_zero_btn)
 
         self.load_zero_btn = QPushButton()
         self.load_zero_btn.clicked.connect(self.on_load_zero_clicked)
         self.load_zero_btn.setEnabled(False)
-        layout.addWidget(self.load_zero_btn)
+        controls.addWidget(self.load_zero_btn)
 
         self.clear_zero_btn = QPushButton()
         self.clear_zero_btn.clicked.connect(self.on_clear_zero_clicked)
         self.clear_zero_btn.setEnabled(False)
-        layout.addWidget(self.clear_zero_btn)
+        controls.addWidget(self.clear_zero_btn)
 
         # Filter size control
         self.sample_rate_label = QLabel()
-        layout.addWidget(self.sample_rate_label)
+        controls.addWidget(self.sample_rate_label)
         self.sample_rate_combo = QComboBox()
         for sample_rate in SUPPORTED_SAMPLE_RATES:
             self.sample_rate_combo.addItem(
@@ -1563,24 +1587,25 @@ class ReducerMonitorWindow(QMainWindow):
         self.sample_rate_combo.setCurrentText("100 SPS")
         self.sample_rate_combo.setEnabled(False)
         self.sample_rate_combo.currentIndexChanged.connect(self.on_sample_rate_changed)
-        layout.addWidget(self.sample_rate_combo)
+        controls.addWidget(self.sample_rate_combo)
 
         # Filter size control
         self.filter_size_label = QLabel()
-        layout.addWidget(self.filter_size_label)
+        controls.addWidget(self.filter_size_label)
         self.filter_size_spin = QSpinBox()
         self.filter_size_spin.setMinimum(2)
         self.filter_size_spin.setMaximum(64)
         self.filter_size_spin.setValue(16)
         self.filter_size_spin.setEnabled(False)
         self.filter_size_spin.valueChanged.connect(self.on_filter_size_changed)
-        layout.addWidget(self.filter_size_spin)
+        controls.addWidget(self.filter_size_spin)
+
+        controls.addStretch()
+        layout.addLayout(controls)
 
         self.stream_summary_label = QLabel()
         self.stream_summary_label.setStyleSheet("color: #315b7d; font-weight: 600;")
         layout.addWidget(self.stream_summary_label)
-
-        layout.addStretch()
 
         group.setLayout(layout)
         return group
