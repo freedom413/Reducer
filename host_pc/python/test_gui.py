@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QEvent, QPointF
 
 from can_protocol import (
     CANFrame,
@@ -395,20 +396,14 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(len(self.window.plot_panels), DEFAULT_VISIBLE_PLOTS)
         self.assertEqual(self.window.plot_channels, [0, 1, 2, 3])
 
-    def test_dark_theme_is_default_and_can_switch_to_light(self):
+    def test_dark_theme_is_fixed(self):
         stylesheet = self.window.styleSheet()
 
         self.assertEqual(self.window.theme, "dark")
-        self.assertEqual(self.window.theme_combo.currentData(), "dark")
+        self.assertFalse(hasattr(self.window, "theme_combo"))
         self.assertIn("background: #101826", stylesheet)
+        self.assertNotIn("background: #f4f7fb", stylesheet)
         self.assertFalse(self.window.windowIcon().isNull())
-
-        self.window.theme_combo.setCurrentIndex(
-            self.window.theme_combo.findData("light")
-        )
-
-        self.assertEqual(self.window.theme, "light")
-        self.assertIn("background: #f4f7fb", self.window.styleSheet())
 
     def test_empty_waveform_plots_have_consistent_initial_ranges(self):
         for plot in self.window.plot_widgets:
@@ -445,6 +440,38 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(list(curves["strain"].getData()[1]), [34.0])
         self.assertEqual(list(curves["stress"].getData()[1]), [56.0])
         self.assertTrue(all(curve.isVisible() for curve in curves.values()))
+
+    def test_waveform_curve_color_can_be_customized(self):
+        self.window._set_plot_metric_color(0, "voltage", "#abcdef")
+
+        curve = self.window.plot_metric_curves[0]["voltage"]
+        button = self.window.plot_metric_color_buttons[0]["voltage"]
+        self.assertEqual(self.window.plot_metric_colors[0]["voltage"], "#abcdef")
+        self.assertEqual(curve.opts["pen"].color().name(), "#abcdef")
+        self.assertIn("#abcdef", button.styleSheet())
+
+    def test_waveform_hover_shows_nearest_curve_coordinates(self):
+        self.window.on_data_updated(0, {
+            "voltage": 12.5,
+            "strain": 34.0,
+            "stress": 56.0,
+            "samples": 1,
+        })
+        self.window.update_plots()
+        self.window.show()
+        self.app.processEvents()
+
+        plot = self.window.plot_widgets[0]
+        scene_pos = plot.getPlotItem().vb.mapViewToScene(QPointF(0.0, 12.5))
+        self.window._on_plot_mouse_moved(plot, scene_pos)
+
+        hover_items = self.window.plot_hover_items[0]
+        self.assertTrue(hover_items["label"].isVisible())
+        self.assertIn("Sample: 0", hover_items["label"].toPlainText())
+        self.assertIn("12.500 mV", hover_items["label"].toPlainText())
+
+        self.window.eventFilter(plot, QEvent(QEvent.Type.Leave))
+        self.assertFalse(hover_items["label"].isVisible())
 
     def test_waveform_plot_keeps_at_least_one_metric_selected(self):
         checkbox = self.window.plot_metric_checkboxes[0]["voltage"]
@@ -908,11 +935,6 @@ class TestCsvLogging(unittest.TestCase):
         self.assertEqual(offline_window.waveform_buffers[0], [1.25, 7.75])
         self.assertEqual(offline_window.waveform_buffers[1], [-4.5])
         self.assertTrue(all(len(buffer) == 0 for buffer in self.window.waveform_buffers))
-
-        self.window.theme_combo.setCurrentIndex(
-            self.window.theme_combo.findData("light")
-        )
-        self.assertEqual(offline_window.theme, "light")
 
         self.window.language_combo.setCurrentIndex(
             self.window.language_combo.findData("zh")
