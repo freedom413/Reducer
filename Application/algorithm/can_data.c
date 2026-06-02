@@ -48,3 +48,26 @@ void can_build_status_frame(can_tx_status_frame_t *frame, uint8_t sequence,
     frame->detail = detail;
     frame->crc8 = can_calc_crc8((const uint8_t *)frame, 7);
 }
+
+void can_build_health_frame(can_tx_health_frame_t *frame, uint32_t sample_rate_x10,
+                            uint16_t telemetry_decimation, uint16_t tx_drop_count,
+                            uint16_t adc_overflow_count, uint16_t adc_recovery_count,
+                            uint8_t active_adc_count, uint8_t flags)
+{
+    frame->frame_type = CAN_FRAME_TYPE_HEALTH;
+    frame->version = CAN_HEALTH_VERSION;
+    frame->sample_rate_x10_le[0] = (uint8_t)(sample_rate_x10 & 0xFFU);
+    frame->sample_rate_x10_le[1] = (uint8_t)((sample_rate_x10 >> 8) & 0xFFU);
+    frame->sample_rate_x10_le[2] = (uint8_t)((sample_rate_x10 >> 16) & 0xFFU);
+    frame->sample_rate_x10_le[3] = (uint8_t)((sample_rate_x10 >> 24) & 0xFFU);
+    frame->telemetry_decimation_le[0] = (uint8_t)(telemetry_decimation & 0xFFU);
+    frame->telemetry_decimation_le[1] = (uint8_t)((telemetry_decimation >> 8) & 0xFFU);
+    frame->tx_drop_count_le[0] = (uint8_t)(tx_drop_count & 0xFFU);
+    frame->tx_drop_count_le[1] = (uint8_t)((tx_drop_count >> 8) & 0xFFU);
+    frame->adc_overflow_count_le[0] = (uint8_t)(adc_overflow_count & 0xFFU);
+    frame->adc_overflow_count_le[1] = (uint8_t)((adc_overflow_count >> 8) & 0xFFU);
+    frame->adc_recovery_count_le[0] = (uint8_t)(adc_recovery_count & 0xFFU);
+    frame->adc_recovery_count_le[1] = (uint8_t)((adc_recovery_count >> 8) & 0xFFU);
+    frame->flags = (uint8_t)(flags | ((active_adc_count & 0x0FU) << 4));
+    frame->crc8 = can_calc_crc8((const uint8_t *)frame, 15);
+}

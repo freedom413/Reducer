@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdbool.h>
+#include <string.h>
 #include "delay.h"
 #include "can.h"
 #include "fdcan.h"
@@ -21,12 +22,18 @@
 #define CAN_INTERVAL_TEST_PERIOD_MS  100U
 #endif
 #define CAN_TX_WAIT_TIMEOUT_MS       5U
+#define CAN_TELEMETRY_MAX_FRAMES_PER_SECOND  3000U
+#define CAN_HEALTH_PERIOD_MS         1000U
 
 // ============================================================================
 // Module State
 // ============================================================================
 static ads1256_data_t adc_ads1256_data[ADC_CHANNEL_COUNT] = {0};
 static bool can_ready = false;
+static uint16_t can_telemetry_decimation = 1U;
+static uint16_t can_telemetry_sample_count[ADC_CHANNEL_COUNT] = {0};
+static uint16_t can_tx_drop_count = 0U;
+static uint32_t can_health_last_tx_tick = 0U;
 #if CAN_INTERVAL_TEST_ENABLED
 static uint32_t can_test_last_tx_tick = 0;
 static uint8_t can_test_sequence = 0;
@@ -42,6 +49,8 @@ static float running_mean[ADC_CHANNEL_COUNT] = {0};
 static float running_m2[ADC_CHANNEL_COUNT] = {0};
 static uint16_t sample_count[ADC_CHANNEL_COUNT] = {0};
 
+static void update_can_telemetry_decimation(void);
+
 #if CAN_INTERVAL_TEST_ENABLED
 static void send_can_interval_test(void)
 {
@@ -52,12 +61,12 @@ static void send_can_interval_test(void)
     }
     can_test_last_tx_tick = now;
 
-    const uint8_t frame[CAN_DATA_LEN] = {
+    const uint8_t frame[8] = {
         0xAAU, 0x55U, can_test_sequence, (uint8_t)~can_test_sequence,
         0x00U, 0xFFU, 0x5AU, 0xA5U,
     };
 
-    if (can_classic_data_frame_send(CAN_INTERVAL_TEST_ID, frame, sizeof(frame)) ==
+    if (can_fd_data_frame_send(CAN_INTERVAL_TEST_ID, frame, sizeof(frame)) ==
         (int)sizeof(frame)) {
         can_test_sequence++;
     }
@@ -75,6 +84,7 @@ void setup(void)
 #endif
 
     adc_ads1256_start();
+    update_can_telemetry_decimation();
 
     // Register flash hardware operations (user provides implementation)
     flash_storage_register_user_ops();
@@ -115,6 +125,42 @@ static void reset_statistics(void)
     }
 }
 
+static uint8_t active_ads1256_count(void)
+{
+    uint16_t channel_mask = adc_ads1256_get_channel_mask();
+    uint8_t active_count = 0;
+
+    for (uint8_t base = 0; base < ADC_CHANNEL_COUNT;
+         base = (uint8_t)(base + ADS1256_CHANNELS_PER_DEVICE)) {
+        uint16_t device_mask =
+            (uint16_t)(((1U << ADS1256_CHANNELS_PER_DEVICE) - 1U) << base);
+        if ((channel_mask & device_mask) != 0U) {
+            active_count++;
+        }
+    }
+
+    return active_count;
+}
+
+static void update_can_telemetry_decimation(void)
+{
+    uint32_t source_rate_x10 =
+        adc_ads1256_get_cycling_rate_x10() * active_ads1256_count();
+    uint32_t telemetry_limit_x10 =
+        CAN_TELEMETRY_MAX_FRAMES_PER_SECOND * 10U;
+    uint32_t decimation =
+        (source_rate_x10 + telemetry_limit_x10 - 1U) / telemetry_limit_x10;
+
+    if (decimation == 0U) {
+        decimation = 1U;
+    }
+    if (decimation > UINT16_MAX) {
+        decimation = UINT16_MAX;
+    }
+    can_telemetry_decimation = (uint16_t)decimation;
+    memset(can_telemetry_sample_count, 0, sizeof(can_telemetry_sample_count));
+}
+
 static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
                             uint16_t value, uint8_t detail)
 {
@@ -125,8 +171,8 @@ static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
     can_tx_status_frame_t frame;
     can_build_status_frame(&frame, sequence, cmd_type, status, value, detail);
     uint32_t start = HAL_GetTick();
-    while (can_classic_data_frame_send(CAN_ID_TX_STATUS, (const uint8_t *)&frame,
-                                       sizeof(frame)) == -3) {
+    while (can_fd_data_frame_send(CAN_ID_TX_STATUS, (const uint8_t *)&frame,
+                                  sizeof(frame)) == -3) {
         if ((uint32_t)(HAL_GetTick() - start) >= CAN_TX_WAIT_TIMEOUT_MS) {
             break;
         }
@@ -147,8 +193,41 @@ static void send_can_telemetry(uint8_t channel, int16_t voltage_001mv,
      * delays ADC polling and makes overload worse. Status ACKs still use a
      * short bounded wait because they are command responses.
      */
-    (void)can_classic_data_frame_send(CAN_ID_TX_TELEMETRY,
-                                      (const uint8_t *)&frame, sizeof(frame));
+    if (can_fd_data_frame_send(CAN_ID_TX_TELEMETRY,
+                               (const uint8_t *)&frame, sizeof(frame)) !=
+        (int)sizeof(frame)) {
+        if (can_tx_drop_count < UINT16_MAX) {
+            can_tx_drop_count++;
+        }
+    }
+}
+
+static void send_can_health(void)
+{
+    uint32_t now = HAL_GetTick();
+    if (!can_ready ||
+        (uint32_t)(now - can_health_last_tx_tick) < CAN_HEALTH_PERIOD_MS) {
+        return;
+    }
+    can_health_last_tx_tick = now;
+
+    uint8_t flags = adc_ads1256_is_running() != 0U ? 0x01U : 0x00U;
+    can_tx_health_frame_t frame;
+    can_build_health_frame(&frame,
+                           adc_ads1256_get_sample_rate_x10(),
+                           can_telemetry_decimation,
+                           can_tx_drop_count,
+                           adc_ads1256_get_overflow_count(),
+                           adc_ads1256_get_recovery_count(),
+                           active_ads1256_count(),
+                           flags);
+    if (can_fd_data_frame_send(CAN_ID_TX_HEALTH,
+                               (const uint8_t *)&frame, sizeof(frame)) !=
+        (int)sizeof(frame)) {
+        if (can_tx_drop_count < UINT16_MAX) {
+            can_tx_drop_count++;
+        }
+    }
 }
 
 static int16_t clamp_i16_from_float(float value)
@@ -196,7 +275,11 @@ static void process_adc_sample(uint8_t channel, int32_t raw_value)
     int16_t strain_ue = clamp_i16_from_float(result.strain);
     // stress preview in 0.1 MPa units, clipped to fit the compact 1-byte field
     int8_t stress_01mpa = clamp_i8_from_float(result.stress * 10.0f);
-    send_can_telemetry(channel, voltage_001mv, strain_ue, stress_01mpa);
+    can_telemetry_sample_count[channel]++;
+    if (can_telemetry_sample_count[channel] >= can_telemetry_decimation) {
+        can_telemetry_sample_count[channel] = 0;
+        send_can_telemetry(channel, voltage_001mv, strain_ue, stress_01mpa);
+    }
 }
 
 static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t value,
@@ -272,6 +355,7 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
                     reset_channel_statistics(i);
                 }
             }
+            update_can_telemetry_decimation();
             return CAN_STATUS_OK;
         }
 
@@ -288,19 +372,35 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
             }
             return CAN_STATUS_OK;
 
-        case CAN_CMD_SET_SAMPLE_RATE:
-            if (adc_ads1256_set_sample_rate(value) != 0) {
+        case CAN_CMD_SET_SAMPLE_RATE: {
+            uint32_t requested_sps_x10;
+            if (param == CAN_SAMPLE_RATE_PARAM_SPS) {
+                requested_sps_x10 = (uint32_t)value * 10U;
+            } else if (param == CAN_SAMPLE_RATE_PARAM_DECI_SPS) {
+                requested_sps_x10 = value;
+            } else {
+                if (detail != NULL) {
+                    *detail = param;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
+            if (adc_ads1256_set_sample_rate_x10(requested_sps_x10) != 0) {
                 if (detail != NULL) {
                     *detail = 1;
                 }
                 return CAN_STATUS_BAD_VALUE;
             }
             if (applied_value != NULL) {
-                *applied_value = adc_ads1256_get_sample_rate();
+                *applied_value = (uint16_t)(
+                    param == CAN_SAMPLE_RATE_PARAM_DECI_SPS ?
+                    adc_ads1256_get_sample_rate_x10() :
+                    adc_ads1256_get_sample_rate());
             }
             filter_reset_all();
             reset_statistics();
+            update_can_telemetry_decimation();
             return CAN_STATUS_OK;
+        }
 
         case CAN_CMD_START_CALIB:
             if (adc_ads1256_calibrate() != 0 || adc_ads1256_restart() != 0) {
@@ -369,6 +469,8 @@ static void process_can_commands(void)
 
         int dlc_bytes = can_data_len_get(msg.RxHeader.DataLength);
         if (msg.RxHeader.Identifier != CAN_ID_RX_COMMAND ||
+            msg.RxHeader.FDFormat != FDCAN_FD_CAN ||
+            msg.RxHeader.BitRateSwitch != FDCAN_BRS_ON ||
             dlc_bytes != (int)sizeof(can_rx_command_frame_t)) {
             continue;
         }
@@ -408,6 +510,7 @@ void loop(void)
 #endif
 
     process_can_commands();
+    send_can_health();
 
     adc_ads1256_poll();
 
@@ -419,7 +522,7 @@ void loop(void)
             /*
              * Process channels as conversions arrive. The two ADS1256 devices
              * normally produce at most two samples per poll, which avoids a
-             * six-frame burst overflowing the three-slot FDCAN TX FIFO.
+             * multi-frame burst overflowing the three-slot FDCAN TX FIFO.
              */
             process_adc_sample(ch, adc_ads1256_data[i].raw_value);
         }
