@@ -19,13 +19,18 @@ from can_protocol import (
     CANFrame,
     CAN_FRAME_TYPE_STATUS,
     CAN_FRAME_TYPE_TELEMETRY,
+    CAN_FRAME_TYPE_HEALTH,
+    CAN_HEALTH_VERSION,
     CAN_ID_RX_COMMAND,
+    CAN_ID_TX_HEALTH,
     CAN_ID_TX_STATUS,
     CAN_ID_TX_TELEMETRY,
     CAN_STATUS_BAD_VALUE,
     CAN_STATUS_OK,
     CAN_STATUS_STORAGE_ERROR,
+    CAN_FD_DATA_BITRATE,
     DEFAULT_CAN_SEND_TIMEOUT_S,
+    DEFAULT_SLCAN_TTY_BAUDRATE,
     Baudrate,
     PythonCANInterface,
     _PythonCanListener,
@@ -35,6 +40,7 @@ from can_protocol import (
     list_can_channels,
     parse_status_frame,
     parse_telemetry_frame,
+    parse_health_frame,
 )
 from reducer_monitor import (
     CAN_CMD_CLEAR_ZERO,
@@ -49,6 +55,7 @@ from reducer_monitor import (
     FIXED_CAN_BITRATE,
     MAX_VISIBLE_PLOTS,
     NUM_CHANNELS,
+    SUPPORTED_SAMPLE_RATES,
     ChannelData,
     OfflineWaveformWindow,
     ReducerMonitorWindow,
@@ -78,6 +85,28 @@ def build_status_payload(sequence: int, cmd_type: int, status: int, value: int, 
         (value >> 8) & 0xFF,
         detail & 0xFF,
     ])
+    return payload + bytes([crc8_xor(payload)])
+
+
+def build_health_payload(
+    sample_rate_x10: int = 300000,
+    decimation: int = 3,
+    tx_drop: int = 4,
+    overflow: int = 5,
+    recovery: int = 6,
+    active_adc_count: int = 2,
+    running: bool = True,
+) -> bytes:
+    flags = ((active_adc_count & 0x0F) << 4) | (1 if running else 0)
+    payload = (
+        bytes([CAN_FRAME_TYPE_HEALTH, CAN_HEALTH_VERSION])
+        + sample_rate_x10.to_bytes(4, "little")
+        + decimation.to_bytes(2, "little")
+        + tx_drop.to_bytes(2, "little")
+        + overflow.to_bytes(2, "little")
+        + recovery.to_bytes(2, "little")
+        + bytes([flags])
+    )
     return payload + bytes([crc8_xor(payload)])
 
 
@@ -121,6 +150,20 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(parsed.status, CAN_STATUS_OK)
         self.assertEqual(parsed.value, 16)
         self.assertEqual(parsed.detail, 0x55)
+
+    def test_parse_health_frame(self):
+        parsed = parse_health_frame(
+            CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_payload())
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.sample_rate_sps, 30000)
+        self.assertEqual(parsed.telemetry_decimation, 3)
+        self.assertEqual(parsed.tx_drop_count, 4)
+        self.assertEqual(parsed.adc_overflow_count, 5)
+        self.assertEqual(parsed.adc_recovery_count, 6)
+        self.assertEqual(parsed.active_adc_count, 2)
+        self.assertTrue(parsed.adc_running)
 
     def test_parse_rejects_bad_crc(self):
         payload = bytearray(build_telemetry_payload(channel=0, voltage_001mv=100, strain_ue=50, stress_01mpa=5))
@@ -168,7 +211,7 @@ class TestProtocolHelpers(unittest.TestCase):
 
         self.assertEqual(channels, [("COM9", "USB-CAN Adapter (VID:PID=1D50:606F)")])
 
-    def test_python_can_interface_connect_slcan_passes_serial_settings(self):
+    def test_python_can_interface_connect_slcan_passes_canable2_fd_settings(self):
         bus_instance = MagicMock()
         notifier_instance = MagicMock()
 
@@ -186,14 +229,50 @@ class TestProtocolHelpers(unittest.TestCase):
             )
 
         self.assertTrue(connected)
-        mock_bus.assert_called_once_with(
-            interface="slcan",
-            channel="COM7",
-            bitrate=500000,
-            tty_baudrate=460800,
-            sleep_after_open=0.25,
-        )
+        kwargs = mock_bus.call_args.kwargs
+        self.assertEqual(kwargs["interface"], "slcan")
+        self.assertEqual(kwargs["channel"], "COM7")
+        self.assertEqual(kwargs["timing"].nom_bitrate, 500000)
+        self.assertEqual(kwargs["timing"].data_bitrate, CAN_FD_DATA_BITRATE)
+        self.assertEqual(kwargs["tty_baudrate"], 460800)
+        self.assertEqual(kwargs["sleep_after_open"], 0.25)
         self.assertEqual(interface.tty_baudrate, 460800)
+
+    def test_upstream_slcan_bus_writes_canable2_fd_commands_and_brs_frame(self):
+        import can as python_can
+        from can.interfaces.slcan import slcanBus
+
+        serial_port = MagicMock()
+        serial_port.write_timeout = None
+        timing = PythonCANInterface._can_fd_timing(Baudrate.BAUD_500K)
+
+        with patch(
+            "can.interfaces.slcan.serial.serial_for_url",
+            return_value=serial_port,
+        ):
+            bus = slcanBus(
+                channel="COM7",
+                timing=timing,
+                tty_baudrate=DEFAULT_SLCAN_TTY_BAUDRATE,
+                sleep_after_open=0,
+            )
+            bus.send(
+                python_can.Message(
+                    arbitration_id=0x100,
+                    data=bytes([0xA0, 1, 2, 3, 4, 5, 6, 7]),
+                    is_extended_id=False,
+                    is_fd=True,
+                    bitrate_switch=True,
+                )
+            )
+            bus.shutdown()
+
+        serial_writes = [call.args[0] for call in serial_port.write.call_args_list]
+        self.assertEqual(serial_writes[:4], [b"C\r", b"S6\r", b"Y2\r", b"O\r"])
+        self.assertIn(b"b1008A001020304050607\r", serial_writes)
+
+    def test_default_slcan_tty_baudrate_matches_canable2_cdc_compatibility_value(self):
+        self.assertEqual(DEFAULT_SLCAN_TTY_BAUDRATE, 115200)
 
     def test_python_can_listener_is_callable_by_notifier(self):
         received = []
@@ -203,6 +282,8 @@ class TestProtocolHelpers(unittest.TestCase):
         msg.data = bytes([1, 2, 3])
         msg.is_extended_id = False
         msg.is_remote_frame = False
+        msg.is_fd = True
+        msg.bitrate_switch = True
         msg.timestamp = 1.25
 
         listener(msg)
@@ -210,6 +291,8 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0].id, 0x123)
         self.assertEqual(received[0].data, bytes([1, 2, 3]))
+        self.assertTrue(received[0].is_fd)
+        self.assertTrue(received[0].bitrate_switch)
 
     def test_python_can_send_uses_bounded_timeout(self):
         bus_instance = MagicMock()
@@ -498,33 +581,51 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(sent_frame.data[5], 0)
 
     def test_sample_rate_command(self):
-        self.window.serial_baud_combo.setCurrentText("460800")
         self.window.sample_rate_combo.setCurrentText("500 SPS")
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
         self.assertEqual(sent_frame.data[2], CAN_CMD_SET_SAMPLE_RATE)
         self.assertEqual(sent_frame.data[4], 0xF4)
         self.assertEqual(sent_frame.data[5], 0x01)
 
-    def test_high_sample_rate_requires_faster_slcan_adapter(self):
-        self.window.serial_baud_combo.setCurrentText("115200")
+    def test_all_ads1256_sample_rates_are_available(self):
+        self.assertEqual(
+            SUPPORTED_SAMPLE_RATES,
+            [2.5, 5, 10, 15, 25, 30, 50, 60, 100, 500, 1000, 2000,
+             3750, 7500, 15000, 30000],
+        )
 
-        self.window.sample_rate_combo.setCurrentText("500 SPS")
+    def test_fractional_sample_rate_uses_deci_sps_command_encoding(self):
+        self.window.sample_rate_combo.setCurrentText("2.5 SPS")
 
-        self.window.can_bus.send_frame.assert_not_called()
-        self.assertEqual(self.window.sample_rate_combo.currentData(), 100)
-        self.assertIn("230400", self.window.status_bar.currentMessage())
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_SAMPLE_RATE)
+        self.assertEqual(sent_frame.data[3], 1)
+        self.assertEqual(sent_frame.data[4], 25)
+        self.assertEqual(sent_frame.data[5], 0)
 
-    def test_slcan_bandwidth_estimate_counts_active_adc_devices(self):
-        self.assertEqual(self.window._minimum_slcan_tty_baudrate(1000), 460800)
+    def test_high_ads_rate_uses_bounded_telemetry_decimation(self):
+        self.assertEqual(self.window._telemetry_decimation(30000), 2)
 
         self.window._add_waveform_plot()
-        self.assertEqual(self.window._minimum_slcan_tty_baudrate(1000), 921600)
 
-        for panel in list(self.window.plot_panels[1:]):
-            self.window._remove_waveform_plot(panel)
+        self.assertEqual(self.window._telemetry_decimation(30000), 3)
 
-        self.assertEqual(self.window.plot_channels, [0])
-        self.assertEqual(self.window._minimum_slcan_tty_baudrate(1000), 460800)
+    def test_health_frame_updates_system_health_panel(self):
+        self.window.on_can_frame_received(
+            CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_payload())
+        )
+
+        self.assertEqual(self.window.sample_rate_sps, 30000)
+        self.assertIn("TX drops 4", self.window.health_summary_label.text())
+        self.assertIn("ADC overflows 5", self.window.health_summary_label.text())
+
+    def test_high_sample_rate_is_available_over_canable2_usb_cdc(self):
+        self.window.sample_rate_combo.setCurrentText("30000 SPS")
+
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_SAMPLE_RATE)
+        self.assertEqual(sent_frame.data[4], 0x30)
+        self.assertEqual(sent_frame.data[5], 0x75)
 
     def test_connection_options_can_be_locked(self):
         self.window.is_connected = False
@@ -532,16 +633,16 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertFalse(self.window.interface_combo.isEnabled())
         self.assertFalse(self.window.channel_combo.isEnabled())
-        self.assertFalse(self.window.serial_baud_combo.isEnabled())
+        self.assertFalse(hasattr(self.window, "serial_baud_combo"))
         self.assertFalse(hasattr(self.window, "baud_combo"))
-        self.assertEqual(self.window.can_baud_value.text(), "500K")
+        self.assertEqual(self.window.can_baud_value.text(), "500K / 2M FD+BRS")
         self.assertFalse(self.window.refresh_btn.isEnabled())
         self.assertTrue(self.window.language_combo.isEnabled())
 
     def test_can_bitrate_is_fixed_to_match_mcu_firmware(self):
         self.assertEqual(FIXED_CAN_BITRATE, Baudrate.BAUD_500K)
         self.assertFalse(hasattr(self.window, "baud_combo"))
-        self.assertEqual(self.window.can_baud_value.text(), "500K")
+        self.assertEqual(self.window.can_baud_value.text(), "500K / 2M FD+BRS")
 
     def test_command_fails_when_disconnected(self):
         self.window.is_connected = False

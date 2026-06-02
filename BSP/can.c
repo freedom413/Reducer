@@ -17,6 +17,13 @@ static uint32_t can_dlc_from_len(uint32_t len)
         case 6: return FDCAN_DLC_BYTES_6;
         case 7: return FDCAN_DLC_BYTES_7;
         case 8: return FDCAN_DLC_BYTES_8;
+        case 12: return FDCAN_DLC_BYTES_12;
+        case 16: return FDCAN_DLC_BYTES_16;
+        case 20: return FDCAN_DLC_BYTES_20;
+        case 24: return FDCAN_DLC_BYTES_24;
+        case 32: return FDCAN_DLC_BYTES_32;
+        case 48: return FDCAN_DLC_BYTES_48;
+        case 64: return FDCAN_DLC_BYTES_64;
         default: return UINT32_MAX;
     }
 }
@@ -59,7 +66,7 @@ int can_data_len_get(uint32_t frame_len)
     }
 }
 
-int can_classic_data_frame_send(uint32_t id, const uint8_t *data, uint32_t len)
+int can_fd_data_frame_send(uint32_t id, const uint8_t *data, uint32_t len)
 {
     FDCAN_TxHeaderTypeDef tx_header = {0};
     uint32_t dlc = can_dlc_from_len(len);
@@ -76,8 +83,8 @@ int can_classic_data_frame_send(uint32_t id, const uint8_t *data, uint32_t len)
     tx_header.TxFrameType = FDCAN_DATA_FRAME;
     tx_header.DataLength = dlc;
     tx_header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    tx_header.BitRateSwitch = FDCAN_BRS_OFF;
-    tx_header.FDFormat = FDCAN_CLASSIC_CAN;
+    tx_header.BitRateSwitch = FDCAN_BRS_ON;
+    tx_header.FDFormat = FDCAN_FD_CAN;
     tx_header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     tx_header.MessageMarker = 0;
 
