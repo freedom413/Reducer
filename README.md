@@ -97,6 +97,7 @@ host_pc/python/
 | `SAVE_ZERO` | `0x05` | 保存当前零点 |
 | `LOAD_ZERO` | `0x06` | 读取 Flash 零点 |
 | `CLEAR_ZERO` | `0x07` | 清除内存和 Flash 零点 |
+| `SET_CHANNEL_MASK` | `0x08` | 设置 ADS1256 扫描通道掩码，未订阅通道不采集 |
 
 ### 状态码
 
@@ -148,10 +149,10 @@ python -m venv .venv
 ### GUI 功能
 
 - 自动枚举 SLCAN 串口和 SocketCAN 接口。
-- 支持选择 CAN 波特率，默认 `500K`。
+- CAN 波特率固定为 `500K`，与 MCU 固件保持一致。
 - 支持选择 SLCAN 串口波特率，默认 `115200`。
 - SLCAN 带宽不足时会拒绝过高采样率，避免串口侧静默丢帧。
-- 实时显示 6 通道电压曲线。
+- 默认显示 4 张图表，可新增到 8 张；每张图可叠加选择电压、应变和应力曲线。图表绑定的通道会自动同步到 MCU，未展示通道不采集。
 - 表格显示每通道电压、应变、应力和样本数。
 - 统计每通道电压最小值、最大值和平均值。
 - 支持 CSV 记录。
@@ -166,12 +167,12 @@ python -m venv .venv
 | Interface | `slcan` |
 | Channel | Windows: `COMx`; Linux: `/dev/ttyUSBx` |
 | Adapter Baud | 适配器串口波特率；`100 SPS` 可使用 `115200`，`500 SPS` 至少使用 `460800`，`1000 SPS` 至少使用 `921600` |
-| CAN Baudrate | `500K` |
+| CAN Baudrate | 固定 `500K` |
 
 ## 硬件联调顺序
 
 1. 烧录固件，确认 CANH/CANL、终端电阻和共地正常。
-2. 打开上位机，选择 `slcan` 和正确串口，CAN 波特率选择 `500K`。
+2. 打开上位机，选择 `slcan` 和正确串口。CAN 波特率固定为 `500K`。
 3. 连接后观察是否持续收到 `0x101` 遥测帧，6 通道是否轮流更新。
 4. 点击 `Calibrate`，确认收到 `0x102` ACK。
 5. 修改 `Filter Size` 或 `Sample Rate`，确认上位机状态栏显示 ACK，MCU 端采样行为正常。

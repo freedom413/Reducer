@@ -6,7 +6,7 @@
 
 // Default filter window size
 #define FILTER_WINDOW_SIZE_DEFAULT  16
-#define FILTER_CHANNEL_COUNT 6
+#define FILTER_CHANNEL_COUNT 8
 
 // Filter window size constraints
 #define FILTER_WINDOW_SIZE_MIN  2

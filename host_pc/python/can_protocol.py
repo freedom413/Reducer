@@ -50,6 +50,7 @@ COMMAND_NAMES = {
     0x05: "Save Zero",
     0x06: "Load Zero",
     0x07: "Clear Zero",
+    0x08: "Set Channel Mask",
 }
 
 STATUS_NAMES = {

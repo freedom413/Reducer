@@ -56,9 +56,14 @@ CAN_CMD_START_CALIB = 0x04
 CAN_CMD_SAVE_ZERO = 0x05
 CAN_CMD_LOAD_ZERO = 0x06
 CAN_CMD_CLEAR_ZERO = 0x07
+CAN_CMD_SET_CHANNEL_MASK = 0x08
 
 # Number of channels
-NUM_CHANNELS = 6
+NUM_CHANNELS = 8
+DEFAULT_VISIBLE_PLOTS = 4
+MAX_VISIBLE_PLOTS = 8
+FIXED_CAN_BITRATE = Baudrate.BAUD_500K
+ADC_CHANNEL_MASKS = (0x0F, 0xF0)
 ELASTIC_MODULUS_MPA = 210000.0
 
 # Waveform buffer size
@@ -67,6 +72,21 @@ PLOT_VISIBLE_SAMPLES = 300
 PLOT_MIN_Y_RANGE_MV = 0.05
 DEFAULT_PLOT_REFRESH_HZ = 60
 COMMAND_ACK_TIMEOUT_S = 2.0
+
+PLOT_METRICS = {
+    "voltage": {
+        "label_key": "voltage_mv", "axis_key": "voltage",
+        "color": "#1f77b4", "units": "mV",
+    },
+    "strain": {
+        "label_key": "strain_ue", "axis_key": "strain",
+        "color": "#ff7f0e", "units": "ue",
+    },
+    "stress": {
+        "label_key": "stress_mpa", "axis_key": "stress",
+        "color": "#d62728", "units": "MPa",
+    },
+}
 
 SUPPORTED_SAMPLE_RATES = [5, 10, 15, 25, 30, 50, 60, 100, 500, 1000]
 SLCAN_TELEMETRY_FRAME_BYTES = 22
@@ -96,10 +116,21 @@ TRANSLATIONS = {
         "clear_plots_tooltip": "Clear waveform history without changing MCU settings or current values",
         "import_csv": "Import CSV",
         "import_csv_tooltip": "Load recorded CSV data into the waveform plots",
-        "plot_title": "CH{channel} Voltage",
+        "add_plot": "Add Plot",
+        "add_plot_tooltip": "Add a waveform plot and request MCU sampling, up to 8 plots total",
+        "remove_plot": "Remove",
+        "remove_plot_tooltip": "Remove this plot and stop MCU sampling if no other plot uses its channel",
+        "plot_source": "Source:",
+        "plot_source_tooltip": "Select the displayed channel and update MCU sampling automatically",
+        "plot_metrics": "Curves:",
+        "plot_metrics_tooltip": "Select one or more curves to overlay in this plot",
+        "plot_title": "CH{channel} Curves",
+        "value": "Value",
         "voltage": "Voltage",
+        "strain": "Strain",
+        "stress": "Stress",
         "sample": "Sample",
-        "plot_tooltip": "Double-click to maximize or return to the 6-channel view",
+        "plot_tooltip": "Double-click to maximize or return to the grid view",
         "table_channel": "Channel",
         "voltage_mv": "Voltage (mV)",
         "strain_ue": "Strain (ue)",
@@ -146,6 +177,8 @@ TRANSLATIONS = {
         "load_zero_failed": "Failed to load zero offset",
         "clear_zero_sent": "Clear Zero command sent, waiting for device ACK",
         "clear_zero_failed": "Failed to clear zero offset",
+        "channel_mask_sent": "ADC channel selection sent: 0x{mask:02X}",
+        "channel_mask_failed": "Failed to update ADC channel selection",
         "logging_to": "Logging to {filename}",
         "logging_stopped": "Logging stopped",
         "failed_start_logging": "Failed to start logging: {error}",
@@ -156,6 +189,16 @@ TRANSLATIONS = {
         "command_sequence": "Command sequence {sequence}",
     },
     "zh": {
+        "channel_mask_sent": "ADC 通道选择已发送：0x{mask:02X}",
+        "channel_mask_failed": "ADC 通道选择更新失败",
+        "add_plot": "新增图表",
+        "add_plot_tooltip": "新增一个波形图表，最多可显示 8 张",
+        "remove_plot": "移除",
+        "remove_plot_tooltip": "移除当前波形图表",
+        "plot_source": "数据源：",
+        "plot_source_tooltip": "选择当前图表展示的通道",
+        "plot_metrics": "曲线：",
+        "plot_metrics_tooltip": "选择当前图表中叠加显示的一种或多种曲线",
         "window_title": "减速器柔轮监视器",
         "offline_window_title": "减速器波形记录 - {filename}",
         "can_connection": "CAN 连接",
@@ -177,10 +220,13 @@ TRANSLATIONS = {
         "clear_plots_tooltip": "清空波形历史，不改变 MCU 设置和当前数值",
         "import_csv": "导入 CSV",
         "import_csv_tooltip": "将已记录的 CSV 数据加载到波形窗口",
-        "plot_title": "CH{channel} 电压",
+        "plot_title": "CH{channel} 曲线",
+        "value": "数值",
         "voltage": "电压",
+        "strain": "应变",
+        "stress": "应力",
         "sample": "采样点",
-        "plot_tooltip": "双击可最大化曲线或返回六通道视图",
+        "plot_tooltip": "双击可最大化曲线或返回网格视图",
         "table_channel": "通道",
         "voltage_mv": "电压 (mV)",
         "strain_ue": "应变 (ue)",
@@ -246,6 +292,7 @@ COMMAND_TRANSLATIONS = {
     "Save Zero": "保存零点",
     "Load Zero": "加载零点",
     "Clear Zero": "清除零点",
+    "Set Channel Mask": "设置 ADC 通道",
 }
 
 STATUS_TRANSLATIONS = {
@@ -493,7 +540,9 @@ class ReducerMonitorWindow(QMainWindow):
         self.lock = Lock()
 
         # Waveform data buffers
-        self.waveform_buffers = [deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)]
+        self.waveform_buffers, self.waveform_metric_buffers = (
+            self._create_waveform_buffers()
+        )
         self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
 
         # CSV logging
@@ -508,6 +557,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.rx_status_count = 0
         self.rx_bad_protocol_count = 0
         self.maximized_plot_channel: Optional[int] = None
+        self.maximized_plot_panel: Optional[QWidget] = None
+        self.last_sent_channel_mask: Optional[int] = None
         self.language = "en"
         self.sample_rate_sps = 100
         self._status_message = None
@@ -595,14 +646,11 @@ class ReducerMonitorWindow(QMainWindow):
             self.serial_baud_combo.setCurrentIndex(serial_baud_index)
         layout.addWidget(self.serial_baud_combo)
 
-        # CAN bitrate selection
+        # MCU firmware uses a fixed classic CAN bitrate.
         self.can_baud_label = QLabel()
         layout.addWidget(self.can_baud_label)
-        self.baud_combo = QComboBox()
-        for br in Baudrate:
-            self.baud_combo.addItem(f"{br.bps // 1000}K", br)
-        self.baud_combo.setCurrentText("500K")
-        layout.addWidget(self.baud_combo)
+        self.can_baud_value = QLabel(f"{FIXED_CAN_BITRATE.bps // 1000}K")
+        layout.addWidget(self.can_baud_value)
 
         # Connect button
         self.connect_btn = QPushButton()
@@ -638,7 +686,7 @@ class ReducerMonitorWindow(QMainWindow):
         return group
 
     def _create_waveform_tab(self) -> QWidget:
-        """Create the waveform display tab with 6 channel plots"""
+        """Create the waveform display tab with configurable channel plots"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
@@ -656,6 +704,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.import_csv_btn.clicked.connect(self.import_csv)
         controls.addWidget(self.import_csv_btn)
 
+        self.add_plot_btn = QPushButton()
+        self.add_plot_btn.clicked.connect(self._add_waveform_plot)
+        controls.addWidget(self.add_plot_btn)
+
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -663,25 +715,21 @@ class ReducerMonitorWindow(QMainWindow):
         self.waveform_layout = QGridLayout(plots_widget)
         layout.addWidget(plots_widget)
 
-        # Create 6 plot widgets in a 2x3 grid
+        # Keep acquisition buffers separate from plot cards so each card can
+        # select a source channel without affecting telemetry collection.
+        self.plot_panels = []
         self.plot_widgets = []
         self.plot_curves = []
+        self.plot_channel_combos = []
+        self.plot_source_labels = []
+        self.plot_metrics_labels = []
+        self.plot_metric_checkboxes = []
+        self.plot_metric_curves = []
+        self.plot_remove_buttons = []
+        self.plot_channels = []
 
-        for i in range(NUM_CHANNELS):
-            # Create plot widget
-            pw = pg.PlotWidget()
-            pw.showGrid(x=True, y=True, alpha=0.3)
-            pw.disableAutoRange()
-            pw.scene().sigMouseClicked.connect(
-                lambda event, channel=i: self._on_plot_mouse_clicked(channel, event)
-            )
-
-            # Create curve
-            curve = pw.plot(pen=pg.mkPen(color=self._get_channel_color(i), width=1.5))
-            self.plot_widgets.append(pw)
-            self.plot_curves.append(curve)
-
-        self._refresh_waveform_layout()
+        for channel in range(min(DEFAULT_VISIBLE_PLOTS, NUM_CHANNELS)):
+            self._add_waveform_plot(channel)
 
         return widget
 
@@ -778,12 +826,11 @@ class ReducerMonitorWindow(QMainWindow):
         self.clear_plots_btn.setToolTip(self._tr("clear_plots_tooltip"))
         self.import_csv_btn.setText(self._tr("import_csv"))
         self.import_csv_btn.setToolTip(self._tr("import_csv_tooltip"))
+        self.add_plot_btn.setText(self._tr("add_plot"))
+        self.add_plot_btn.setToolTip(self._tr("add_plot_tooltip"))
 
-        for channel, plot in enumerate(self.plot_widgets):
-            plot.setTitle(self._tr("plot_title", channel=channel))
-            plot.setLabel("left", self._tr("voltage"), units="mV")
-            plot.setLabel("bottom", self._tr("sample"))
-            plot.setToolTip(self._tr("plot_tooltip"))
+        for plot_index in range(len(self.plot_widgets)):
+            self._update_plot_presentation(plot_index)
 
         self.data_table.setHorizontalHeaderLabels([
             self._tr("table_channel"),
@@ -871,13 +918,15 @@ class ReducerMonitorWindow(QMainWindow):
     def _set_connection_controls_enabled(self, enabled: bool):
         self.interface_combo.setEnabled(enabled)
         self.channel_combo.setEnabled(enabled)
-        self.baud_combo.setEnabled(enabled)
         self.refresh_btn.setEnabled(enabled)
         self._update_connection_options()
 
-    @staticmethod
-    def _minimum_slcan_tty_baudrate(sample_rate: int) -> int:
-        telemetry_frames_per_second = sample_rate * NUM_CHANNELS / 3
+    def _minimum_slcan_tty_baudrate(self, sample_rate: int) -> int:
+        channel_mask = self._displayed_channel_mask()
+        active_adc_count = sum(
+            1 for adc_mask in ADC_CHANNEL_MASKS if channel_mask & adc_mask
+        )
+        telemetry_frames_per_second = sample_rate * active_adc_count
         required_baudrate = (
             telemetry_frames_per_second *
             SLCAN_TELEMETRY_FRAME_BYTES *
@@ -910,15 +959,263 @@ class ReducerMonitorWindow(QMainWindow):
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
         return colors[ch % len(colors)]
 
-    def _on_plot_mouse_clicked(self, channel: int, event):
-        if event.double():
-            self._toggle_plot_maximize(channel)
+    @staticmethod
+    def _create_waveform_buffers():
+        voltage_buffers = [
+            deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
+        ]
+        return voltage_buffers, {
+            "voltage": voltage_buffers,
+            "strain": [
+                deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
+            ],
+            "stress": [
+                deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
+            ],
+        }
 
-    def _toggle_plot_maximize(self, channel: int):
-        if self.maximized_plot_channel == channel:
+    def _add_waveform_plot(self, channel: Optional[int] = None):
+        if len(self.plot_panels) >= MAX_VISIBLE_PLOTS:
+            return
+
+        if channel is None:
+            used_channels = set(self.plot_channels)
+            channel = next(
+                (ch for ch in range(NUM_CHANNELS) if ch not in used_channels),
+                0,
+            )
+
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        header = QHBoxLayout()
+        source_label = QLabel()
+        header.addWidget(source_label)
+
+        channel_combo = QComboBox()
+        for source_channel in range(NUM_CHANNELS):
+            channel_combo.addItem(f"CH{source_channel}", source_channel)
+        channel_combo.setCurrentIndex(channel)
+        header.addWidget(channel_combo)
+
+        metrics_label = QLabel()
+        header.addWidget(metrics_label)
+        metric_checkboxes = {}
+        for metric in PLOT_METRICS:
+            checkbox = QCheckBox()
+            checkbox.setChecked(metric == "voltage")
+            metric_checkboxes[metric] = checkbox
+            header.addWidget(checkbox)
+        header.addStretch()
+
+        remove_button = QPushButton()
+        remove_button.clicked.connect(
+            lambda _checked=False, selected_panel=panel:
+                self._remove_waveform_plot(selected_panel)
+        )
+        header.addWidget(remove_button)
+        panel_layout.addLayout(header)
+
+        plot = pg.PlotWidget()
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.disableAutoRange()
+        plot.scene().sigMouseClicked.connect(
+            lambda event, selected_panel=panel:
+                self._on_plot_mouse_clicked(selected_panel, event)
+        )
+        metric_curves = {}
+        for metric, config in PLOT_METRICS.items():
+            curve = plot.plot(
+                pen=pg.mkPen(color=config["color"], width=1.5)
+            )
+            curve.setVisible(metric == "voltage")
+            metric_curves[metric] = curve
+        panel_layout.addWidget(plot)
+
+        self.plot_panels.append(panel)
+        self.plot_widgets.append(plot)
+        self.plot_curves.append(metric_curves["voltage"])
+        self.plot_channel_combos.append(channel_combo)
+        self.plot_source_labels.append(source_label)
+        self.plot_metrics_labels.append(metrics_label)
+        self.plot_metric_checkboxes.append(metric_checkboxes)
+        self.plot_metric_curves.append(metric_curves)
+        self.plot_remove_buttons.append(remove_button)
+        self.plot_channels.append(channel)
+
+        channel_combo.currentIndexChanged.connect(
+            lambda _index, selected_plot=plot:
+                self._on_plot_channel_changed(selected_plot)
+        )
+        for metric, checkbox in metric_checkboxes.items():
+            checkbox.toggled.connect(
+                lambda checked, selected_plot=plot, selected_metric=metric:
+                    self._on_plot_metric_toggled(
+                        selected_plot, selected_metric, checked
+                    )
+            )
+
+        plot_index = len(self.plot_widgets) - 1
+        self._update_plot_presentation(plot_index)
+        self._refresh_plot_data(plot_index)
+        if self.auto_scale_checkbox.isChecked():
+            self._update_plot_range(plot_index)
+
+        self._refresh_waveform_layout()
+        self._update_plot_controls()
+        self._sync_mcu_channel_mask()
+
+    def _remove_waveform_plot(self, panel: QWidget):
+        if panel not in self.plot_panels:
+            return
+
+        plot_index = self.plot_panels.index(panel)
+        if self.maximized_plot_panel is panel:
+            self.maximized_plot_panel = None
+            self.maximized_plot_channel = None
+
+        self.waveform_layout.removeWidget(panel)
+        self.plot_panels.pop(plot_index)
+        self.plot_widgets.pop(plot_index)
+        self.plot_curves.pop(plot_index)
+        self.plot_channel_combos.pop(plot_index)
+        self.plot_source_labels.pop(plot_index)
+        self.plot_metrics_labels.pop(plot_index)
+        self.plot_metric_checkboxes.pop(plot_index)
+        self.plot_metric_curves.pop(plot_index)
+        self.plot_remove_buttons.pop(plot_index)
+        self.plot_channels.pop(plot_index)
+        panel.deleteLater()
+
+        self._refresh_waveform_layout()
+        self._update_plot_controls()
+        self._sync_mcu_channel_mask()
+
+    def _on_plot_channel_changed(self, plot: pg.PlotWidget):
+        if plot not in self.plot_widgets:
+            return
+
+        plot_index = self.plot_widgets.index(plot)
+        channel = self.plot_channel_combos[plot_index].currentData()
+        if channel is None:
+            return
+
+        self.plot_channels[plot_index] = int(channel)
+        self._refresh_plot_data(plot_index)
+        if self.auto_scale_checkbox.isChecked():
+            self._update_plot_range(plot_index)
+        self._update_plot_presentation(plot_index)
+        if self.maximized_plot_panel is self.plot_panels[plot_index]:
+            self.maximized_plot_channel = int(channel)
+        self._sync_mcu_channel_mask()
+
+    def _on_plot_metric_toggled(
+        self, plot: pg.PlotWidget, metric: str, enabled: bool
+    ):
+        if plot not in self.plot_widgets:
+            return
+
+        plot_index = self.plot_widgets.index(plot)
+        checkboxes = self.plot_metric_checkboxes[plot_index]
+        if not enabled and not any(
+            checkbox.isChecked() for checkbox in checkboxes.values()
+        ):
+            with QSignalBlocker(checkboxes[metric]):
+                checkboxes[metric].setChecked(True)
+            return
+
+        self.plot_metric_curves[plot_index][metric].setVisible(enabled)
+        self._refresh_plot_data(plot_index)
+        self._update_plot_presentation(plot_index)
+        if self.auto_scale_checkbox.isChecked():
+            self._update_plot_range(plot_index)
+
+    def _selected_plot_metrics(self, plot_index: int) -> List[str]:
+        return [
+            metric
+            for metric, checkbox in self.plot_metric_checkboxes[plot_index].items()
+            if checkbox.isChecked()
+        ]
+
+    def _refresh_plot_data(self, plot_index: int):
+        channel = self.plot_channels[plot_index]
+        for metric, curve in self.plot_metric_curves[plot_index].items():
+            curve.setData(list(self.waveform_metric_buffers[metric][channel]))
+
+    def _update_plot_presentation(self, plot_index: int):
+        channel = self.plot_channels[plot_index]
+        plot = self.plot_widgets[plot_index]
+        plot.setTitle(self._tr("plot_title", channel=channel))
+        selected_metrics = self._selected_plot_metrics(plot_index)
+        if len(selected_metrics) == 1:
+            config = PLOT_METRICS[selected_metrics[0]]
+            plot.setLabel(
+                "left", self._tr(config["axis_key"]), units=config["units"]
+            )
+        else:
+            plot.setLabel("left", self._tr("value"))
+        plot.setLabel("bottom", self._tr("sample"))
+        plot.setToolTip(self._tr("plot_tooltip"))
+        self.plot_source_labels[plot_index].setText(self._tr("plot_source"))
+        self.plot_channel_combos[plot_index].setToolTip(
+            self._tr("plot_source_tooltip")
+        )
+        self.plot_metrics_labels[plot_index].setText(self._tr("plot_metrics"))
+        for metric, checkbox in self.plot_metric_checkboxes[plot_index].items():
+            config = PLOT_METRICS[metric]
+            checkbox.setText(self._tr(config["label_key"]))
+            checkbox.setToolTip(self._tr("plot_metrics_tooltip"))
+            checkbox.setStyleSheet(f"color: {config['color']};")
+        self.plot_remove_buttons[plot_index].setText(self._tr("remove_plot"))
+        self.plot_remove_buttons[plot_index].setToolTip(
+            self._tr("remove_plot_tooltip")
+        )
+
+    def _update_plot_controls(self):
+        self.add_plot_btn.setEnabled(len(self.plot_panels) < MAX_VISIBLE_PLOTS)
+        for button in self.plot_remove_buttons:
+            button.setEnabled(True)
+
+    def _displayed_channel_mask(self) -> int:
+        channel_mask = 0
+        for channel in self.plot_channels:
+            channel_mask |= 1 << channel
+        return channel_mask
+
+    def _sync_mcu_channel_mask(
+        self, *, show_status: bool = True, force: bool = False
+    ) -> bool:
+        if not self.is_connected:
+            return True
+
+        channel_mask = self._displayed_channel_mask()
+        if not force and channel_mask == self.last_sent_channel_mask:
+            return True
+
+        if self.send_command(CAN_CMD_SET_CHANNEL_MASK, value=channel_mask):
+            self.last_sent_channel_mask = channel_mask
+            if show_status:
+                self._show_status("channel_mask_sent", mask=channel_mask)
+            return True
+
+        if show_status:
+            self._show_status("channel_mask_failed")
+        return False
+
+    def _on_plot_mouse_clicked(self, panel: QWidget, event):
+        if event.double():
+            self._toggle_plot_maximize(panel)
+
+    def _toggle_plot_maximize(self, plot):
+        panel = self.plot_panels[plot] if isinstance(plot, int) else plot
+        if self.maximized_plot_panel is panel:
+            self.maximized_plot_panel = None
             self.maximized_plot_channel = None
         else:
-            self.maximized_plot_channel = channel
+            self.maximized_plot_panel = panel
+            plot_index = self.plot_panels.index(panel)
+            self.maximized_plot_channel = self.plot_channels[plot_index]
         self._refresh_waveform_layout()
 
     def _on_auto_scale_toggled(self, enabled: bool):
@@ -931,11 +1228,14 @@ class ReducerMonitorWindow(QMainWindow):
 
     def _clear_plots(self):
         with self.lock:
-            self.waveform_buffers = [deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)]
+            self.waveform_buffers, self.waveform_metric_buffers = (
+                self._create_waveform_buffers()
+            )
             self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
 
-        for curve in self.plot_curves:
-            curve.setData([], [])
+        for curves in self.plot_metric_curves:
+            for curve in curves.values():
+                curve.setData([], [])
 
         self._show_status("waveforms_cleared")
 
@@ -972,33 +1272,42 @@ class ReducerMonitorWindow(QMainWindow):
         while self.waveform_layout.count():
             self.waveform_layout.takeAt(0)
 
-        for plot in self.plot_widgets:
-            plot.hide()
+        for panel in self.plot_panels:
+            panel.hide()
 
-        if self.maximized_plot_channel is not None:
-            for row in range(2):
+        if self.maximized_plot_panel is not None:
+            for row in range(MAX_VISIBLE_PLOTS):
                 self.waveform_layout.setRowStretch(row, 0)
-            for column in range(3):
+            for column in range(MAX_VISIBLE_PLOTS):
                 self.waveform_layout.setColumnStretch(column, 0)
 
-            plot = self.plot_widgets[self.maximized_plot_channel]
-            self.waveform_layout.addWidget(plot, 0, 0, 2, 3)
-            plot.show()
+            self.waveform_layout.addWidget(self.maximized_plot_panel, 0, 0, 1, 1)
+            self.maximized_plot_panel.show()
             return
 
-        for row in range(2):
+        columns = 2 if len(self.plot_panels) <= 4 else 3
+        rows = (len(self.plot_panels) + columns - 1) // columns
+        for row in range(MAX_VISIBLE_PLOTS):
+            self.waveform_layout.setRowStretch(row, 0)
+        for column in range(MAX_VISIBLE_PLOTS):
+            self.waveform_layout.setColumnStretch(column, 0)
+        for row in range(rows):
             self.waveform_layout.setRowStretch(row, 1)
-        for column in range(3):
+        for column in range(columns):
             self.waveform_layout.setColumnStretch(column, 1)
 
-        for channel, plot in enumerate(self.plot_widgets):
-            self.waveform_layout.addWidget(plot, channel // 3, channel % 3)
-            plot.show()
+        for plot_index, panel in enumerate(self.plot_panels):
+            self.waveform_layout.addWidget(
+                panel, plot_index // columns, plot_index % columns
+            )
+            panel.show()
 
     def _reset_measurements(self):
         with self.lock:
             self.channel_data = [ChannelData() for _ in range(NUM_CHANNELS)]
-            self.waveform_buffers = [deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)]
+            self.waveform_buffers, self.waveform_metric_buffers = (
+                self._create_waveform_buffers()
+            )
             self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
             self.channel_stats = [
                 {'min': None, 'max': None, 'sum': 0.0, 'count': 0}
@@ -1017,8 +1326,9 @@ class ReducerMonitorWindow(QMainWindow):
             self._refresh_statistics_labels()
 
         if hasattr(self, 'plot_curves'):
-            for curve in self.plot_curves:
-                curve.setData([], [])
+            for curves in self.plot_metric_curves:
+                for curve in curves.values():
+                    curve.setData([], [])
 
     def on_connect_clicked(self):
         """Handle connect/disconnect button click"""
@@ -1205,7 +1515,7 @@ class ReducerMonitorWindow(QMainWindow):
             )
             return
 
-        baudrate = self.baud_combo.currentData()
+        baudrate = FIXED_CAN_BITRATE
         tty_baudrate = int(self.serial_baud_combo.currentData() or DEFAULT_SLCAN_TTY_BAUDRATE)
 
         try:
@@ -1254,7 +1564,12 @@ class ReducerMonitorWindow(QMainWindow):
             self.clear_zero_btn.setEnabled(True)
             self.sample_rate_combo.setEnabled(True)
             self.filter_size_spin.setEnabled(True)
-            if interface == "slcan":
+            channel_mask_synced = self._sync_mcu_channel_mask(
+                show_status=False, force=True
+            )
+            if not channel_mask_synced:
+                self._show_status("channel_mask_failed")
+            elif interface == "slcan":
                 self._show_status(
                     "connected_slcan",
                     channel=channel,
@@ -1301,6 +1616,7 @@ class ReducerMonitorWindow(QMainWindow):
             self.can_bus = None
 
         self.is_connected = False
+        self.last_sent_channel_mask = None
         self._set_connection_controls_enabled(True)
         self.pending_commands.clear()
         self.pending_command_deadlines.clear()
@@ -1361,7 +1677,9 @@ class ReducerMonitorWindow(QMainWindow):
     def on_data_updated(self, channel: int, data: dict):
         """Handle data update signal"""
         # Update waveform buffer
-        self.waveform_buffers[channel].append(data['voltage'])
+        self.waveform_metric_buffers["voltage"][channel].append(data['voltage'])
+        self.waveform_metric_buffers["strain"][channel].append(data['strain'])
+        self.waveform_metric_buffers["stress"][channel].append(data['stress'])
         self.plot_dirty[channel] = True
 
         # Update data table
@@ -1390,22 +1708,36 @@ class ReducerMonitorWindow(QMainWindow):
     def update_plots(self):
         """Update waveform plots (called by timer)"""
         with self.lock:
-            for ch in range(NUM_CHANNELS):
-                if self.plot_dirty[ch]:
-                    values = list(self.waveform_buffers[ch])
-                    self.plot_curves[ch].setData(values)
+            dirty_channels = {
+                ch for ch in range(NUM_CHANNELS) if self.plot_dirty[ch]
+            }
+            for plot_index, channel in enumerate(self.plot_channels):
+                if channel in dirty_channels:
+                    self._refresh_plot_data(plot_index)
                     if self.auto_scale_checkbox.isChecked():
-                        self._update_plot_range(ch, values)
-                    self.plot_dirty[ch] = False
+                        self._update_plot_range(plot_index)
+            for channel in dirty_channels:
+                self.plot_dirty[channel] = False
 
-    def _update_plot_range(self, channel: int, values: List[float]):
-        if not values:
+    def _update_plot_range(self, plot_index: int):
+        channel = self.plot_channels[plot_index]
+        series = [
+            list(self.waveform_metric_buffers[metric][channel])
+            for metric in self._selected_plot_metrics(plot_index)
+        ]
+        series = [values for values in series if values]
+        if not series:
             return
 
-        visible_count = min(len(values), PLOT_VISIBLE_SAMPLES)
-        first_sample = len(values) - visible_count
-        last_sample = max(first_sample + 1, len(values) - 1)
-        visible_values = values[first_sample:]
+        sample_count = max(len(values) for values in series)
+        visible_count = min(sample_count, PLOT_VISIBLE_SAMPLES)
+        first_sample = sample_count - visible_count
+        last_sample = max(first_sample + 1, sample_count - 1)
+        visible_values = [
+            value
+            for values in series
+            for value in values[-visible_count:]
+        ]
 
         minimum = min(visible_values)
         maximum = max(visible_values)
@@ -1413,7 +1745,7 @@ class ReducerMonitorWindow(QMainWindow):
         y_range = max(maximum - minimum, PLOT_MIN_Y_RANGE_MV)
         y_padding = y_range * 0.1
 
-        plot = self.plot_widgets[channel]
+        plot = self.plot_widgets[plot_index]
         plot.setXRange(first_sample, last_sample, padding=0.01)
         plot.setYRange(center - (y_range / 2.0) - y_padding,
                        center + (y_range / 2.0) + y_padding,
@@ -1491,6 +1823,12 @@ class ReducerMonitorWindow(QMainWindow):
             )
             logger.info("%s acknowledged, value=%u", command_name, status.value)
             return
+
+        if (
+            status.cmd_type == CAN_CMD_SET_CHANNEL_MASK and
+            self.last_sent_channel_mask == status.value
+        ):
+            self.last_sent_channel_mask = None
 
         reason = STATUS_NAMES.get(status.status, f"status 0x{status.status:02X}")
         self._show_status("command_rejected", command=command_name, reason=reason)
