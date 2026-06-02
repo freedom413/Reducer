@@ -15,6 +15,7 @@
 // Frame type definitions
 // ============================================================================
 #define CAN_FRAME_TYPE_TELEMETRY  0x51
+#define CAN_FRAME_TYPE_TELEMETRY_BATCH  0x53
 #define CAN_FRAME_TYPE_COMMAND    0xA0
 #define CAN_FRAME_TYPE_STATUS     0xA1
 #define CAN_FRAME_TYPE_HEALTH     0x52
@@ -49,6 +50,34 @@ typedef struct __attribute__((packed)) {
 } can_tx_telemetry_frame_t;
 
 _Static_assert(sizeof(can_tx_telemetry_frame_t) == 8, "can_tx_telemetry_frame_t must be 8 bytes");
+
+// ============================================================================
+// Batched telemetry CAN TX frame - 64-byte CAN FD+BRS frame
+// ============================================================================
+#define CAN_TELEMETRY_BATCH_MAX_RECORDS  10U
+#define CAN_TELEMETRY_BATCH_FRAME_LEN    64U
+
+// Each record uses 6 bytes. The final frame carries a record count, one
+// reserved byte, and a checksum over bytes 0-62.
+typedef struct __attribute__((packed)) {
+    uint8_t  channel;
+    uint8_t  voltage_be[2];
+    uint8_t  strain_be[2];
+    int8_t   stress;
+} can_tx_telemetry_record_t;
+
+_Static_assert(sizeof(can_tx_telemetry_record_t) == 6, "can_tx_telemetry_record_t must be 6 bytes");
+
+typedef struct __attribute__((packed)) {
+    uint8_t frame_type;
+    uint8_t record_count;
+    can_tx_telemetry_record_t records[CAN_TELEMETRY_BATCH_MAX_RECORDS];
+    uint8_t reserved;
+    uint8_t crc8;
+} can_tx_telemetry_batch_frame_t;
+
+_Static_assert(sizeof(can_tx_telemetry_batch_frame_t) == CAN_TELEMETRY_BATCH_FRAME_LEN,
+               "can_tx_telemetry_batch_frame_t must be 64 bytes");
 
 // ============================================================================
 // Command frame (PC -> STM32) with CRC and sequence number
@@ -148,6 +177,13 @@ uint8_t can_calc_crc8(const uint8_t *data, uint8_t len);
  */
 void can_build_telemetry_frame(can_tx_telemetry_frame_t *frame, uint8_t channel,
                                int16_t voltage_001mv, int16_t strain_ue, int8_t stress_01mpa);
+void can_build_telemetry_record(can_tx_telemetry_record_t *record, uint8_t channel,
+                                int16_t voltage_001mv, int16_t strain_ue,
+                                int8_t stress_01mpa);
+void can_build_telemetry_batch_frame(
+    can_tx_telemetry_batch_frame_t *frame,
+    const can_tx_telemetry_record_t *records,
+    uint8_t record_count);
 void can_build_status_frame(can_tx_status_frame_t *frame, uint8_t sequence,
                             uint8_t cmd_type, uint8_t status, uint16_t value,
                             uint8_t detail);
