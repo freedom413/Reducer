@@ -51,9 +51,11 @@ The real multiplexed conversion throughput follows ADS1256 datasheet Table 14.
 For example, the `30000 SPS` setting produces about `4374` conversions/s per
 active ADC while cycling channels.
 
-Every acquired conversion is filtered and converted. Only outgoing telemetry is
-decimated. Firmware calculates a decimation factor from Table 14 throughput and
-the number of active ADC devices, then caps telemetry near `3000 frames/s`.
+Every acquired conversion is filtered and converted. Firmware packs up to ten
+records into one 64-byte telemetry frame and buffers up to 128 pending records
+before the three-slot FDCAN hardware TX FIFO. At the maximum dual-ADC rate this
+transfers all acquired conversions without telemetry decimation. A safety
+decimation factor applies only above `10000 records/s`.
 
 ## Filtering, Statistics, And Zero Storage
 
@@ -70,13 +72,13 @@ for explicit zero-storage commands.
 
 ## CAN FD Protocol
 
-All business frames use standard 11-bit IDs, CAN FD+BRS, `500K / 2M`, and an XOR
+All business frames use standard 11-bit IDs, CAN FD+BRS, `1M / 5M`, and an XOR
 checksum.
 
 | Direction | ID | Type | Length | Purpose |
 |---|---:|---:|---:|---|
 | PC -> MCU | `0x100` | `0xA0` | 8 | Command |
-| MCU -> PC | `0x101` | `0x51` | 8 | Per-channel telemetry |
+| MCU -> PC | `0x101` | `0x53` | 64 | Up to ten telemetry records |
 | MCU -> PC | `0x102` | `0xA1` | 8 | Command ACK |
 | MCU -> PC | `0x103` | `0x52` | 16 | One-second health report |
 
@@ -98,12 +100,16 @@ encodes tenths of SPS. The latter represents `2.5 SPS` as `value=25`.
 Telemetry frame:
 
 ```text
-byte 0: type = 0x51
-byte 1: logical channel 0..7
-byte 2-3: voltage int16 BE, 0.01 mV units
-byte 4-5: strain int16 BE, microstrain units
-byte 6: clipped stress preview int8, 0.1 MPa units
-byte 7: XOR CRC over bytes 0..6
+byte 0: type = 0x53
+byte 1: telemetry record count, 1..10
+byte 2-61: ten 6-byte record slots, unused slots are zero-filled
+byte 62: reserved
+byte 63: XOR CRC over bytes 0..62
+
+record byte 0: logical channel 0..7
+record byte 1-2: voltage int16 BE, 0.01 mV units
+record byte 3-4: strain int16 BE, microstrain units
+record byte 5: clipped stress preview int8, 0.1 MPa units
 ```
 
 Health frame:

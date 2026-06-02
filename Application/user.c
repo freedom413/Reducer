@@ -22,7 +22,9 @@
 #define CAN_INTERVAL_TEST_PERIOD_MS  100U
 #endif
 #define CAN_TX_WAIT_TIMEOUT_MS       5U
-#define CAN_TELEMETRY_MAX_FRAMES_PER_SECOND  3000U
+#define CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND  10000U
+#define CAN_TELEMETRY_QUEUE_RECORD_COUNT      128U
+#define CAN_TELEMETRY_FLUSH_PERIOD_MS         2U
 #define CAN_HEALTH_PERIOD_MS         1000U
 
 // ============================================================================
@@ -32,6 +34,12 @@ static ads1256_data_t adc_ads1256_data[ADC_CHANNEL_COUNT] = {0};
 static bool can_ready = false;
 static uint16_t can_telemetry_decimation = 1U;
 static uint16_t can_telemetry_sample_count[ADC_CHANNEL_COUNT] = {0};
+static can_tx_telemetry_record_t
+    can_telemetry_queue[CAN_TELEMETRY_QUEUE_RECORD_COUNT] = {0};
+static uint16_t can_telemetry_queue_read = 0U;
+static uint16_t can_telemetry_queue_write = 0U;
+static uint16_t can_telemetry_queue_count = 0U;
+static uint32_t can_telemetry_queue_first_tick = 0U;
 static uint16_t can_tx_drop_count = 0U;
 static uint32_t can_health_last_tx_tick = 0U;
 #if CAN_INTERVAL_TEST_ENABLED
@@ -50,6 +58,7 @@ static float running_m2[ADC_CHANNEL_COUNT] = {0};
 static uint16_t sample_count[ADC_CHANNEL_COUNT] = {0};
 
 static void update_can_telemetry_decimation(void);
+static void flush_can_telemetry(void);
 
 #if CAN_INTERVAL_TEST_ENABLED
 static void send_can_interval_test(void)
@@ -147,7 +156,7 @@ static void update_can_telemetry_decimation(void)
     uint32_t source_rate_x10 =
         adc_ads1256_get_cycling_rate_x10() * active_ads1256_count();
     uint32_t telemetry_limit_x10 =
-        CAN_TELEMETRY_MAX_FRAMES_PER_SECOND * 10U;
+        CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND * 10U;
     uint32_t decimation =
         (source_rate_x10 + telemetry_limit_x10 - 1U) / telemetry_limit_x10;
 
@@ -159,6 +168,10 @@ static void update_can_telemetry_decimation(void)
     }
     can_telemetry_decimation = (uint16_t)decimation;
     memset(can_telemetry_sample_count, 0, sizeof(can_telemetry_sample_count));
+    can_telemetry_queue_read = 0U;
+    can_telemetry_queue_write = 0U;
+    can_telemetry_queue_count = 0U;
+    can_telemetry_queue_first_tick = HAL_GetTick();
 }
 
 static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
@@ -179,26 +192,84 @@ static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
     }
 }
 
-static void send_can_telemetry(uint8_t channel, int16_t voltage_001mv,
-                               int16_t strain_ue, int8_t stress_01mpa)
+static void count_can_tx_drops(uint16_t count)
+{
+    uint32_t total = (uint32_t)can_tx_drop_count + count;
+    can_tx_drop_count = total > UINT16_MAX ? UINT16_MAX : (uint16_t)total;
+}
+
+static void pop_can_telemetry_records(uint8_t record_count)
+{
+    can_telemetry_queue_read =
+        (uint16_t)((can_telemetry_queue_read + record_count) %
+                   CAN_TELEMETRY_QUEUE_RECORD_COUNT);
+    can_telemetry_queue_count -= record_count;
+    if (can_telemetry_queue_count > 0U) {
+        can_telemetry_queue_first_tick = HAL_GetTick();
+    }
+}
+
+static void queue_can_telemetry(uint8_t channel, int16_t voltage_001mv,
+                                int16_t strain_ue, int8_t stress_01mpa)
+{
+    if (!can_ready || channel >= ADC_CHANNEL_COUNT) {
+        return;
+    }
+
+    if (can_telemetry_queue_count == CAN_TELEMETRY_QUEUE_RECORD_COUNT) {
+        pop_can_telemetry_records(1U);
+        count_can_tx_drops(1U);
+    }
+    if (can_telemetry_queue_count == 0U) {
+        can_telemetry_queue_first_tick = HAL_GetTick();
+    }
+    can_build_telemetry_record(&can_telemetry_queue[can_telemetry_queue_write],
+                               channel, voltage_001mv, strain_ue, stress_01mpa);
+    can_telemetry_queue_write =
+        (uint16_t)((can_telemetry_queue_write + 1U) %
+                   CAN_TELEMETRY_QUEUE_RECORD_COUNT);
+    can_telemetry_queue_count++;
+}
+
+static void flush_can_telemetry(void)
 {
     if (!can_ready) {
         return;
     }
 
-    can_tx_telemetry_frame_t frame;
-    can_build_telemetry_frame(&frame, channel, voltage_001mv, strain_ue, stress_01mpa);
-    /*
-     * Telemetry is best-effort. Waiting for a congested CAN TX queue here
-     * delays ADC polling and makes overload worse. Status ACKs still use a
-     * short bounded wait because they are command responses.
-     */
-    if (can_fd_data_frame_send(CAN_ID_TX_TELEMETRY,
-                               (const uint8_t *)&frame, sizeof(frame)) !=
-        (int)sizeof(frame)) {
-        if (can_tx_drop_count < UINT16_MAX) {
-            can_tx_drop_count++;
+    while (can_telemetry_queue_count > 0U) {
+        uint32_t now = HAL_GetTick();
+        if (can_telemetry_queue_count < CAN_TELEMETRY_BATCH_MAX_RECORDS &&
+            (uint32_t)(now - can_telemetry_queue_first_tick) <
+                CAN_TELEMETRY_FLUSH_PERIOD_MS) {
+            return;
         }
+
+        uint8_t record_count =
+            can_telemetry_queue_count > CAN_TELEMETRY_BATCH_MAX_RECORDS ?
+                CAN_TELEMETRY_BATCH_MAX_RECORDS :
+                (uint8_t)can_telemetry_queue_count;
+        can_tx_telemetry_record_t records[CAN_TELEMETRY_BATCH_MAX_RECORDS];
+        for (uint8_t i = 0U; i < record_count; i++) {
+            uint16_t queue_index =
+                (uint16_t)((can_telemetry_queue_read + i) %
+                           CAN_TELEMETRY_QUEUE_RECORD_COUNT);
+            records[i] = can_telemetry_queue[queue_index];
+        }
+
+        can_tx_telemetry_batch_frame_t frame;
+        can_build_telemetry_batch_frame(&frame, records, record_count);
+        int ret = can_fd_data_frame_send(
+            CAN_ID_TX_TELEMETRY,
+            (const uint8_t *)&frame,
+            sizeof(frame));
+        if (ret == -3) {
+            return;
+        }
+        if (ret != (int)sizeof(frame)) {
+            count_can_tx_drops(record_count);
+        }
+        pop_can_telemetry_records(record_count);
     }
 }
 
@@ -224,9 +295,7 @@ static void send_can_health(void)
     if (can_fd_data_frame_send(CAN_ID_TX_HEALTH,
                                (const uint8_t *)&frame, sizeof(frame)) !=
         (int)sizeof(frame)) {
-        if (can_tx_drop_count < UINT16_MAX) {
-            can_tx_drop_count++;
-        }
+        count_can_tx_drops(1U);
     }
 }
 
@@ -278,7 +347,7 @@ static void process_adc_sample(uint8_t channel, int32_t raw_value)
     can_telemetry_sample_count[channel]++;
     if (can_telemetry_sample_count[channel] >= can_telemetry_decimation) {
         can_telemetry_sample_count[channel] = 0;
-        send_can_telemetry(channel, voltage_001mv, strain_ue, stress_01mpa);
+        queue_can_telemetry(channel, voltage_001mv, strain_ue, stress_01mpa);
     }
 }
 
@@ -511,6 +580,7 @@ void loop(void)
 
     process_can_commands();
     send_can_health();
+    flush_can_telemetry();
 
     adc_ads1256_poll();
 
@@ -527,4 +597,6 @@ void loop(void)
             process_adc_sample(ch, adc_ads1256_data[i].raw_value);
         }
     }
+
+    flush_can_telemetry();
 }

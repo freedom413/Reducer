@@ -28,6 +28,7 @@ CAN_ID_TX_STATUS = 0x102
 CAN_ID_TX_HEALTH = 0x103
 
 CAN_FRAME_TYPE_TELEMETRY = 0x51
+CAN_FRAME_TYPE_TELEMETRY_BATCH = 0x53
 CAN_FRAME_TYPE_COMMAND = 0xA0
 CAN_FRAME_TYPE_STATUS = 0xA1
 CAN_FRAME_TYPE_HEALTH = 0x52
@@ -63,7 +64,10 @@ STATUS_NAMES = {
 DEFAULT_SLCAN_TTY_BAUDRATE = 115200
 DEFAULT_SLCAN_OPEN_DELAY = 2.0
 DEFAULT_CAN_SEND_TIMEOUT_S = 0.2
-CAN_FD_DATA_BITRATE = 2000000
+CAN_FD_DATA_BITRATE = 5000000
+CAN_TELEMETRY_BATCH_FRAME_LEN = 64
+CAN_TELEMETRY_BATCH_MAX_RECORDS = 10
+CAN_TELEMETRY_RECORD_LEN = 6
 
 
 class Baudrate(Enum):
@@ -172,7 +176,7 @@ def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
     )
 
 
-def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
+def _parse_legacy_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
     if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
         return None
     if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) != 8:
@@ -188,6 +192,47 @@ def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
         strain_ue=strain_ue,
         stress_01mpa=stress_01mpa,
     )
+
+
+def parse_telemetry_frames(frame: CANFrame) -> Optional[List[TelemetryFrame]]:
+    legacy = _parse_legacy_telemetry_frame(frame)
+    if legacy is not None:
+        return [legacy]
+
+    if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
+        return None
+    if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) != CAN_TELEMETRY_BATCH_FRAME_LEN:
+        return None
+    if frame.data[0] != CAN_FRAME_TYPE_TELEMETRY_BATCH:
+        return None
+    record_count = frame.data[1]
+    if not 1 <= record_count <= CAN_TELEMETRY_BATCH_MAX_RECORDS:
+        return None
+    if frame.data[62] != 0 or crc8_xor(frame.data[:63]) != frame.data[63]:
+        return None
+
+    records = []
+    for index in range(record_count):
+        offset = 2 + index * CAN_TELEMETRY_RECORD_LEN
+        channel, voltage_001mv, strain_ue, stress_01mpa = struct.unpack(
+            ">Bhhb", frame.data[offset:offset + CAN_TELEMETRY_RECORD_LEN]
+        )
+        records.append(
+            TelemetryFrame(
+                channel=channel,
+                voltage_001mv=voltage_001mv,
+                strain_ue=strain_ue,
+                stress_01mpa=stress_01mpa,
+            )
+        )
+    return records
+
+
+def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
+    records = parse_telemetry_frames(frame)
+    if records is None or len(records) != 1:
+        return None
+    return records[0]
 
 
 def parse_health_frame(frame: CANFrame) -> Optional[HealthFrame]:

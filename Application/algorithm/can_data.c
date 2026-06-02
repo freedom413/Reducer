@@ -35,6 +35,42 @@ void can_build_telemetry_frame(can_tx_telemetry_frame_t *frame, uint8_t channel,
     frame->crc8 = can_calc_crc8((const uint8_t *)frame, 7);
 }
 
+void can_build_telemetry_record(can_tx_telemetry_record_t *record, uint8_t channel,
+                                int16_t voltage_001mv, int16_t strain_ue,
+                                int8_t stress_01mpa)
+{
+    record->channel = channel;
+    record->voltage_be[0] = (uint8_t)(((uint16_t)voltage_001mv >> 8) & 0xFF);
+    record->voltage_be[1] = (uint8_t)((uint16_t)voltage_001mv & 0xFF);
+    record->strain_be[0] = (uint8_t)(((uint16_t)strain_ue >> 8) & 0xFF);
+    record->strain_be[1] = (uint8_t)((uint16_t)strain_ue & 0xFF);
+    record->stress = stress_01mpa;
+}
+
+void can_build_telemetry_batch_frame(
+    can_tx_telemetry_batch_frame_t *frame,
+    const can_tx_telemetry_record_t *records,
+    uint8_t record_count)
+{
+    if (record_count > CAN_TELEMETRY_BATCH_MAX_RECORDS) {
+        record_count = CAN_TELEMETRY_BATCH_MAX_RECORDS;
+    }
+
+    frame->frame_type = CAN_FRAME_TYPE_TELEMETRY_BATCH;
+    frame->record_count = record_count;
+    for (uint8_t i = 0; i < CAN_TELEMETRY_BATCH_MAX_RECORDS; i++) {
+        if (i < record_count) {
+            frame->records[i] = records[i];
+        } else {
+            can_tx_telemetry_record_t empty = {0};
+            frame->records[i] = empty;
+        }
+    }
+    frame->reserved = 0U;
+    frame->crc8 = can_calc_crc8((const uint8_t *)frame,
+                                CAN_TELEMETRY_BATCH_FRAME_LEN - 1U);
+}
+
 void can_build_status_frame(can_tx_status_frame_t *frame, uint8_t sequence,
                             uint8_t cmd_type, uint8_t status, uint16_t value,
                             uint8_t detail)
