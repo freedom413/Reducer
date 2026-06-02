@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from threading import Lock
@@ -24,6 +25,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem,
 )
 from PyQt6.QtCore import QSignalBlocker, QTimer, pyqtSignal, QThread, Qt
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 
 # Plotting
 import pyqtgraph as pg
@@ -73,6 +75,52 @@ PLOT_VISIBLE_SAMPLES = 300
 PLOT_MIN_Y_RANGE_MV = 0.05
 DEFAULT_PLOT_REFRESH_HZ = 60
 COMMAND_ACK_TIMEOUT_S = 2.0
+DEFAULT_THEME = "dark"
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "reducer_monitor.svg"
+
+THEME_COLORS = {
+    "dark": {
+        "window_bg": "#101826",
+        "panel_bg": "#182436",
+        "panel_alt": "#223149",
+        "border": "#334761",
+        "text": "#e6eef8",
+        "strong_text": "#ffffff",
+        "muted_text": "#a8bdd3",
+        "input_bg": "#101826",
+        "accent": "#2f80d1",
+        "accent_hover": "#4895e2",
+        "disabled_bg": "#42536a",
+        "disabled_text": "#a8b4c2",
+        "selection_bg": "#315f91",
+        "plot_bg": "#080d15",
+        "plot_axis": "#b9c8d8",
+    },
+    "light": {
+        "window_bg": "#f4f7fb",
+        "panel_bg": "#ffffff",
+        "panel_alt": "#eaf1f8",
+        "border": "#d7e0ea",
+        "text": "#24415f",
+        "strong_text": "#17324d",
+        "muted_text": "#315b7d",
+        "input_bg": "#ffffff",
+        "accent": "#2878c8",
+        "accent_hover": "#1f68ae",
+        "disabled_bg": "#b8c6d4",
+        "disabled_text": "#ffffff",
+        "selection_bg": "#dcecff",
+        "plot_bg": "#080d15",
+        "plot_axis": "#b9c8d8",
+    },
+}
+
+HEALTH_ICON_COLORS = {
+    "waiting": "#e0a33a",
+    "ok": "#35b66a",
+    "warning": "#ed8b2c",
+    "error": "#e05252",
+}
 
 PLOT_METRICS = {
     "voltage": {
@@ -100,6 +148,104 @@ ADS1256_CYCLING_RATES = {
     15000: 3817, 30000: 4374,
 }
 
+
+def theme_stylesheet(theme: str) -> str:
+    colors = THEME_COLORS[theme]
+    return f"""
+        QMainWindow, QWidget#centralWidget {{
+            background: {colors["window_bg"]};
+        }}
+        QWidget {{
+            color: {colors["text"]};
+        }}
+        QGroupBox {{
+            background: {colors["panel_bg"]};
+            border: 1px solid {colors["border"]};
+            border-radius: 8px; margin-top: 10px; padding: 8px;
+            font-weight: 600;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin; left: 12px; padding: 0 4px;
+            color: {colors["text"]};
+        }}
+        QPushButton {{
+            background: {colors["accent"]}; color: white; border: 0;
+            border-radius: 5px; padding: 6px 12px;
+        }}
+        QPushButton:disabled {{
+            background: {colors["disabled_bg"]};
+            color: {colors["disabled_text"]};
+        }}
+        QPushButton:hover:!disabled {{
+            background: {colors["accent_hover"]};
+        }}
+        QComboBox, QSpinBox {{
+            background: {colors["input_bg"]}; color: {colors["text"]};
+            border: 1px solid {colors["border"]};
+            border-radius: 4px; padding: 4px 7px;
+        }}
+        QComboBox QAbstractItemView {{
+            background: {colors["panel_bg"]}; color: {colors["text"]};
+            selection-background-color: {colors["selection_bg"]};
+            selection-color: {colors["strong_text"]};
+        }}
+        QLineEdit {{
+            background: {colors["input_bg"]}; color: {colors["text"]};
+        }}
+        QLabel, QCheckBox {{
+            color: {colors["text"]};
+        }}
+        QTabWidget::pane {{
+            border: 1px solid {colors["border"]};
+            background: {colors["panel_bg"]};
+        }}
+        QTabBar::tab {{
+            background: {colors["panel_alt"]}; color: {colors["text"]};
+            border: 1px solid {colors["border"]}; padding: 7px 16px;
+        }}
+        QTabBar::tab:selected {{
+            background: {colors["panel_bg"]};
+            color: {colors["strong_text"]};
+        }}
+        QTableWidget {{
+            background: {colors["panel_bg"]}; color: {colors["text"]};
+            gridline-color: {colors["border"]};
+        }}
+        QHeaderView::section {{
+            background: {colors["panel_alt"]}; color: {colors["text"]};
+            border: 1px solid {colors["border"]}; padding: 4px;
+        }}
+        QStatusBar {{
+            background: {colors["panel_alt"]}; color: {colors["text"]};
+        }}
+        QToolTip {{
+            background: {colors["panel_bg"]}; color: {colors["text"]};
+            border: 1px solid {colors["border"]};
+        }}
+    """
+
+
+def apply_plot_theme(plot: pg.PlotWidget, theme: str) -> None:
+    colors = THEME_COLORS[theme]
+    plot.setBackground(colors["plot_bg"])
+    for axis_name in ("left", "bottom"):
+        axis = plot.getPlotItem().getAxis(axis_name)
+        axis.setPen(pg.mkPen(colors["plot_axis"]))
+        axis.setTextPen(pg.mkPen(colors["plot_axis"]))
+
+
+def status_icon_pixmap(state: str) -> QPixmap:
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(HEALTH_ICON_COLORS[state]))
+    painter.drawEllipse(2, 2, 10, 10)
+    painter.end()
+    return pixmap
+
+
 TRANSLATIONS = {
     "en": {
         "window_title": "Reducer Flexspline Monitor",
@@ -114,6 +260,9 @@ TRANSLATIONS = {
         "start_logging": "Start Logging",
         "stop_logging": "Stop Logging",
         "language": "Language:",
+        "theme": "Theme:",
+        "theme_dark": "Dark",
+        "theme_light": "Light",
         "waveforms": "Waveforms",
         "data_panel": "Data Panel",
         "auto_scale": "Auto Scale",
@@ -222,6 +371,9 @@ TRANSLATIONS = {
         "start_logging": "开始记录",
         "stop_logging": "停止记录",
         "language": "语言：",
+        "theme": "主题：",
+        "theme_dark": "暗黑",
+        "theme_light": "白色",
         "waveforms": "波形",
         "data_panel": "数据面板",
         "auto_scale": "自动缩放",
@@ -382,17 +534,22 @@ class OfflineWaveformWindow(QMainWindow):
         filename: str,
         waveform_buffers: List[List[float]],
         language: str = "en",
+        theme: str = DEFAULT_THEME,
     ):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.filename = filename
         self.waveform_buffers = waveform_buffers
         self.language = language
+        self.theme = theme
         self.maximized_plot_channel: Optional[int] = None
 
         self.setGeometry(140, 140, 1200, 800)
+        self.setStyleSheet(theme_stylesheet(self.theme))
 
         central_widget = QWidget()
+        central_widget.setObjectName("centralWidget")
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
 
@@ -413,6 +570,7 @@ class OfflineWaveformWindow(QMainWindow):
         self.plot_curves = []
         for channel in range(NUM_CHANNELS):
             plot = pg.PlotWidget()
+            apply_plot_theme(plot, self.theme)
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.disableAutoRange()
             plot.setXRange(0, 100, padding=0.0)
@@ -433,7 +591,9 @@ class OfflineWaveformWindow(QMainWindow):
         self._retranslate_ui()
 
     @classmethod
-    def from_csv(cls, filename: str, language: str = "en"):
+    def from_csv(
+        cls, filename: str, language: str = "en", theme: str = DEFAULT_THEME
+    ):
         waveform_buffers = [[] for _ in range(NUM_CHANNELS)]
         with open(filename, "r", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -446,10 +606,17 @@ class OfflineWaveformWindow(QMainWindow):
                 if 0 <= channel < NUM_CHANNELS:
                     waveform_buffers[channel].append(float(row["voltage_mv"]))
 
-        return cls(filename, waveform_buffers, language)
+        return cls(filename, waveform_buffers, language, theme)
 
     def set_language(self, language: str):
         self.language = language
+        self._retranslate_ui()
+
+    def set_theme(self, theme: str):
+        self.theme = theme
+        self.setStyleSheet(theme_stylesheet(theme))
+        for plot in self.plot_widgets:
+            apply_plot_theme(plot, theme)
         self._retranslate_ui()
 
     def _retranslate_ui(self):
@@ -459,7 +626,10 @@ class OfflineWaveformWindow(QMainWindow):
         )
         self.auto_scale_checkbox.setText(translate(self.language, "auto_scale"))
         for channel, plot in enumerate(self.plot_widgets):
-            plot.setTitle(translate(self.language, "plot_title", channel=channel))
+            plot.setTitle(
+                translate(self.language, "plot_title", channel=channel),
+                color=THEME_COLORS[self.theme]["plot_axis"],
+            )
             plot.setLabel("left", translate(self.language, "voltage"), units="mV")
             plot.setLabel("bottom", translate(self.language, "sample"))
             plot.setToolTip(translate(self.language, "plot_tooltip"))
@@ -540,6 +710,7 @@ class ReducerMonitorWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
 
         # CAN protocol
         self.can_bus: Optional[PythonCANInterface] = None
@@ -580,6 +751,7 @@ class ReducerMonitorWindow(QMainWindow):
         self.maximized_plot_panel: Optional[QWidget] = None
         self.last_sent_channel_mask: Optional[int] = None
         self.language = "en"
+        self.theme = DEFAULT_THEME
         self.sample_rate_sps = 100.0
         self._status_message = None
 
@@ -608,52 +780,10 @@ class ReducerMonitorWindow(QMainWindow):
         """Initialize the user interface"""
         self.setGeometry(100, 100, 1200, 800)
         self.setMinimumSize(1100, 720)
-        self.setStyleSheet("""
-            QMainWindow { background: #f4f7fb; }
-            QGroupBox {
-                background: white; border: 1px solid #d7e0ea;
-                border-radius: 8px; margin-top: 10px; padding: 8px;
-                font-weight: 600;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; left: 12px; padding: 0 4px;
-                color: #24415f;
-            }
-            QPushButton {
-                background: #2878c8; color: white; border: 0;
-                border-radius: 5px; padding: 6px 12px;
-            }
-            QPushButton:disabled { background: #b8c6d4; }
-            QPushButton:hover:!disabled { background: #1f68ae; }
-            QComboBox, QSpinBox {
-                background: white; color: #24415f; border: 1px solid #b8c6d4;
-                border-radius: 4px; padding: 4px 7px;
-            }
-            QComboBox QAbstractItemView {
-                background: white; color: #24415f;
-                selection-background-color: #dcecff;
-                selection-color: #17324d;
-            }
-            QLineEdit { background: white; color: #24415f; }
-            QLabel, QCheckBox { color: #24415f; }
-            QTabWidget::pane { border: 1px solid #d7e0ea; background: white; }
-            QTabBar::tab {
-                background: #eaf1f8; color: #24415f;
-                border: 1px solid #d7e0ea; padding: 7px 16px;
-            }
-            QTabBar::tab:selected { background: white; color: #17324d; }
-            QTableWidget {
-                background: white; color: #24415f;
-                gridline-color: #d7e0ea;
-            }
-            QHeaderView::section {
-                background: #eaf1f8; color: #24415f;
-                border: 1px solid #d7e0ea; padding: 4px;
-            }
-            QStatusBar { background: #eaf1f8; color: #24415f; }
-        """)
+        self.setStyleSheet(theme_stylesheet(self.theme))
 
         central_widget = QWidget()
+        central_widget.setObjectName("centralWidget")
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout(central_widget)
@@ -665,9 +795,6 @@ class ReducerMonitorWindow(QMainWindow):
         # Command group
         self.cmd_group = self._create_command_group()
         main_layout.addWidget(self.cmd_group)
-
-        self.health_group = self._create_health_group()
-        main_layout.addWidget(self.health_group)
 
         # Tab widget for waveforms and data
         self.tabs = QTabWidget()
@@ -685,6 +812,11 @@ class ReducerMonitorWindow(QMainWindow):
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        self.health_icon_label = QLabel()
+        self.health_icon_label.setFixedSize(16, 16)
+        self.health_summary_label = QLabel()
+        self.status_bar.addPermanentWidget(self.health_icon_label)
+        self.status_bar.addPermanentWidget(self.health_summary_label)
         self._retranslate_ui()
         self._show_status("disconnected")
 
@@ -732,6 +864,14 @@ class ReducerMonitorWindow(QMainWindow):
         self.log_btn.clicked.connect(self.on_log_clicked)
         self.log_btn.setEnabled(False)
         layout.addWidget(self.log_btn)
+
+        self.theme_label = QLabel()
+        layout.addWidget(self.theme_label)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("", "dark")
+        self.theme_combo.addItem("", "light")
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        layout.addWidget(self.theme_combo)
 
         self.language_label = QLabel()
         layout.addWidget(self.language_label)
@@ -856,6 +996,32 @@ class ReducerMonitorWindow(QMainWindow):
         for window in self.offline_waveform_windows:
             window.set_language(self.language)
 
+    def _on_theme_changed(self, _index: int):
+        theme = self.theme_combo.currentData()
+        if theme is None:
+            return
+
+        self._apply_theme(str(theme))
+        for window in self.offline_waveform_windows:
+            window.set_theme(self.theme)
+
+    def _apply_theme(self, theme: str):
+        self.theme = theme
+        colors = THEME_COLORS[theme]
+        self.setStyleSheet(theme_stylesheet(theme))
+        if hasattr(self, "stream_summary_label"):
+            self.stream_summary_label.setStyleSheet(
+                f"color: {colors['muted_text']}; font-weight: 600;"
+            )
+        if hasattr(self, "health_summary_label"):
+            self.health_summary_label.setStyleSheet(
+                f"color: {colors['muted_text']};"
+            )
+        for plot_index, plot in enumerate(getattr(self, "plot_widgets", [])):
+            apply_plot_theme(plot, theme)
+            self._update_plot_presentation(plot_index)
+        self._refresh_health_panel(update_rx_rate=False)
+
     def _retranslate_ui(self):
         self.setWindowTitle(self._tr("window_title"))
         self.conn_group.setTitle(self._tr("can_connection"))
@@ -869,6 +1035,13 @@ class ReducerMonitorWindow(QMainWindow):
         self.log_btn.setText(
             self._tr("stop_logging") if self.logging_enabled else self._tr("start_logging")
         )
+        self.theme_label.setText(self._tr("theme"))
+        self.theme_combo.setItemText(
+            self.theme_combo.findData("dark"), self._tr("theme_dark")
+        )
+        self.theme_combo.setItemText(
+            self.theme_combo.findData("light"), self._tr("theme_light")
+        )
         self.language_label.setText(self._tr("language"))
 
         self.cmd_group.setTitle(self._tr("commands"))
@@ -879,7 +1052,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.clear_zero_btn.setText(self._tr("clear_zero"))
         self.sample_rate_label.setText(self._tr("sample_rate"))
         self.filter_size_label.setText(self._tr("filter_size"))
-        self.health_group.setTitle(self._tr("health"))
         self._refresh_health_panel(update_rx_rate=False)
         self._update_stream_summary()
 
@@ -1112,6 +1284,7 @@ class ReducerMonitorWindow(QMainWindow):
         panel_layout.addLayout(header)
 
         plot = pg.PlotWidget()
+        apply_plot_theme(plot, self.theme)
         plot.showGrid(x=True, y=True, alpha=0.3)
         plot.disableAutoRange()
         plot.setXRange(0, 100, padding=0.0)
@@ -1242,7 +1415,10 @@ class ReducerMonitorWindow(QMainWindow):
     def _update_plot_presentation(self, plot_index: int):
         channel = self.plot_channels[plot_index]
         plot = self.plot_widgets[plot_index]
-        plot.setTitle(self._tr("plot_title", channel=channel))
+        plot.setTitle(
+            self._tr("plot_title", channel=channel),
+            color=THEME_COLORS[self.theme]["plot_axis"],
+        )
         selected_metrics = self._selected_plot_metrics(plot_index)
         if len(selected_metrics) == 1:
             config = PLOT_METRICS[selected_metrics[0]]
@@ -1342,7 +1518,9 @@ class ReducerMonitorWindow(QMainWindow):
         )
         if filename:
             try:
-                window = OfflineWaveformWindow.from_csv(filename, self.language)
+                window = OfflineWaveformWindow.from_csv(
+                    filename, self.language, self.theme
+                )
             except Exception as exc:
                 QMessageBox.critical(
                     self, self._tr("error"), self._tr("failed_import_csv", error=exc)
@@ -1604,19 +1782,11 @@ class ReducerMonitorWindow(QMainWindow):
         layout.addLayout(controls)
 
         self.stream_summary_label = QLabel()
-        self.stream_summary_label.setStyleSheet("color: #315b7d; font-weight: 600;")
+        self.stream_summary_label.setStyleSheet(
+            f"color: {THEME_COLORS[self.theme]['muted_text']}; font-weight: 600;"
+        )
         layout.addWidget(self.stream_summary_label)
 
-        group.setLayout(layout)
-        return group
-
-    def _create_health_group(self) -> QGroupBox:
-        group = QGroupBox()
-        layout = QHBoxLayout()
-        self.health_summary_label = QLabel()
-        self.health_summary_label.setStyleSheet("color: #315b7d;")
-        layout.addWidget(self.health_summary_label)
-        layout.addStretch()
         group.setLayout(layout)
         return group
 
@@ -1631,16 +1801,27 @@ class ReducerMonitorWindow(QMainWindow):
 
         health = self.latest_health
         if health is None:
-            self.health_summary_label.setText(
+            self._set_health_status(
+                "waiting",
                 self._tr(
                     "health_waiting",
                     rx_rate=self.rx_telemetry_rate_hz,
                     bad=self.rx_bad_protocol_count,
-                )
+                ),
             )
             return
 
-        self.health_summary_label.setText(
+        counters = (
+            health.tx_drop_count,
+            health.adc_overflow_count,
+            health.adc_recovery_count,
+            self.rx_bad_protocol_count,
+        )
+        state = "ok" if health.adc_running and not any(counters) else "warning"
+        if not health.adc_running:
+            state = "error"
+        self._set_health_status(
+            state,
             self._tr(
                 "health_summary",
                 adc_state=self._tr(
@@ -1653,8 +1834,14 @@ class ReducerMonitorWindow(QMainWindow):
                 overflow=health.adc_overflow_count,
                 recovery=health.adc_recovery_count,
                 bad=self.rx_bad_protocol_count,
-            )
+            ),
         )
+
+    def _set_health_status(self, state: str, text: str):
+        self.health_icon_label.setPixmap(status_icon_pixmap(state))
+        self.health_icon_label.setToolTip(text)
+        self.health_summary_label.setText(text)
+        self.health_summary_label.setToolTip(text)
 
     def connect(self):
         """Connect to the CAN adapter"""
@@ -2024,6 +2211,7 @@ class ReducerMonitorWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
 
     # Set application info
     app.setApplicationName("Reducer Flexspline Monitor")
