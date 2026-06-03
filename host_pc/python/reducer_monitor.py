@@ -81,21 +81,21 @@ APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "reducer_monitor.sv
 
 THEME_COLORS = {
     "dark": {
-        "window_bg": "#101826",
-        "panel_bg": "#182436",
-        "panel_alt": "#223149",
-        "border": "#334761",
-        "text": "#e6eef8",
+        "window_bg": "#1e1e1e",
+        "panel_bg": "#252526",
+        "panel_alt": "#2d2d30",
+        "border": "#3c3c3c",
+        "text": "#cccccc",
         "strong_text": "#ffffff",
-        "muted_text": "#a8bdd3",
-        "input_bg": "#101826",
-        "accent": "#2f80d1",
-        "accent_hover": "#4895e2",
-        "disabled_bg": "#42536a",
-        "disabled_text": "#a8b4c2",
-        "selection_bg": "#315f91",
-        "plot_bg": "#080d15",
-        "plot_axis": "#b9c8d8",
+        "muted_text": "#969696",
+        "input_bg": "#1f1f1f",
+        "accent": "#0e639c",
+        "accent_hover": "#1177bb",
+        "disabled_bg": "#3a3d41",
+        "disabled_text": "#858585",
+        "selection_bg": "#264f78",
+        "plot_bg": "#1e1e1e",
+        "plot_axis": "#cccccc",
     },
 }
 
@@ -109,15 +109,15 @@ HEALTH_ICON_COLORS = {
 PLOT_METRICS = {
     "voltage": {
         "label_key": "voltage_mv", "axis_key": "voltage",
-        "color": "#1f77b4", "units": "mV",
+        "color": "#569cd6", "units": "mV",
     },
     "strain": {
         "label_key": "strain_ue", "axis_key": "strain",
-        "color": "#ff7f0e", "units": "ue",
+        "color": "#d7ba7d", "units": "ue",
     },
     "stress": {
         "label_key": "stress_mpa", "axis_key": "stress",
-        "color": "#d62728", "units": "MPa",
+        "color": "#f44747", "units": "MPa",
     },
 }
 
@@ -145,7 +145,7 @@ def theme_stylesheet(theme: str) -> str:
         QGroupBox {{
             background: {colors["panel_bg"]};
             border: 1px solid {colors["border"]};
-            border-radius: 8px; margin-top: 10px; padding: 8px;
+            border-radius: 4px; margin-top: 10px; padding: 8px;
             font-weight: 600;
         }}
         QGroupBox::title {{
@@ -154,7 +154,7 @@ def theme_stylesheet(theme: str) -> str:
         }}
         QPushButton {{
             background: {colors["accent"]}; color: white; border: 0;
-            border-radius: 5px; padding: 6px 12px;
+            border-radius: 2px; padding: 6px 12px;
         }}
         QPushButton:disabled {{
             background: {colors["disabled_bg"]};
@@ -166,7 +166,7 @@ def theme_stylesheet(theme: str) -> str:
         QComboBox, QSpinBox {{
             background: {colors["input_bg"]}; color: {colors["text"]};
             border: 1px solid {colors["border"]};
-            border-radius: 4px; padding: 4px 7px;
+            border-radius: 2px; padding: 4px 7px;
         }}
         QComboBox QAbstractItemView {{
             background: {colors["panel_bg"]}; color: {colors["text"]};
@@ -228,8 +228,8 @@ def apply_plot_theme(plot: pg.PlotWidget, theme: str) -> None:
 
 def curve_color_button_stylesheet(color: str) -> str:
     return (
-        f"background: {color}; border: 1px solid #b9c8d8; "
-        "border-radius: 3px; padding: 0px;"
+        f"background: {color}; border: 1px solid #6a6a6a; "
+        "border-radius: 2px; padding: 0px;"
     )
 
 
@@ -237,7 +237,7 @@ def create_plot_hover_items(plot: pg.PlotWidget) -> dict[str, object]:
     line = pg.InfiniteLine(
         angle=90,
         movable=False,
-        pen=pg.mkPen("#6f8fab", width=1, style=Qt.PenStyle.DashLine),
+        pen=pg.mkPen("#6a6a6a", width=1, style=Qt.PenStyle.DashLine),
     )
     marker = pg.ScatterPlotItem(
         size=9,
@@ -247,7 +247,7 @@ def create_plot_hover_items(plot: pg.PlotWidget) -> dict[str, object]:
     label = pg.TextItem(
         anchor=(0, 1),
         color=THEME_COLORS[DEFAULT_THEME]["text"],
-        fill=pg.mkBrush(24, 36, 54, 235),
+        fill=pg.mkBrush(37, 37, 38, 235),
         border=pg.mkPen(THEME_COLORS[DEFAULT_THEME]["border"]),
     )
     for item in (line, marker, label):
@@ -659,7 +659,7 @@ class OfflineWaveformWindow(QMainWindow):
 
     @staticmethod
     def _get_channel_color(channel: int) -> str:
-        colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+        colors = ["#569cd6", "#d7ba7d", "#6a9955", "#c586c0", "#4ec9b0", "#ce9178"]
         return colors[channel % len(colors)]
 
     def _on_plot_mouse_clicked(self, channel: int, event):
@@ -816,7 +816,7 @@ class ReducerMonitorWindow(QMainWindow):
         self.maximized_plot_channel: Optional[int] = None
         self.maximized_plot_panel: Optional[QWidget] = None
         self.last_sent_channel_mask: Optional[int] = None
-        self.language = "en"
+        self.language = "zh"
         self.theme = DEFAULT_THEME
         self.sample_rate_sps = 100.0
         self._status_message = None
@@ -937,6 +937,9 @@ class ReducerMonitorWindow(QMainWindow):
         self.language_combo = QComboBox()
         self.language_combo.addItem("English", "en")
         self.language_combo.addItem("中文", "zh")
+        language_index = self.language_combo.findData(self.language)
+        if language_index >= 0:
+            self.language_combo.setCurrentIndex(language_index)
         self.language_combo.currentIndexChanged.connect(self._on_language_changed)
         layout.addWidget(self.language_combo)
 
@@ -1251,7 +1254,7 @@ class ReducerMonitorWindow(QMainWindow):
 
     def _get_channel_color(self, ch: int) -> str:
         """Get a unique color for each channel"""
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+        colors = ['#569cd6', '#d7ba7d', '#6a9955', '#c586c0', '#4ec9b0', '#ce9178']
         return colors[ch % len(colors)]
 
     @staticmethod
@@ -1490,9 +1493,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_metric_color_buttons[plot_index][metric].setStyleSheet(
             curve_color_button_stylesheet(normalized)
         )
-        self.plot_metric_checkboxes[plot_index][metric].setStyleSheet(
-            f"color: {normalized};"
-        )
 
     def _on_plot_mouse_moved(self, plot: pg.PlotWidget, scene_pos):
         if plot not in self.plot_widgets:
@@ -1583,7 +1583,9 @@ class ReducerMonitorWindow(QMainWindow):
             color = self.plot_metric_colors[plot_index][metric]
             checkbox.setText(self._tr(config["label_key"]))
             checkbox.setToolTip(self._tr("plot_metrics_tooltip"))
-            checkbox.setStyleSheet(f"color: {color};")
+            checkbox.setStyleSheet(
+                f"color: {THEME_COLORS[self.theme]['text']};"
+            )
             color_button = self.plot_metric_color_buttons[plot_index][metric]
             color_button.setStyleSheet(curve_color_button_stylesheet(color))
             color_button.setToolTip(self._tr("plot_metrics_tooltip"))
