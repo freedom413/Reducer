@@ -389,6 +389,11 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.close()
         self.window.deleteLater()
 
+    def _switch_to_english(self):
+        self.window.language_combo.setCurrentIndex(
+            self.window.language_combo.findData("en")
+        )
+
     def test_available_channel_count(self):
         self.assertEqual(len(self.window.channel_data), NUM_CHANNELS)
 
@@ -401,9 +406,15 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertEqual(self.window.theme, "dark")
         self.assertFalse(hasattr(self.window, "theme_combo"))
-        self.assertIn("background: #101826", stylesheet)
+        self.assertIn("background: #1e1e1e", stylesheet)
         self.assertNotIn("background: #f4f7fb", stylesheet)
         self.assertFalse(self.window.windowIcon().isNull())
+
+    def test_chinese_language_is_default(self):
+        self.assertEqual(self.window.language, "zh")
+        self.assertEqual(self.window.language_combo.currentData(), "zh")
+        self.assertEqual(self.window.windowTitle(), "减速器柔轮监视器")
+        self.assertEqual(self.window.tabs.tabText(0), "波形")
 
     def test_empty_waveform_plots_have_consistent_initial_ranges(self):
         for plot in self.window.plot_widgets:
@@ -415,7 +426,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
     def test_stream_summary_has_its_own_command_row(self):
         self.assertEqual(self.window.cmd_group.layout().count(), 2)
-        self.assertIn("decimation x1", self.window.stream_summary_label.text())
+        self.assertIn("抽取 x1", self.window.stream_summary_label.text())
 
     def test_waveform_plot_defaults_to_voltage_curve(self):
         checkboxes = self.window.plot_metric_checkboxes[0]
@@ -467,7 +478,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         hover_items = self.window.plot_hover_items[0]
         self.assertTrue(hover_items["label"].isVisible())
-        self.assertIn("Sample: 0", hover_items["label"].toPlainText())
+        self.assertIn(": 0", hover_items["label"].toPlainText())
         self.assertIn("12.500 mV", hover_items["label"].toPlainText())
 
         self.window.eventFilter(plot, QEvent(QEvent.Type.Leave))
@@ -583,6 +594,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(self.window.channel_data[0].voltage_mv, 0.0)
 
     def test_status_frame_updates_status_bar(self):
+        self._switch_to_english()
         self.window.pending_commands[7] = "Set Filter Size"
         frame = CANFrame(
             id=CAN_ID_TX_STATUS,
@@ -594,6 +606,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(self.window.status_bar.currentMessage(), "Set Filter Size acknowledged (value=32)")
 
     def test_rejected_status_frame_updates_status_bar(self):
+        self._switch_to_english()
         self.window.pending_commands[5] = "Set Filter Size"
         frame = CANFrame(
             id=CAN_ID_TX_STATUS,
@@ -611,6 +624,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertIn("rejected", self.window.status_bar.currentMessage())
 
     def test_storage_error_status_updates_status_bar(self):
+        self._switch_to_english()
         self.window.pending_commands[8] = "Save Zero"
         frame = CANFrame(
             id=CAN_ID_TX_STATUS,
@@ -645,6 +659,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
             "command_acknowledged", command="Set Filter Size", value=32
         )
 
+        self._switch_to_english()
         self.window.language_combo.setCurrentIndex(
             self.window.language_combo.findData("zh")
         )
@@ -733,6 +748,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(self.window._telemetry_decimation(30000), 1)
 
     def test_health_frame_updates_system_health_panel(self):
+        self._switch_to_english()
         self.window.on_can_frame_received(
             CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_payload())
         )
@@ -747,6 +763,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         )
 
     def test_health_summary_is_in_status_bar_with_waiting_icon(self):
+        self._switch_to_english()
         self.assertIs(self.window.health_summary_label.parent(), self.window.status_bar)
         self.assertFalse(hasattr(self.window, "health_group"))
         self.assertFalse(self.window.health_icon_label.pixmap().isNull())
