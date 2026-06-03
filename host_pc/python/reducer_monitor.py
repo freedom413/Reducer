@@ -905,7 +905,7 @@ class ReducerMonitorWindow(QMainWindow):
         self.channel_combo.setEditable(True)
         layout.addWidget(self.channel_combo)
 
-        # MCU firmware uses fixed 1M nominal and 5M data-phase bitrates.
+        # MCU firmware uses fixed 1M nominal and 2M data-phase bitrates.
         self.can_baud_label = QLabel()
         layout.addWidget(self.can_baud_label)
         self.can_baud_value = QLabel(
