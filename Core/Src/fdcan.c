@@ -23,6 +23,9 @@
 /* USER CODE BEGIN 0 */
 #include "can_data.h"
 
+#define FDCAN1_DATA_TDC_OFFSET_TQ 15U
+#define FDCAN1_DATA_TDC_FILTER_TQ 0U
+
 /* USER CODE END 0 */
 
 FDCAN_HandleTypeDef hfdcan1;
@@ -61,6 +64,20 @@ void MX_FDCAN1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN FDCAN1_Init 2 */
+
+  /*
+   * CAN FD data phase runs at 5 Mbit/s. Enable transmitter delay
+   * compensation so the secondary sample point follows the transceiver delay.
+   */
+  if (HAL_FDCAN_ConfigTxDelayCompensation(&hfdcan1,
+                                          FDCAN1_DATA_TDC_OFFSET_TQ,
+                                          FDCAN1_DATA_TDC_FILTER_TQ) != HAL_OK) {
+    Error_Handler();
+  }
+
+  if (HAL_FDCAN_EnableTxDelayCompensation(&hfdcan1) != HAL_OK) {
+    Error_Handler();
+  }
 
   /* Configure filter to accept only CAN_ID_RX_COMMAND (0x100) */
   FDCAN_FilterTypeDef sFilterConfig;

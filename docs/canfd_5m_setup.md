@@ -16,6 +16,19 @@ The STM32G431 FDCAN kernel clock is `170 MHz`. Firmware timing is:
 | Nominal | 10 | 14 | 2 | 1 | 1 Mbit/s |
 | Data | 2 | 14 | 2 | 1 | 5 Mbit/s |
 
+The 5 Mbit/s data phase also enables FDCAN transmitter delay compensation:
+
+| Setting | Value |
+|---|---:|
+| TDC offset | 15 data time quanta |
+| TDC filter | 0 data time quanta |
+
+With the current data timing, one data time quantum is about `11.76 ns`; the
+offset places the secondary sample point near the configured data sample point.
+If a specific transceiver/cable setup still reports data-phase protocol errors,
+verify the physical layer first and then tune this offset with a scope or bus
+analyzer.
+
 ## Hardware
 
 Use a CAN FD-capable transceiver on the MCU board and a CAN FD-capable PC
