@@ -72,7 +72,7 @@ for explicit zero-storage commands.
 
 ## CAN FD Protocol
 
-All business frames use standard 11-bit IDs, CAN FD+BRS, `1M / 5M`, and an XOR
+All business frames use standard 11-bit IDs, CAN FD+BRS, `1M / 2M`, and an XOR
 checksum.
 
 | Direction | ID | Type | Length | Purpose |

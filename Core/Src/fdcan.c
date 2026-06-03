@@ -52,7 +52,7 @@ void MX_FDCAN1_Init(void)
   hfdcan1.Init.NominalSyncJumpWidth = 1;
   hfdcan1.Init.NominalTimeSeg1 = 14;
   hfdcan1.Init.NominalTimeSeg2 = 2;
-  hfdcan1.Init.DataPrescaler = 2;
+  hfdcan1.Init.DataPrescaler = 5;
   hfdcan1.Init.DataSyncJumpWidth = 1;
   hfdcan1.Init.DataTimeSeg1 = 14;
   hfdcan1.Init.DataTimeSeg2 = 2;
@@ -66,7 +66,7 @@ void MX_FDCAN1_Init(void)
   /* USER CODE BEGIN FDCAN1_Init 2 */
 
   /*
-   * CAN FD data phase runs at 5 Mbit/s. Enable transmitter delay
+   * CAN FD data phase runs at 2 Mbit/s. Enable transmitter delay
    * compensation so the secondary sample point follows the transceiver delay.
    */
   if (HAL_FDCAN_ConfigTxDelayCompensation(&hfdcan1,

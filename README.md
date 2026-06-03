@@ -5,19 +5,19 @@ STM32G431 + 双 ADS1256 的 8 通道柔轮状态采集系统。固件负责采�
 本分支统一使用 CAN FD+BRS：
 
 - 仲裁段：`1 Mbit/s`
-- 数据段：`5 Mbit/s`
+- 数据段：`2 Mbit/s`
 - 推荐适配器：CANable 2.0 官方 SLCAN FD 固件
 - CANable 2.0 使用 USB CDC 虚拟串口，主机设置的串口波特率不会限制 USB 吞吐。
-- 配置说明：[docs/canfd_5m_setup.md](docs/canfd_5m_setup.md)
+- 配置说明：[docs/canfd_2m_setup.md](docs/canfd_2m_setup.md)
 
 ## 当前能力
 
 - 双 ADS1256，每片 4 个差分输入，共 8 个逻辑通道。
 - 支持 ADS1256 全部采样档位：`2.5/5/10/15/25/30/50/60/100/500/1000/2000/3750/7500/15000/30000 SPS`。
-- SPI1 为 `2.65625 Mbit/s`，低于 ADS1256 在 `7.68 MHz` 晶振下的 SCLK 上限。
+- SPI1 为 `2.65622 Mbit/s`，低于 ADS1256 在 `7.68 MHz` 晶振下的 SCLK 上限。
 - MCU 对每个采样值执行滤波和物理量换算，仅对外发遥测自动抽取，避免高速档位压满链路。
 - MCU 每秒发送健康帧，上报采样率、抽取倍数、CAN TX 丢弃、ADC 缓冲区溢出、自动恢复次数和运行状态。
-- 上位机使用官方 `python-can` SLCAN FD 扩展，支持 CANable 2.0 的 `S8`、`Y5` 和 FD+BRS `b` 帧。
+- 上位机使用官方 `python-can` SLCAN FD 扩展，支持 CANable 2.0 的 `S8`、`Y2` 和 FD+BRS `b` 帧。
 - GUI 支持最多 8 张动态图表、指标叠加、通道订阅、设备健康、ACK、CSV 记录和离线 CSV 回放。
 
 ## 目录结构
@@ -35,7 +35,7 @@ BSP/
   can.*                          FDCAN 收发封装
 Core/                            STM32CubeMX 生成代码
 docs/
-  canfd_5m_setup.md              CAN FD 部署和联调说明
+  canfd_2m_setup.md              CAN FD 部署和联调说明
   user_application_flow.md       应用层流程英文说明
   user_application_flow_zh.md    应用层流程中文说明
 host_pc/python/
@@ -79,7 +79,7 @@ python -m venv .venv
 .venv\Scripts\python host_pc\python\reducer_monitor.py
 ```
 
-GUI 中选择 `CANable 2.0 SLCAN FD` 和对应 `COMx`。CAN 波特率固定为 `1M / 5M FD+BRS`。
+GUI 中选择 `CANable 2.0 SLCAN FD` 和对应 `COMx`。CAN 波特率固定为 `1M / 2M FD+BRS`。
 
 ## 联调顺序
 
