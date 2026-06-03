@@ -321,7 +321,7 @@ class TestProtocolHelpers(unittest.TestCase):
             bus.shutdown()
 
         serial_writes = [call.args[0] for call in serial_port.write.call_args_list]
-        self.assertEqual(serial_writes[:4], [b"C\r", b"S8\r", b"Y5\r", b"O\r"])
+        self.assertEqual(serial_writes[:4], [b"C\r", b"S8\r", b"Y2\r", b"O\r"])
         self.assertIn(b"b1008A001020304050607\r", serial_writes)
         self.assertIn(b"b101F" + batch_data.hex().upper().encode() + b"\r", serial_writes)
 
@@ -799,14 +799,14 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertFalse(self.window.channel_combo.isEnabled())
         self.assertFalse(hasattr(self.window, "serial_baud_combo"))
         self.assertFalse(hasattr(self.window, "baud_combo"))
-        self.assertEqual(self.window.can_baud_value.text(), "1M / 5M FD+BRS")
+        self.assertEqual(self.window.can_baud_value.text(), "1M / 2M FD+BRS")
         self.assertFalse(self.window.refresh_btn.isEnabled())
         self.assertTrue(self.window.language_combo.isEnabled())
 
     def test_can_bitrate_is_fixed_to_match_mcu_firmware(self):
         self.assertEqual(FIXED_CAN_BITRATE, Baudrate.BAUD_1M)
         self.assertFalse(hasattr(self.window, "baud_combo"))
-        self.assertEqual(self.window.can_baud_value.text(), "1M / 5M FD+BRS")
+        self.assertEqual(self.window.can_baud_value.text(), "1M / 2M FD+BRS")
 
     def test_command_fails_when_disconnected(self):
         self.window.is_connected = False
