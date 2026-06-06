@@ -19,6 +19,9 @@ from PyQt6.QtCore import QEvent, QPointF
 
 from can_protocol import (
     CANFrame,
+    ConfigFrame,
+    CAN_FRAME_TYPE_TELEMETRY_PHYSICAL_BATCH,
+    CAN_FRAME_TYPE_TELEMETRY_RAW_BATCH,
     CAN_FRAME_TYPE_STATUS,
     CAN_FRAME_TYPE_TELEMETRY,
     CAN_FRAME_TYPE_TELEMETRY_BATCH,
@@ -26,14 +29,18 @@ from can_protocol import (
     CAN_HEALTH_VERSION,
     CAN_ID_RX_COMMAND,
     CAN_ID_TX_HEALTH,
+    CAN_ID_TX_CONFIG,
     CAN_ID_TX_STATUS,
     CAN_ID_TX_TELEMETRY,
     CAN_STATUS_BAD_VALUE,
     CAN_STATUS_OK,
     CAN_STATUS_STORAGE_ERROR,
     CAN_FD_DATA_BITRATE,
+    CAN_PROTOCOL_VERSION,
     DEFAULT_CAN_SEND_TIMEOUT_S,
     DEFAULT_SLCAN_TTY_BAUDRATE,
+    TELEMETRY_MODE_PHYSICAL,
+    TELEMETRY_MODE_RAW,
     Baudrate,
     PythonCANInterface,
     _PythonCanListener,
@@ -45,14 +52,17 @@ from can_protocol import (
     parse_telemetry_frame,
     parse_telemetry_frames,
     parse_health_frame,
+    parse_config_frame,
 )
 from reducer_monitor import (
+    CANReceiver,
     CAN_CMD_CLEAR_ZERO,
     CAN_CMD_LOAD_ZERO,
     CAN_CMD_SAVE_ZERO,
     CAN_CMD_SET_CHANNEL_MASK,
     CAN_CMD_SET_SAMPLE_RATE,
     CAN_CMD_SET_FILTER_SIZE,
+    CAN_CMD_SET_TELEMETRY_MODE,
     CAN_CMD_START_CALIB,
     CAN_CMD_ZERO_DATUM,
     DEFAULT_VISIBLE_PLOTS,
@@ -127,7 +137,126 @@ def build_health_payload(
     return payload + bytes([crc8_xor(payload)])
 
 
+def build_raw_v2_payload(records, sequence: int = 0x42, drop_delta: int = 3) -> bytes:
+    payload = bytearray(64)
+    payload[0] = CAN_FRAME_TYPE_TELEMETRY_RAW_BATCH
+    payload[1] = CAN_PROTOCOL_VERSION
+    payload[2] = TELEMETRY_MODE_RAW
+    payload[3] = sequence
+    payload[4] = len(records)
+    payload[5:7] = drop_delta.to_bytes(2, "little")
+    for index, (channel, raw_value) in enumerate(records):
+        offset = 8 + index * 4
+        payload[offset] = channel & 0xFF
+        payload[offset + 1:offset + 4] = int(raw_value).to_bytes(3, "big", signed=True)
+    return bytes(payload)
+
+
+def build_physical_v2_payload(records, sequence: int = 0x43, drop_delta: int = 4) -> bytes:
+    payload = bytearray(64)
+    payload[0] = CAN_FRAME_TYPE_TELEMETRY_PHYSICAL_BATCH
+    payload[1] = CAN_PROTOCOL_VERSION
+    payload[2] = TELEMETRY_MODE_PHYSICAL
+    payload[3] = sequence
+    payload[4] = len(records)
+    payload[5:7] = drop_delta.to_bytes(2, "little")
+    for index, (channel, voltage_001mv, strain_ue, stress_01mpa) in enumerate(records):
+        struct.pack_into(
+            ">Bihh", payload, 8 + index * 9,
+            channel, voltage_001mv * 10, strain_ue, round(stress_01mpa / 2.5),
+        )
+    return bytes(payload)
+
+
+def build_config_v3_payload() -> bytes:
+    payload = bytearray(64)
+    payload[0] = 0x56
+    payload[1] = CAN_PROTOCOL_VERSION
+    payload[2] = 0x03
+    payload[3] = 16
+    payload[4] = 7
+    payload[5] = TELEMETRY_MODE_RAW
+    payload[6:8] = (0x000F).to_bytes(2, "little")
+    payload[8:12] = (10000).to_bytes(4, "little")
+    payload[12:16] = (2498500).to_bytes(4, "little")
+    payload[16:20] = (42).to_bytes(4, "little")
+    for channel in range(8):
+        payload[20 + channel * 4:24 + channel * 4] = (
+            channel * -100
+        ).to_bytes(4, "little", signed=True)
+    return bytes(payload)
+
+
+def build_health_v2_payload(
+    sample_rate_x10: int = 300000,
+    tx_drop: int = 4,
+    overflow: int = 5,
+    recovery: int = 6,
+    telemetry_samples_per_second: int = 8748,
+    telemetry_frames_per_second: int = 625,
+    active_adc_count: int = 2,
+    mode: int = TELEMETRY_MODE_RAW,
+    running: bool = True,
+) -> bytes:
+    payload = bytearray(24)
+    payload[0] = CAN_FRAME_TYPE_HEALTH
+    payload[1] = CAN_PROTOCOL_VERSION
+    payload[2:6] = sample_rate_x10.to_bytes(4, "little")
+    payload[6:8] = tx_drop.to_bytes(2, "little")
+    payload[8:10] = overflow.to_bytes(2, "little")
+    payload[10:12] = recovery.to_bytes(2, "little")
+    payload[12:14] = telemetry_samples_per_second.to_bytes(2, "little")
+    payload[14:16] = telemetry_frames_per_second.to_bytes(2, "little")
+    payload[16] = active_adc_count
+    payload[17] = mode
+    payload[18] = 1 if running else 0
+    return bytes(payload)
+
+
 class TestProtocolHelpers(unittest.TestCase):
+    def test_v3_command_and_status_use_uint32_value(self):
+        frame = build_command_frame(
+            sequence=0x12, cmd_type=0x0B, param=0, value=2_498_500
+        )
+        self.assertEqual(len(frame.data), 12)
+        self.assertEqual(int.from_bytes(frame.data[6:10], "little"), 2_498_500)
+
+        payload = bytearray(12)
+        payload[0:6] = bytes([
+            CAN_FRAME_TYPE_STATUS, CAN_PROTOCOL_VERSION, 0x12, 0x0B,
+            CAN_STATUS_OK, 0,
+        ])
+        payload[6:10] = (2_498_500).to_bytes(4, "little")
+        parsed = parse_status_frame(CANFrame(id=CAN_ID_TX_STATUS, data=bytes(payload)))
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.value, 2_498_500)
+
+    def test_parse_v3_physical_telemetry_uses_wide_units(self):
+        payload = bytearray(64)
+        payload[0] = CAN_FRAME_TYPE_TELEMETRY_PHYSICAL_BATCH
+        payload[1] = CAN_PROTOCOL_VERSION
+        payload[2] = TELEMETRY_MODE_PHYSICAL
+        payload[4] = 1
+        struct.pack_into(">Bihh", payload, 8, 2, -1_234_567, -456, -16800)
+
+        parsed = parse_telemetry_frames(
+            CANFrame(id=CAN_ID_TX_TELEMETRY, data=bytes(payload))
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0].voltage_uv, -1_234_567)
+        self.assertEqual(parsed[0].stress_qmpa, -16800)
+
+    def test_parse_v3_config_snapshot(self):
+        parsed = parse_config_frame(
+            CANFrame(id=CAN_ID_TX_CONFIG, data=build_config_v3_payload())
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.vref_uv, 2_498_500)
+        self.assertEqual(parsed.pga_gain, 16)
+        self.assertEqual(parsed.filter_length, 7)
+        self.assertEqual(parsed.channel_mask, 0x000F)
+        self.assertEqual(parsed.zero_offsets[3], -300)
+
     def test_crc8_xor_basic(self):
         self.assertEqual(crc8_xor(bytes([1, 2, 3])), 0x00)
 
@@ -136,12 +265,26 @@ class TestProtocolHelpers(unittest.TestCase):
 
         self.assertEqual(frame.id, CAN_ID_RX_COMMAND)
         self.assertEqual(frame.data[0], 0xA0)
-        self.assertEqual(frame.data[1], 0x12)
-        self.assertEqual(frame.data[2], CAN_CMD_SET_FILTER_SIZE)
-        self.assertEqual(frame.data[3], 0x34)
-        self.assertEqual(frame.data[4], 0x78)
-        self.assertEqual(frame.data[5], 0x56)
-        self.assertEqual(frame.data[7], crc8_xor(frame.data[:7]))
+        self.assertEqual(frame.data[1], CAN_PROTOCOL_VERSION)
+        self.assertEqual(frame.data[2], 0x12)
+        self.assertEqual(frame.data[3], CAN_CMD_SET_FILTER_SIZE)
+        self.assertEqual(frame.data[4], 0x34)
+        self.assertEqual(len(frame.data), 12)
+        self.assertEqual(int.from_bytes(frame.data[6:10], "little"), 0x5678)
+
+    def test_build_telemetry_mode_command_frame(self):
+        frame = build_command_frame(
+            sequence=0x34,
+            cmd_type=CAN_CMD_SET_TELEMETRY_MODE,
+            param=0,
+            value=TELEMETRY_MODE_RAW,
+        )
+
+        self.assertEqual(frame.data[:6], bytes([
+            0xA0, CAN_PROTOCOL_VERSION, 0x34, CAN_CMD_SET_TELEMETRY_MODE,
+            0x00, 0x00,
+        ]))
+        self.assertEqual(int.from_bytes(frame.data[6:10], "little"), TELEMETRY_MODE_RAW)
 
     def test_parse_telemetry_frame(self):
         payload = build_telemetry_payload(channel=2, voltage_001mv=1234, strain_ue=-456, stress_01mpa=-12)
@@ -173,6 +316,56 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(parsed[1].channel, 1)
         self.assertEqual(parsed[1].strain_ue, 901)
 
+    def test_parse_v2_raw_telemetry_batch(self):
+        frame = CANFrame(
+            id=CAN_ID_TX_TELEMETRY,
+            data=build_raw_v2_payload([
+                (0, 0x123456),
+                (1, -2),
+            ]),
+        )
+
+        parsed = parse_telemetry_frames(frame)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0].channel, 0)
+        self.assertEqual(parsed[0].raw_value, 0x123456)
+        self.assertEqual(parsed[0].telemetry_mode, TELEMETRY_MODE_RAW)
+        self.assertEqual(parsed[1].channel, 1)
+        self.assertEqual(parsed[1].raw_value, -2)
+
+    def test_parse_v2_raw_telemetry_rejects_bad_version_or_count(self):
+        payload = bytearray(build_raw_v2_payload([(0, 1)]))
+        payload[1] = 0x01
+        self.assertIsNone(parse_telemetry_frames(CANFrame(
+            id=CAN_ID_TX_TELEMETRY, data=bytes(payload)
+        )))
+
+        payload = bytearray(build_raw_v2_payload([(0, 1)]))
+        payload[4] = 15
+        self.assertIsNone(parse_telemetry_frames(CANFrame(
+            id=CAN_ID_TX_TELEMETRY, data=bytes(payload)
+        )))
+
+    def test_parse_v2_physical_telemetry_batch(self):
+        frame = CANFrame(
+            id=CAN_ID_TX_TELEMETRY,
+            data=build_physical_v2_payload([
+                (2, 1234, -456, -12),
+            ]),
+        )
+
+        parsed = parse_telemetry_frames(frame)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].channel, 2)
+        self.assertEqual(parsed[0].voltage_001mv, 1234)
+        self.assertEqual(parsed[0].strain_ue, -456)
+        self.assertEqual(parsed[0].stress_01mpa, -12)
+        self.assertEqual(parsed[0].telemetry_mode, TELEMETRY_MODE_PHYSICAL)
+
     def test_parse_rejects_batched_telemetry_with_bad_crc(self):
         payload = bytearray(build_telemetry_batch_payload([(0, 1234, -456, -12)]))
         payload[-1] ^= 0xFF
@@ -182,7 +375,10 @@ class TestProtocolHelpers(unittest.TestCase):
         ))
 
     def test_parse_status_frame(self):
-        payload = build_status_payload(sequence=3, cmd_type=CAN_CMD_ZERO_DATUM, status=CAN_STATUS_OK, value=16, detail=0x55)
+        payload = bytes([
+            CAN_FRAME_TYPE_STATUS, CAN_PROTOCOL_VERSION, 3, CAN_CMD_ZERO_DATUM,
+            CAN_STATUS_OK, 16, 0, 0x55,
+        ])
         frame = CANFrame(id=CAN_ID_TX_STATUS, data=payload)
 
         parsed = parse_status_frame(frame)
@@ -196,16 +392,18 @@ class TestProtocolHelpers(unittest.TestCase):
 
     def test_parse_health_frame(self):
         parsed = parse_health_frame(
-            CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_payload())
+            CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_v2_payload())
         )
 
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.sample_rate_sps, 30000)
-        self.assertEqual(parsed.telemetry_decimation, 3)
         self.assertEqual(parsed.tx_drop_count, 4)
         self.assertEqual(parsed.adc_overflow_count, 5)
         self.assertEqual(parsed.adc_recovery_count, 6)
         self.assertEqual(parsed.active_adc_count, 2)
+        self.assertEqual(parsed.telemetry_mode, TELEMETRY_MODE_RAW)
+        self.assertEqual(parsed.telemetry_samples_per_second, 8748)
+        self.assertEqual(parsed.telemetry_frames_per_second, 625)
         self.assertTrue(parsed.adc_running)
 
     def test_parse_rejects_bad_crc(self):
@@ -266,7 +464,7 @@ class TestProtocolHelpers(unittest.TestCase):
             connected = interface.connect(
                 "slcan",
                 "COM7",
-                Baudrate.BAUD_1M,
+                Baudrate.BAUD_500K,
                 tty_baudrate=460800,
                 sleep_after_open=0.25,
             )
@@ -275,7 +473,7 @@ class TestProtocolHelpers(unittest.TestCase):
         kwargs = mock_bus.call_args.kwargs
         self.assertEqual(kwargs["interface"], "slcan")
         self.assertEqual(kwargs["channel"], "COM7")
-        self.assertEqual(kwargs["timing"].nom_bitrate, 1000000)
+        self.assertEqual(kwargs["timing"].nom_bitrate, 500000)
         self.assertEqual(kwargs["timing"].data_bitrate, CAN_FD_DATA_BITRATE)
         self.assertEqual(kwargs["tty_baudrate"], 460800)
         self.assertEqual(kwargs["sleep_after_open"], 0.25)
@@ -287,7 +485,7 @@ class TestProtocolHelpers(unittest.TestCase):
 
         serial_port = MagicMock()
         serial_port.write_timeout = None
-        timing = PythonCANInterface._can_fd_timing(Baudrate.BAUD_1M)
+        timing = PythonCANInterface._can_fd_timing(Baudrate.BAUD_500K)
 
         with patch(
             "can.interfaces.slcan.serial.serial_for_url",
@@ -321,7 +519,7 @@ class TestProtocolHelpers(unittest.TestCase):
             bus.shutdown()
 
         serial_writes = [call.args[0] for call in serial_port.write.call_args_list]
-        self.assertEqual(serial_writes[:4], [b"C\r", b"S8\r", b"Y2\r", b"O\r"])
+        self.assertEqual(serial_writes[:4], [b"C\r", b"S6\r", b"Y2\r", b"O\r"])
         self.assertIn(b"b1008A001020304050607\r", serial_writes)
         self.assertIn(b"b101F" + batch_data.hex().upper().encode() + b"\r", serial_writes)
 
@@ -372,6 +570,20 @@ class TestChannelData(unittest.TestCase):
         self.assertEqual(data.voltage_001mv, 0)
         self.assertEqual(data.stress_01mpa, 0)
         self.assertEqual(data.samples, 0)
+
+
+class TestCANReceiver(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_registers_callback_before_thread_start(self):
+        can_bus = MagicMock()
+
+        receiver = CANReceiver(can_bus)
+
+        can_bus.register_rx_callback.assert_called_once()
+        receiver.stop()
 
 
 class TestReducerMonitorWindow(unittest.TestCase):
@@ -426,7 +638,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
     def test_stream_summary_has_its_own_command_row(self):
         self.assertEqual(self.window.cmd_group.layout().count(), 2)
-        self.assertIn("抽取 x1", self.window.stream_summary_label.text())
+        self.assertIn("Raw", self.window.stream_summary_label.text())
 
     def test_waveform_plot_defaults_to_voltage_curve(self):
         checkboxes = self.window.plot_metric_checkboxes[0]
@@ -502,12 +714,10 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window._add_waveform_plot()
         self.assertEqual(len(self.window.plot_panels), MAX_VISIBLE_PLOTS)
 
-    def test_adding_plot_subscribes_mcu_channel(self):
+    def test_adding_plot_does_not_override_mcu_channel_mask(self):
+        self.window.can_bus.send_frame.reset_mock()
         self.window._add_waveform_plot()
-
-        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
-        self.assertEqual(sent_frame.data[4], 0x1F)
+        self.window.can_bus.send_frame.assert_not_called()
 
     def test_waveform_plot_can_change_bound_channel(self):
         self.window.plot_channel_combos[0].setCurrentIndex(5)
@@ -522,9 +732,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(self.window.plot_channels[0], 5)
         _, y_data = self.window.plot_curves[0].getData()
         self.assertEqual(list(y_data), [12.5])
-        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
-        self.assertEqual(sent_frame.data[4], 0x2E)
+        self.window.can_bus.send_frame.assert_not_called()
 
     def test_waveform_plot_can_be_removed(self):
         panel = self.window.plot_panels[-1]
@@ -533,9 +741,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertEqual(len(self.window.plot_panels), DEFAULT_VISIBLE_PLOTS - 1)
         self.assertNotIn(panel, self.window.plot_panels)
-        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
-        self.assertEqual(sent_frame.data[4], 0x07)
+        self.window.can_bus.send_frame.assert_not_called()
 
     def test_removing_all_waveform_plots_stops_mcu_sampling(self):
         for panel in list(self.window.plot_panels):
@@ -543,9 +749,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertEqual(self.window.plot_panels, [])
         self.assertEqual(self.window._displayed_channel_mask(), 0)
-        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_CHANNEL_MASK)
-        self.assertEqual(sent_frame.data[4], 0x00)
+        self.window.can_bus.send_frame.assert_not_called()
 
     def test_duplicate_plots_subscribe_mcu_channel_once(self):
         self.window._sync_mcu_channel_mask()
@@ -563,10 +767,11 @@ class TestReducerMonitorWindow(unittest.TestCase):
         )
 
         self.window.on_can_frame_received(frame)
+        self.window.update_plots()
 
         self.assertAlmostEqual(self.window.channel_data[1].voltage_mv, 23.45, places=2)
         self.assertEqual(self.window.channel_data[1].strain_ue, 321.0)
-        self.assertAlmostEqual(self.window.channel_data[1].stress_mpa, 67.41, places=3)
+        self.assertAlmostEqual(self.window.channel_data[1].stress_mpa, 4.5, places=3)
         self.assertEqual(self.window.channel_data[1].samples, 1)
 
     def test_parse_batched_telemetry_updates_channels(self):
@@ -579,10 +784,30 @@ class TestReducerMonitorWindow(unittest.TestCase):
         )
 
         self.window.on_can_frame_received(frame)
+        self.window.update_plots()
 
         self.assertAlmostEqual(self.window.channel_data[0].voltage_mv, 12.34)
         self.assertAlmostEqual(self.window.channel_data[1].voltage_mv, 56.78)
         self.assertEqual(self.window.rx_telemetry_count, 2)
+
+    def test_parse_v2_raw_telemetry_is_converted_on_gui_thread(self):
+        frame = CANFrame(
+            id=CAN_ID_TX_TELEMETRY,
+            data=build_raw_v2_payload([
+                (0, 838860),
+                (1, -838860),
+            ]),
+        )
+
+        self.window.on_can_frame_received(frame)
+        self.assertEqual(self.window.channel_data[0].samples, 0)
+        self.window.update_plots()
+
+        self.assertEqual(self.window.rx_telemetry_count, 2)
+        self.assertEqual(self.window.channel_data[0].samples, 1)
+        self.assertEqual(self.window.channel_data[1].samples, 1)
+        self.assertGreater(self.window.channel_data[0].voltage_mv, 0.0)
+        self.assertLess(self.window.channel_data[1].voltage_mv, 0.0)
 
     def test_bad_telemetry_crc_is_rejected(self):
         payload = bytearray(build_telemetry_payload(channel=0, voltage_001mv=1000, strain_ue=100, stress_01mpa=10))
@@ -688,41 +913,60 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.on_zero_clicked()
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
         self.assertEqual(sent_frame.id, CAN_ID_RX_COMMAND)
-        self.assertEqual(sent_frame.data[2], CAN_CMD_ZERO_DATUM)
+        self.assertEqual(sent_frame.data[3], CAN_CMD_ZERO_DATUM)
 
-    def test_save_zero_command(self):
-        self.window.on_save_zero_clicked()
-        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SAVE_ZERO)
+    def test_config_snapshot_updates_adc_controls(self):
+        self.window._apply_config_snapshot(ConfigFrame(
+            saved=True,
+            zero_valid=False,
+            pga_gain=8,
+            filter_length=7,
+            telemetry_mode=TELEMETRY_MODE_RAW,
+            channel_mask=0x0F,
+            sample_rate_x10=10000,
+            vref_uv=2_498_500,
+            sequence=12,
+            zero_offsets=list(range(8)),
+        ))
+        self.assertAlmostEqual(self.window.vref_spin.value(), 2.4985)
+        self.assertEqual(self.window.pga_combo.currentData(), 8)
+        self.assertEqual(self.window.channel_mask_spin.value(), 0x0F)
+        self.assertIn("需要重新调零", self.window.config_state_label.text())
 
-    def test_load_zero_command(self):
-        self.window.on_load_zero_clicked()
-        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_LOAD_ZERO)
+    def test_redundant_zero_buttons_are_removed(self):
+        self.assertFalse(hasattr(self.window, "save_zero_btn"))
+        self.assertFalse(hasattr(self.window, "load_zero_btn"))
 
     def test_clear_zero_command(self):
         self.window.on_clear_zero_clicked()
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_CLEAR_ZERO)
+        self.assertEqual(sent_frame.data[3], CAN_CMD_CLEAR_ZERO)
 
     def test_calib_command(self):
         self.window.on_calib_clicked()
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_START_CALIB)
+        self.assertEqual(sent_frame.data[3], CAN_CMD_START_CALIB)
 
     def test_filter_size_command(self):
         self.window.on_filter_size_changed(32)
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_FILTER_SIZE)
-        self.assertEqual(sent_frame.data[4], 32)
-        self.assertEqual(sent_frame.data[5], 0)
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_FILTER_SIZE)
+        self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), 32)
 
     def test_sample_rate_command(self):
         self.window.sample_rate_combo.setCurrentText("500 SPS")
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_SAMPLE_RATE)
-        self.assertEqual(sent_frame.data[4], 0xF4)
-        self.assertEqual(sent_frame.data[5], 0x01)
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_SAMPLE_RATE)
+        self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), 500)
+
+    def test_telemetry_mode_command(self):
+        self.window.telemetry_mode_combo.setCurrentIndex(
+            self.window.telemetry_mode_combo.findData(TELEMETRY_MODE_PHYSICAL)
+        )
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_TELEMETRY_MODE)
+        self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), TELEMETRY_MODE_PHYSICAL)
+        self.assertEqual(self.window.telemetry_mode, TELEMETRY_MODE_RAW)
 
     def test_all_ads1256_sample_rates_are_available(self):
         self.assertEqual(
@@ -735,27 +979,40 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.sample_rate_combo.setCurrentText("2.5 SPS")
 
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_SAMPLE_RATE)
-        self.assertEqual(sent_frame.data[3], 1)
-        self.assertEqual(sent_frame.data[4], 25)
-        self.assertEqual(sent_frame.data[5], 0)
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_SAMPLE_RATE)
+        self.assertEqual(sent_frame.data[4], 1)
+        self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), 25)
 
-    def test_high_ads_rate_uses_bounded_telemetry_decimation(self):
-        self.assertEqual(self.window._telemetry_decimation(30000), 1)
+    def test_high_ads_rate_does_not_auto_decimate_telemetry(self):
+        self.assertEqual(self.window._estimated_telemetry_rate(30000), 4374)
 
         self.window._add_waveform_plot()
 
-        self.assertEqual(self.window._telemetry_decimation(30000), 1)
+        self.assertEqual(self.window._estimated_telemetry_rate(30000), 8748)
 
     def test_health_frame_updates_system_health_panel(self):
         self._switch_to_english()
         self.window.on_can_frame_received(
-            CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_payload())
+            CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_v2_payload())
         )
 
         self.assertEqual(self.window.sample_rate_sps, 30000)
-        self.assertIn("TX drops 4", self.window.health_summary_label.text())
-        self.assertIn("ADC overflows 5", self.window.health_summary_label.text())
+        self.assertEqual(self.window.telemetry_mode, TELEMETRY_MODE_RAW)
+        self.assertIn("new drops 0, total 4", self.window.health_summary_label.text())
+        self.assertIn("new overflows 0, total 5", self.window.health_summary_label.text())
+        self.assertEqual(
+            self.window.health_icon_label.pixmap().toImage()
+            .pixelColor(7, 7).name(),
+            "#35b66a",
+        )
+
+        self.window.on_can_frame_received(
+            CANFrame(
+                id=CAN_ID_TX_HEALTH,
+                data=build_health_v2_payload(tx_drop=6, overflow=6, recovery=7),
+            )
+        )
+        self.assertIn("new drops 2, total 6", self.window.health_summary_label.text())
         self.assertEqual(
             self.window.health_icon_label.pixmap().toImage()
             .pixelColor(7, 7).name(),
@@ -773,7 +1030,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.on_can_frame_received(
             CANFrame(
                 id=CAN_ID_TX_HEALTH,
-                data=build_health_payload(tx_drop=0, overflow=0, recovery=0),
+                data=build_health_v2_payload(tx_drop=0, overflow=0, recovery=0),
             )
         )
 
@@ -787,9 +1044,8 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.sample_rate_combo.setCurrentText("30000 SPS")
 
         sent_frame = self.window.can_bus.send_frame.call_args[0][0]
-        self.assertEqual(sent_frame.data[2], CAN_CMD_SET_SAMPLE_RATE)
-        self.assertEqual(sent_frame.data[4], 0x30)
-        self.assertEqual(sent_frame.data[5], 0x75)
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_SAMPLE_RATE)
+        self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), 30000)
 
     def test_connection_options_can_be_locked(self):
         self.window.is_connected = False
@@ -799,14 +1055,14 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertFalse(self.window.channel_combo.isEnabled())
         self.assertFalse(hasattr(self.window, "serial_baud_combo"))
         self.assertFalse(hasattr(self.window, "baud_combo"))
-        self.assertEqual(self.window.can_baud_value.text(), "1M / 2M FD+BRS")
+        self.assertFalse(hasattr(self.window, "can_baud_value"))
         self.assertFalse(self.window.refresh_btn.isEnabled())
         self.assertTrue(self.window.language_combo.isEnabled())
 
     def test_can_bitrate_is_fixed_to_match_mcu_firmware(self):
-        self.assertEqual(FIXED_CAN_BITRATE, Baudrate.BAUD_1M)
+        self.assertEqual(FIXED_CAN_BITRATE, Baudrate.BAUD_500K)
         self.assertFalse(hasattr(self.window, "baud_combo"))
-        self.assertEqual(self.window.can_baud_value.text(), "1M / 2M FD+BRS")
+        self.assertFalse(hasattr(self.window, "can_baud_value"))
 
     def test_command_fails_when_disconnected(self):
         self.window.is_connected = False
@@ -919,6 +1175,7 @@ class TestCsvLogging(unittest.TestCase):
             "stress": 10.5,
             "samples": 1,
         })
+        self.window.update_plots()
 
         self.window.csv_file.close()
 
@@ -963,8 +1220,18 @@ class TestCsvLogging(unittest.TestCase):
         self.assertEqual(offline_window.maximized_plot_channel, 0)
         offline_window._toggle_plot_maximize(0)
         self.assertIsNone(offline_window.maximized_plot_channel)
-        self.assertEqual(offline_window.waveform_layout.count(), NUM_CHANNELS)
+        self.assertEqual(offline_window.waveform_layout.count(), 2)
         offline_window.close()
+
+    def test_offline_window_only_creates_plots_for_channels_with_data(self):
+        window = OfflineWaveformWindow(
+            "sparse.csv",
+            [[1.0], [], [2.0], [], [], [], [], []],
+            "zh",
+        )
+        self.assertEqual(window.plot_channels, [0, 2])
+        self.assertEqual(len(window.plot_widgets), 2)
+        window.close()
 
 
 def run_tests():

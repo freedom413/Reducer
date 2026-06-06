@@ -88,7 +88,7 @@ int32_t filter_apply(uint8_t ch, int32_t raw)
 
     // Return average - use fixed point for precision
     // Subtract zero offset to get calibrated value
-    int32_t filtered = (int32_t)(f->sum / (int64_t)f->count);
+    int32_t filtered = f->sum / (int32_t)f->count;
     return filtered - f->zero_offset;
 }
 
@@ -133,7 +133,7 @@ int32_t filter_get_raw_filtered(uint8_t ch)
     if (f->count == 0) {
         return 0;
     }
-    return (int32_t)(f->sum / (int64_t)f->count);
+    return f->sum / (int32_t)f->count;
 }
 
 bool filter_has_samples(uint8_t ch)

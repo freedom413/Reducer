@@ -3,3 +3,5 @@ numpy>=1.24.0
 PyQt6>=6.5.0
 python-can>=4.6.1
 pyserial>=3.5
+PyOpenGL>=3.1.7
+PyOpenGL-accelerate>=3.1.7
