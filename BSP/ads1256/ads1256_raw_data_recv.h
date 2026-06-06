@@ -36,6 +36,10 @@ uint16_t adc_ads1256_get_recovery_count(void);
 uint8_t adc_ads1256_is_running(void);
 int adc_ads1256_set_channel_mask(uint16_t channel_mask);
 uint16_t adc_ads1256_get_channel_mask(void);
+int adc_ads1256_set_pga_gain(uint8_t gain);
+uint8_t adc_ads1256_get_pga_gain(void);
+int adc_ads1256_set_vref_uv(uint32_t vref_uv);
+uint32_t adc_ads1256_get_vref_uv(void);
 int adc_ads1256_restart(void);
 
 #endif /* __ADS1256_RAW_DATA_RECV_H__ */

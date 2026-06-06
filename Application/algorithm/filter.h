@@ -16,7 +16,7 @@ typedef struct {
     int32_t buffer[FILTER_WINDOW_SIZE_MAX];
     uint8_t index;
     uint8_t count;
-    int64_t sum;
+    int32_t sum;
     uint8_t window_size;  // Current window size
     int32_t zero_offset;  // Zero offset for this channel
 } moving_avg_filter_t;

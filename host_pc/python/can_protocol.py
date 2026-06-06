@@ -26,13 +26,21 @@ CAN_ID_RX_COMMAND = 0x100
 CAN_ID_TX_TELEMETRY = 0x101
 CAN_ID_TX_STATUS = 0x102
 CAN_ID_TX_HEALTH = 0x103
+CAN_ID_TX_CONFIG = 0x104
 
 CAN_FRAME_TYPE_TELEMETRY = 0x51
 CAN_FRAME_TYPE_TELEMETRY_BATCH = 0x53
+CAN_FRAME_TYPE_TELEMETRY_RAW_BATCH = 0x54
+CAN_FRAME_TYPE_TELEMETRY_PHYSICAL_BATCH = 0x55
 CAN_FRAME_TYPE_COMMAND = 0xA0
 CAN_FRAME_TYPE_STATUS = 0xA1
 CAN_FRAME_TYPE_HEALTH = 0x52
+CAN_FRAME_TYPE_CONFIG = 0x56
 CAN_HEALTH_VERSION = 0x01
+CAN_PROTOCOL_VERSION = 0x03
+
+TELEMETRY_MODE_RAW = 0x00
+TELEMETRY_MODE_PHYSICAL = 0x01
 
 CAN_STATUS_OK = 0x00
 CAN_STATUS_BAD_CRC = 0xE1
@@ -50,6 +58,11 @@ COMMAND_NAMES = {
     0x06: "Load Zero",
     0x07: "Clear Zero",
     0x08: "Set Channel Mask",
+    0x09: "Set Telemetry Mode",
+    0x0A: "Get Config",
+    0x0B: "Set Vref",
+    0x0C: "Set PGA",
+    0x0D: "Restore Defaults",
 }
 
 STATUS_NAMES = {
@@ -68,6 +81,11 @@ CAN_FD_DATA_BITRATE = 2000000
 CAN_TELEMETRY_BATCH_FRAME_LEN = 64
 CAN_TELEMETRY_BATCH_MAX_RECORDS = 10
 CAN_TELEMETRY_RECORD_LEN = 6
+CAN_TELEMETRY_V2_HEADER_LEN = 8
+CAN_TELEMETRY_RAW_RECORD_LEN = 4
+CAN_TELEMETRY_RAW_MAX_RECORDS = 14
+CAN_TELEMETRY_PHYSICAL_RECORD_LEN = 9
+CAN_TELEMETRY_PHYSICAL_MAX_RECORDS = 6
 
 
 class Baudrate(Enum):
@@ -113,20 +131,43 @@ class StatusFrame:
 @dataclass
 class TelemetryFrame:
     channel: int
-    voltage_001mv: int
-    strain_ue: int
-    stress_01mpa: int
+    voltage_001mv: int = 0
+    strain_ue: int = 0
+    stress_01mpa: int = 0
+    raw_value: Optional[int] = None
+    voltage_uv: Optional[int] = None
+    stress_qmpa: Optional[int] = None
+    telemetry_mode: int = TELEMETRY_MODE_PHYSICAL
 
 
 @dataclass
 class HealthFrame:
     sample_rate_sps: float
-    telemetry_decimation: int
     tx_drop_count: int
     adc_overflow_count: int
     adc_recovery_count: int
     active_adc_count: int
     adc_running: bool
+    telemetry_decimation: int = 1
+    telemetry_mode: int = TELEMETRY_MODE_RAW
+    telemetry_samples_per_second: int = 0
+    telemetry_frames_per_second: int = 0
+    config_dirty: bool = False
+    zero_valid: bool = False
+
+
+@dataclass
+class ConfigFrame:
+    saved: bool
+    zero_valid: bool
+    pga_gain: int
+    filter_length: int
+    telemetry_mode: int
+    channel_mask: int
+    sample_rate_x10: int
+    vref_uv: int
+    sequence: int
+    zero_offsets: List[int]
 
 
 def crc8_xor(data: bytes) -> int:
@@ -143,27 +184,44 @@ def build_command_frame(sequence: int, cmd_type: int, param: int = 0, value: int
         raise ValueError("cmd_type must fit in uint8")
     if not 0 <= param <= 0xFF:
         raise ValueError("param must fit in uint8")
-    if not 0 <= value <= 0xFFFF:
-        raise ValueError("value must fit in uint16")
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError("value must fit in uint32")
 
     payload = bytes([
         CAN_FRAME_TYPE_COMMAND,
+        CAN_PROTOCOL_VERSION,
         sequence,
         cmd_type,
         param,
-        value & 0xFF,
-        (value >> 8) & 0xFF,
         0x00,
-    ])
-    return CANFrame(id=CAN_ID_RX_COMMAND, data=payload + bytes([crc8_xor(payload)]))
+    ]) + value.to_bytes(4, "little") + b"\x00\x00"
+    return CANFrame(id=CAN_ID_RX_COMMAND, data=payload)
 
 
 def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
     if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
         return None
-    if frame.id != CAN_ID_TX_STATUS or len(frame.data) != 8:
+    if frame.id != CAN_ID_TX_STATUS:
         return None
     if frame.data[0] != CAN_FRAME_TYPE_STATUS:
+        return None
+    if len(frame.data) == 12 and frame.data[1] == CAN_PROTOCOL_VERSION:
+        return StatusFrame(
+            sequence=frame.data[2],
+            cmd_type=frame.data[3],
+            status=frame.data[4],
+            value=int.from_bytes(frame.data[6:10], "little"),
+            detail=frame.data[5],
+        )
+    if len(frame.data) == 8 and frame.data[1] == CAN_PROTOCOL_VERSION:
+        return StatusFrame(
+            sequence=frame.data[2],
+            cmd_type=frame.data[3],
+            status=frame.data[4],
+            value=frame.data[5] | (frame.data[6] << 8),
+            detail=frame.data[7],
+        )
+    if len(frame.data) != 8:
         return None
     if crc8_xor(frame.data[:7]) != frame.data[7]:
         return None
@@ -191,10 +249,85 @@ def _parse_legacy_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
         voltage_001mv=voltage_001mv,
         strain_ue=strain_ue,
         stress_01mpa=stress_01mpa,
+        telemetry_mode=TELEMETRY_MODE_PHYSICAL,
     )
 
 
+def _parse_i24_be(data: bytes) -> int:
+    value = int.from_bytes(data, "big", signed=False)
+    if value & 0x800000:
+        value -= 0x1000000
+    return value
+
+
+def _parse_v2_raw_telemetry_batch(frame: CANFrame) -> Optional[List[TelemetryFrame]]:
+    if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
+        return None
+    if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) != CAN_TELEMETRY_BATCH_FRAME_LEN:
+        return None
+    if frame.data[0] != CAN_FRAME_TYPE_TELEMETRY_RAW_BATCH:
+        return None
+    if frame.data[1] != CAN_PROTOCOL_VERSION or frame.data[2] != TELEMETRY_MODE_RAW:
+        return None
+    record_count = frame.data[4]
+    if not 1 <= record_count <= CAN_TELEMETRY_RAW_MAX_RECORDS:
+        return None
+
+    records = []
+    for index in range(record_count):
+        offset = CAN_TELEMETRY_V2_HEADER_LEN + index * CAN_TELEMETRY_RAW_RECORD_LEN
+        records.append(
+            TelemetryFrame(
+                channel=frame.data[offset],
+                raw_value=_parse_i24_be(frame.data[offset + 1:offset + 4]),
+                telemetry_mode=TELEMETRY_MODE_RAW,
+            )
+        )
+    return records
+
+
+def _parse_v2_physical_telemetry_batch(frame: CANFrame) -> Optional[List[TelemetryFrame]]:
+    if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
+        return None
+    if frame.id != CAN_ID_TX_TELEMETRY or len(frame.data) != CAN_TELEMETRY_BATCH_FRAME_LEN:
+        return None
+    if frame.data[0] != CAN_FRAME_TYPE_TELEMETRY_PHYSICAL_BATCH:
+        return None
+    if frame.data[1] != CAN_PROTOCOL_VERSION or frame.data[2] != TELEMETRY_MODE_PHYSICAL:
+        return None
+    record_count = frame.data[4]
+    if not 1 <= record_count <= CAN_TELEMETRY_PHYSICAL_MAX_RECORDS:
+        return None
+
+    records = []
+    for index in range(record_count):
+        offset = CAN_TELEMETRY_V2_HEADER_LEN + index * CAN_TELEMETRY_PHYSICAL_RECORD_LEN
+        channel, voltage_uv, strain_ue, stress_qmpa = struct.unpack(
+            ">Bihh", frame.data[offset:offset + CAN_TELEMETRY_PHYSICAL_RECORD_LEN]
+        )
+        records.append(
+            TelemetryFrame(
+                channel=channel,
+                voltage_001mv=int(round(voltage_uv / 10.0)),
+                strain_ue=strain_ue,
+                stress_01mpa=int(round(stress_qmpa * 2.5)),
+                voltage_uv=voltage_uv,
+                stress_qmpa=stress_qmpa,
+                telemetry_mode=TELEMETRY_MODE_PHYSICAL,
+            )
+        )
+    return records
+
+
 def parse_telemetry_frames(frame: CANFrame) -> Optional[List[TelemetryFrame]]:
+    v2_raw = _parse_v2_raw_telemetry_batch(frame)
+    if v2_raw is not None:
+        return v2_raw
+
+    v2_physical = _parse_v2_physical_telemetry_batch(frame)
+    if v2_physical is not None:
+        return v2_physical
+
     legacy = _parse_legacy_telemetry_frame(frame)
     if legacy is not None:
         return [legacy]
@@ -223,6 +356,7 @@ def parse_telemetry_frames(frame: CANFrame) -> Optional[List[TelemetryFrame]]:
                 voltage_001mv=voltage_001mv,
                 strain_ue=strain_ue,
                 stress_01mpa=stress_01mpa,
+                telemetry_mode=TELEMETRY_MODE_PHYSICAL,
             )
         )
     return records
@@ -238,7 +372,33 @@ def parse_telemetry_frame(frame: CANFrame) -> Optional[TelemetryFrame]:
 def parse_health_frame(frame: CANFrame) -> Optional[HealthFrame]:
     if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
         return None
-    if frame.id != CAN_ID_TX_HEALTH or len(frame.data) != 16:
+    if frame.id != CAN_ID_TX_HEALTH:
+        return None
+
+    if len(frame.data) == 24 and frame.data[0] == CAN_FRAME_TYPE_HEALTH and frame.data[1] == CAN_PROTOCOL_VERSION:
+        sample_rate_x10 = int.from_bytes(frame.data[2:6], "little")
+        tx_drop = int.from_bytes(frame.data[6:8], "little")
+        overflow = int.from_bytes(frame.data[8:10], "little")
+        recovery = int.from_bytes(frame.data[10:12], "little")
+        telemetry_samples_per_second = int.from_bytes(frame.data[12:14], "little")
+        telemetry_frames_per_second = int.from_bytes(frame.data[14:16], "little")
+        flags = frame.data[18]
+        return HealthFrame(
+            sample_rate_sps=sample_rate_x10 / 10.0,
+            tx_drop_count=tx_drop,
+            adc_overflow_count=overflow,
+            adc_recovery_count=recovery,
+            active_adc_count=frame.data[16],
+            adc_running=(flags & 0x01) != 0,
+            telemetry_decimation=1,
+            telemetry_mode=frame.data[17],
+            telemetry_samples_per_second=telemetry_samples_per_second,
+            telemetry_frames_per_second=telemetry_frames_per_second,
+            config_dirty=(flags & 0x02) != 0,
+            zero_valid=(flags & 0x04) != 0,
+        )
+
+    if len(frame.data) != 16:
         return None
     if frame.data[0] != CAN_FRAME_TYPE_HEALTH or frame.data[1] != CAN_HEALTH_VERSION:
         return None
@@ -257,6 +417,32 @@ def parse_health_frame(frame: CANFrame) -> Optional[HealthFrame]:
         adc_recovery_count=recovery,
         active_adc_count=(flags >> 4) & 0x0F,
         adc_running=(flags & 0x01) != 0,
+    )
+
+
+def parse_config_frame(frame: CANFrame) -> Optional[ConfigFrame]:
+    if frame.is_extended or frame.is_remote or not frame.is_fd or not frame.bitrate_switch:
+        return None
+    if frame.id != CAN_ID_TX_CONFIG or len(frame.data) != 64:
+        return None
+    if frame.data[0] != CAN_FRAME_TYPE_CONFIG or frame.data[1] != CAN_PROTOCOL_VERSION:
+        return None
+    flags = frame.data[2]
+    return ConfigFrame(
+        saved=(flags & 0x01) != 0,
+        zero_valid=(flags & 0x02) != 0,
+        pga_gain=frame.data[3],
+        filter_length=frame.data[4],
+        telemetry_mode=frame.data[5],
+        channel_mask=int.from_bytes(frame.data[6:8], "little"),
+        sample_rate_x10=int.from_bytes(frame.data[8:12], "little"),
+        vref_uv=int.from_bytes(frame.data[12:16], "little"),
+        sequence=int.from_bytes(frame.data[16:20], "little"),
+        zero_offsets=[
+            int.from_bytes(frame.data[20 + index * 4:24 + index * 4],
+                           "little", signed=True)
+            for index in range(8)
+        ],
     )
 
 
