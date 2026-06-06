@@ -35,7 +35,7 @@ static int flash_program_dw(uint32_t addr, uint64_t data)
 {
     if ((addr & 0x7U) != 0U ||
         addr < FLASH_STORAGE_ADDR ||
-        addr > (FLASH_STORAGE_ADDR + FLASH_STORAGE_SIZE - sizeof(data))) {
+        addr > (FLASH_STORAGE_ADDR + FLASH_STORAGE_PAGE_SIZE - sizeof(data))) {
         return -1;
     }
 

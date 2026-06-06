@@ -16,17 +16,19 @@ static int ads1256_write(uint8_t *p_data, uint8_t nbytes)
 
 static int ads1256_read(uint8_t *p_data, uint8_t nbytes)
 {
-    HAL_StatusTypeDef ret;
-    uint8_t dummy = 0xFF;
-
+    uint8_t dummy[16];
+    if (nbytes > sizeof(dummy)) {
+        return -1;
+    }
     for (uint8_t i = 0; i < nbytes; i++) {
-        ret = HAL_SPI_TransmitReceive(&hspi1, &dummy, &p_data[i], 1, ADS1256_SPI_TIMEOUT_MS);
-        if (ret != HAL_OK) {
-            return -1;
-        }
+        dummy[i] = 0xFFU;
     }
 
-    return (int)nbytes;
+    HAL_StatusTypeDef ret = HAL_SPI_TransmitReceive(&hspi1, dummy, p_data,
+                                                    nbytes,
+                                                    ADS1256_SPI_TIMEOUT_MS);
+
+    return (ret == HAL_OK) ? (int)nbytes : -1;
 }
 
 static int ads1256_delay_us(uint32_t us)

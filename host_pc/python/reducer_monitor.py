@@ -7,6 +7,7 @@ State Detection System. Uses CANable 2.0 SLCAN FD and python-can adapters.
 
 import csv
 import datetime
+import importlib.util
 import logging
 import os
 import sys
@@ -17,13 +18,15 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from threading import Lock
 
+import numpy as np
+
 # PyQt6 imports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QGroupBox, QLabel, QPushButton, QComboBox,
     QSpinBox, QStatusBar, QFileDialog, QCheckBox,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QColorDialog,
+    QColorDialog, QDoubleSpinBox,
 )
 from PyQt6.QtCore import QEvent, QSignalBlocker, QTimer, pyqtSignal, QThread, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
@@ -31,14 +34,34 @@ from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 # Plotting
 import pyqtgraph as pg
 
+OPENGL_DEPENDENCIES_AVAILABLE = importlib.util.find_spec("OpenGL") is not None
+
+
+def configure_plot_backend(use_opengl: bool) -> bool:
+    if use_opengl and not OPENGL_DEPENDENCIES_AVAILABLE:
+        pg.setConfigOptions(useOpenGL=False, antialias=False)
+        return False
+    try:
+        pg.setConfigOptions(useOpenGL=bool(use_opengl), antialias=False)
+        return bool(use_opengl)
+    except Exception:
+        pg.setConfigOptions(useOpenGL=False, antialias=False)
+        return False
+
+
+OPENGL_PLOT_AVAILABLE = configure_plot_backend(True)
+
 from can_protocol import (
     Baudrate,
     CANFrame,
     CAN_ID_TX_HEALTH,
+    CAN_ID_TX_CONFIG,
     CAN_ID_TX_STATUS,
     CAN_ID_TX_TELEMETRY,
     CAN_STATUS_OK,
     CAN_FD_DATA_BITRATE,
+    TELEMETRY_MODE_PHYSICAL,
+    TELEMETRY_MODE_RAW,
     COMMAND_NAMES,
     DEFAULT_SLCAN_TTY_BAUDRATE,
     PythonCANInterface,
@@ -48,6 +71,7 @@ from can_protocol import (
     build_command_frame,
     list_can_channels,
     parse_health_frame,
+    parse_config_frame,
     parse_status_frame,
     parse_telemetry_frames,
 )
@@ -61,14 +85,25 @@ CAN_CMD_SAVE_ZERO = 0x05
 CAN_CMD_LOAD_ZERO = 0x06
 CAN_CMD_CLEAR_ZERO = 0x07
 CAN_CMD_SET_CHANNEL_MASK = 0x08
+CAN_CMD_SET_TELEMETRY_MODE = 0x09
+CAN_CMD_GET_CONFIG = 0x0A
+CAN_CMD_SET_VREF_UV = 0x0B
+CAN_CMD_SET_PGA = 0x0C
+CAN_CMD_RESTORE_DEFAULTS = 0x0D
 
 # Number of channels
 NUM_CHANNELS = 8
 DEFAULT_VISIBLE_PLOTS = 4
 MAX_VISIBLE_PLOTS = 8
-FIXED_CAN_BITRATE = Baudrate.BAUD_1M
+FIXED_CAN_BITRATE = Baudrate.BAUD_500K
 ADC_CHANNEL_MASKS = (0x0F, 0xF0)
 ELASTIC_MODULUS_MPA = 210000.0
+ADC_REF_VOLTAGE = 2.5
+ADC_PGA_GAIN = 16
+BRIDGE_EXCITATION_V = 5.0
+GAUGE_FACTOR = 2.11
+MAX_STRAIN_UE = 20000.0
+MV_TO_MICROSTRAIN_SCALE = 1000.0 / (BRIDGE_EXCITATION_V * GAUGE_FACTOR)
 
 # Waveform buffer size
 WAVEFORM_BUFFER_SIZE = 5000
@@ -125,12 +160,70 @@ SUPPORTED_SAMPLE_RATES = [
     2.5, 5, 10, 15, 25, 30, 50, 60, 100, 500, 1000, 2000, 3750, 7500,
     15000, 30000,
 ]
-CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND = 10000
 ADS1256_CYCLING_RATES = {
     2.5: 2.5, 5: 5, 10: 10, 15: 15, 25: 25, 30: 30, 50: 50, 60: 59,
     100: 98, 500: 456, 1000: 837, 2000: 1438, 3750: 2165, 7500: 3043,
     15000: 3817, 30000: 4374,
 }
+
+
+class WaveformRingBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = int(capacity)
+        self.values = np.zeros(self.capacity, dtype=np.float64)
+        self.start = 0
+        self.count = 0
+
+    def append(self, value: float) -> None:
+        index = (self.start + self.count) % self.capacity
+        if self.count == self.capacity:
+            self.values[self.start] = value
+            self.start = (self.start + 1) % self.capacity
+        else:
+            self.values[index] = value
+            self.count += 1
+
+    def extend(self, values) -> None:
+        array = np.asarray(values, dtype=np.float64)
+        if array.size == 0:
+            return
+        if array.size >= self.capacity:
+            self.values[:] = array[-self.capacity:]
+            self.start = 0
+            self.count = self.capacity
+            return
+        for value in array:
+            self.append(float(value))
+
+    def clear(self) -> None:
+        self.start = 0
+        self.count = 0
+
+    def to_array(self, last: Optional[int] = None) -> np.ndarray:
+        if self.count == 0:
+            return np.array([], dtype=np.float64)
+        if self.start + self.count <= self.capacity:
+            data = self.values[self.start:self.start + self.count]
+        else:
+            data = np.concatenate((
+                self.values[self.start:],
+                self.values[:(self.start + self.count) % self.capacity],
+            ))
+        if last is not None and data.size > last:
+            data = data[-last:]
+        return data.copy()
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __bool__(self) -> bool:
+        return self.count > 0
+
+    def __iter__(self):
+        return iter(self.to_array().tolist())
+
+    def __getitem__(self, item):
+        return self.to_array()[item]
 
 
 def theme_stylesheet(theme: str) -> str:
@@ -292,6 +385,9 @@ TRANSLATIONS = {
         "data_panel": "Data Panel",
         "auto_scale": "Auto Scale",
         "auto_scale_tooltip": "Automatically fit each plot to recent samples. Uncheck to keep a fixed scale.",
+        "opengl_plot": "OpenGL Plot",
+        "opengl_plot_tooltip": "Use pyqtgraph OpenGL rendering when PyOpenGL is available; numeric conversion stays on CPU.",
+        "opengl_unavailable": "OpenGL plotting is unavailable, using normal rendering",
         "clear_plots": "Clear Plots",
         "clear_plots_tooltip": "Clear waveform history without changing MCU settings or current values",
         "import_csv": "Import CSV",
@@ -328,6 +424,9 @@ TRANSLATIONS = {
         "clear_zero": "Clear Zero",
         "sample_rate": "Sample Rate:",
         "filter_size": "Filter Size:",
+        "telemetry_mode": "Telemetry:",
+        "telemetry_raw": "Raw High Performance",
+        "telemetry_physical": "Physical Debug",
         "disconnected": "Disconnected",
         "waveforms_cleared": "Waveforms cleared",
         "loaded_log": "Loaded {filename}",
@@ -344,16 +443,18 @@ TRANSLATIONS = {
         "connection_failed": "Connection failed: {error}",
         "connected_slcan": "Connected to {channel} via CANable 2.0 SLCAN FD (USB CDC, CAN FD {can_baudrate}/{data_bitrate} bps, BRS)",
         "connected_generic": "Connected to {interface}:{channel} (CAN FD {can_baudrate}/{data_bitrate} bps, BRS)",
+        "connected_device": "Connected to {interface}:{channel}",
         "zero_sent": "Zero command sent, waiting for device ACK",
         "zero_failed": "Failed to send zero command",
         "calibration_sent": "Calibration command sent, waiting for device ACK",
         "calibration_failed": "Failed to send calibration command",
         "filter_size_failed": "Failed to send filter size command",
         "sample_rate_failed": "Failed to send sample rate command",
-        "stream_summary": "ADC {sample_rate} SPS | scan {scan_rate:.0f} fps | telemetry <= {telemetry_rate:.0f} fps | decimation x{decimation}",
+        "telemetry_mode_failed": "Failed to send telemetry mode command",
+        "stream_summary": "ADC {sample_rate} SPS | scan {scan_rate:.0f} fps | telemetry {telemetry_rate:.0f} samples/s | {mode}",
         "health": "System Health",
-        "health_waiting": "Waiting for MCU health frame | RX {rx_rate:.0f} fps | protocol errors {bad}",
-        "health_summary": "MCU {adc_state} | RX {rx_rate:.0f} fps | ADC {sample_rate} SPS | decimation x{decimation} | TX drops {tx_drop} | ADC overflows {overflow} | recoveries {recovery} | protocol errors {bad}",
+        "health_waiting": "Waiting for MCU health frame | RX {rx_rate:.0f} samples/s | protocol errors {bad}",
+        "health_summary": "MCU {adc_state} | RX {rx_rate:.0f} samples/s | MCU TX {tx_samples} samples/s in {tx_frames} frames/s | ADC {sample_rate} SPS | {mode} | new drops {drop_delta}, total {tx_drop} | new overflows {overflow_delta}, total {overflow} | recoveries {recovery} | protocol errors {bad}",
         "adc_running": "RUN",
         "adc_stopped": "STOP",
         "save_zero_sent": "Save Zero command sent, waiting for device ACK",
@@ -428,6 +529,9 @@ TRANSLATIONS = {
         "clear_zero": "清除零点",
         "sample_rate": "采样率：",
         "filter_size": "滤波长度：",
+        "telemetry_mode": "遥测：",
+        "telemetry_raw": "Raw 高性能",
+        "telemetry_physical": "物理量调试",
         "disconnected": "未连接",
         "waveforms_cleared": "波形已清空",
         "loaded_log": "已加载 {filename}",
@@ -450,10 +554,11 @@ TRANSLATIONS = {
         "calibration_failed": "校准命令发送失败",
         "filter_size_failed": "滤波长度命令发送失败",
         "sample_rate_failed": "采样率命令发送失败",
-        "stream_summary": "ADC {sample_rate} SPS | 扫描 {scan_rate:.0f} 帧/秒 | 遥测 <= {telemetry_rate:.0f} 帧/秒 | 抽取 x{decimation}",
+        "telemetry_mode_failed": "遥测模式命令发送失败",
+        "stream_summary": "ADC {sample_rate} SPS | 扫描 {scan_rate:.0f} 帧/秒 | 遥测 {telemetry_rate:.0f} 样本/秒 | {mode}",
         "health": "系统健康状态",
-        "health_waiting": "等待 MCU 健康帧 | 接收 {rx_rate:.0f} 帧/秒 | 协议错误 {bad}",
-        "health_summary": "MCU {adc_state} | 接收 {rx_rate:.0f} 帧/秒 | ADC {sample_rate} SPS | 抽取 x{decimation} | TX 丢弃 {tx_drop} | ADC 溢出 {overflow} | 恢复 {recovery} | 协议错误 {bad}",
+        "health_waiting": "等待 MCU 健康帧 | 接收 {rx_rate:.0f} 样本/秒 | 协议错误 {bad}",
+        "health_summary": "MCU {adc_state} | 接收 {rx_rate:.0f} 样本/秒 | MCU 发送 {tx_samples} 样本/秒、{tx_frames} 帧/秒 | ADC {sample_rate} SPS | {mode} | 新增丢弃 {drop_delta}、累计 {tx_drop} | 新增溢出 {overflow_delta}、累计 {overflow} | 恢复 {recovery} | 协议错误 {bad}",
         "adc_running": "运行",
         "adc_stopped": "停止",
         "save_zero_sent": "保存零点命令已发送，正在等待设备确认",
@@ -527,25 +632,18 @@ class CANReceiver(QThread):
         super().__init__()
         self.can_bus = can_bus
         self.running = True
-        self._callback = None
-
-    def run(self):
-        def callback(frame: CANFrame):
-            self.frame_received.emit(frame)
-
-        self._callback = callback
+        self._callback = lambda frame: self.frame_received.emit(frame)
         self.can_bus.register_rx_callback(self._callback)
 
-        try:
-            while self.running:
-                QThread.msleep(100)
-        finally:
-            if self._callback is not None:
-                self.can_bus.unregister_rx_callback(self._callback)
-                self._callback = None
+    def run(self):
+        while self.running:
+            QThread.msleep(100)
 
     def stop(self):
         self.running = False
+        if self._callback is not None:
+            self.can_bus.unregister_rx_callback(self._callback)
+            self._callback = None
 
 
 class OfflineWaveformWindow(QMainWindow):
@@ -590,7 +688,10 @@ class OfflineWaveformWindow(QMainWindow):
         self.plot_widgets = []
         self.plot_curves = []
         self.plot_hover_items = []
-        for channel in range(NUM_CHANNELS):
+        self.plot_channels = [
+            channel for channel, values in enumerate(waveform_buffers) if values
+        ]
+        for channel in self.plot_channels:
             plot = pg.PlotWidget()
             plot.installEventFilter(self)
             apply_plot_theme(plot, self.theme)
@@ -645,7 +746,7 @@ class OfflineWaveformWindow(QMainWindow):
             translate(self.language, "offline_window_title", filename=basename)
         )
         self.auto_scale_checkbox.setText(translate(self.language, "auto_scale"))
-        for channel, plot in enumerate(self.plot_widgets):
+        for channel, plot in zip(self.plot_channels, self.plot_widgets):
             plot.setTitle(
                 translate(self.language, "plot_title", channel=channel),
                 color=THEME_COLORS[self.theme]["plot_axis"],
@@ -668,13 +769,14 @@ class OfflineWaveformWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.Leave and watched in self.plot_widgets:
-            channel = self.plot_widgets.index(watched)
-            hide_plot_hover_items(self.plot_hover_items[channel])
+            plot_index = self.plot_widgets.index(watched)
+            hide_plot_hover_items(self.plot_hover_items[plot_index])
         return super().eventFilter(watched, event)
 
     def _on_plot_mouse_moved(self, channel: int, scene_pos):
-        plot = self.plot_widgets[channel]
-        hover_items = self.plot_hover_items[channel]
+        plot_index = self.plot_channels.index(channel)
+        plot = self.plot_widgets[plot_index]
+        hover_items = self.plot_hover_items[plot_index]
         if not plot.getPlotItem().sceneBoundingRect().contains(scene_pos):
             hide_plot_hover_items(hover_items)
             return
@@ -731,17 +833,26 @@ class OfflineWaveformWindow(QMainWindow):
             for column in range(3):
                 self.waveform_layout.setColumnStretch(column, 0)
 
-            plot = self.plot_widgets[self.maximized_plot_channel]
-            self.waveform_layout.addWidget(plot, 0, 0, 2, 3)
+            plot = self.plot_widgets[self.plot_channels.index(self.maximized_plot_channel)]
+            self.waveform_layout.addWidget(plot, 0, 0)
             plot.show()
             return
 
-        for row in range(2):
+        count = len(self.plot_widgets)
+        columns = 1 if count <= 2 else 2 if count <= 4 else 3
+        rows = max(1, (count + columns - 1) // columns)
+        for row in range(NUM_CHANNELS):
+            self.waveform_layout.setRowStretch(row, 0)
+        for column in range(NUM_CHANNELS):
+            self.waveform_layout.setColumnStretch(column, 0)
+        for row in range(rows):
             self.waveform_layout.setRowStretch(row, 1)
-        for column in range(3):
+        for column in range(columns):
             self.waveform_layout.setColumnStretch(column, 1)
-        for channel, plot in enumerate(self.plot_widgets):
-            self.waveform_layout.addWidget(plot, channel // 3, channel % 3)
+        for plot_index, plot in enumerate(self.plot_widgets):
+            self.waveform_layout.addWidget(
+                plot, plot_index // columns, plot_index % columns
+            )
             plot.show()
 
     def _on_auto_scale_toggled(self, enabled: bool):
@@ -749,7 +860,8 @@ class OfflineWaveformWindow(QMainWindow):
             self._fit_all_plots()
 
     def _fit_all_plots(self):
-        for channel, values in enumerate(self.waveform_buffers):
+        for channel in self.plot_channels:
+            values = self.waveform_buffers[channel]
             if values:
                 self._fit_plot(channel, values)
 
@@ -761,7 +873,7 @@ class OfflineWaveformWindow(QMainWindow):
         y_padding = y_range * 0.1
         last_sample = max(1, len(values) - 1)
 
-        plot = self.plot_widgets[channel]
+        plot = self.plot_widgets[self.plot_channels.index(channel)]
         plot.setXRange(0, last_sample, padding=0.01)
         plot.setYRange(center - (y_range / 2.0) - y_padding,
                        center + (y_range / 2.0) + y_padding,
@@ -813,6 +925,18 @@ class ReducerMonitorWindow(QMainWindow):
         self.last_rx_telemetry_count = 0
         self.rx_telemetry_rate_hz = 0.0
         self.latest_health = None
+        self.health_tx_drop_delta = 0
+        self.health_adc_overflow_delta = 0
+        self.health_adc_recovery_delta = 0
+        self.telemetry_mode = TELEMETRY_MODE_RAW
+        self.vref_uv = 2_500_000
+        self.pga_gain = 16
+        self.config_sequence = 0
+        self.zero_offsets = [0 for _ in range(NUM_CHANNELS)]
+        self.zero_valid = False
+        self.pending_telemetry_batches = deque(maxlen=2048)
+        self.display_drop_count = 0
+        self.csv_pending_rows = []
         self.maximized_plot_channel: Optional[int] = None
         self.maximized_plot_panel: Optional[QWidget] = None
         self.last_sent_channel_mask: Optional[int] = None
@@ -826,7 +950,7 @@ class ReducerMonitorWindow(QMainWindow):
         self._refresh_channels()
         self._reset_measurements()
 
-        # Connect signals
+        # Kept for tests and low-rate manual updates; high-rate CAN uses batches.
         self.data_updated.connect(self.on_data_updated)
 
         # Update timer for waveform plot
@@ -905,14 +1029,12 @@ class ReducerMonitorWindow(QMainWindow):
         self.channel_combo.setEditable(True)
         layout.addWidget(self.channel_combo)
 
-        # MCU firmware uses fixed 1M nominal and 2M data-phase bitrates.
-        self.can_baud_label = QLabel()
-        layout.addWidget(self.can_baud_label)
-        self.can_baud_value = QLabel(
-            f"{format_bitrate(FIXED_CAN_BITRATE.bps)} / "
-            f"{format_bitrate(CAN_FD_DATA_BITRATE)} FD+BRS"
-        )
-        layout.addWidget(self.can_baud_value)
+        self.slcan_speed_label = QLabel("USB 串口:")
+        layout.addWidget(self.slcan_speed_label)
+        self.slcan_speed_combo = QComboBox()
+        for speed in (2_000_000, 921_600, 460_800, 115_200):
+            self.slcan_speed_combo.addItem(str(speed), speed)
+        layout.addWidget(self.slcan_speed_combo)
 
         # Connect button
         self.connect_btn = QPushButton()
@@ -961,6 +1083,11 @@ class ReducerMonitorWindow(QMainWindow):
         self.auto_scale_checkbox.toggled.connect(self._on_auto_scale_toggled)
         controls.addWidget(self.auto_scale_checkbox)
 
+        self.opengl_checkbox = QCheckBox()
+        self.opengl_checkbox.setChecked(OPENGL_PLOT_AVAILABLE)
+        self.opengl_checkbox.toggled.connect(self._on_opengl_toggled)
+        controls.addWidget(self.opengl_checkbox)
+
         self.clear_plots_btn = QPushButton()
         self.clear_plots_btn.clicked.connect(self._clear_plots)
         controls.addWidget(self.clear_plots_btn)
@@ -1006,9 +1133,43 @@ class ReducerMonitorWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
+        config_group = QGroupBox("MCU ADC 配置")
+        config_layout = QHBoxLayout(config_group)
+        config_layout.addWidget(QLabel("Vref (V):"))
+        self.vref_spin = QDoubleSpinBox()
+        self.vref_spin.setRange(1.0, 5.0)
+        self.vref_spin.setDecimals(6)
+        self.vref_spin.setSingleStep(0.0001)
+        self.vref_spin.setEnabled(False)
+        self.vref_spin.editingFinished.connect(self.on_vref_changed)
+        config_layout.addWidget(self.vref_spin)
+        config_layout.addWidget(QLabel("PGA:"))
+        self.pga_combo = QComboBox()
+        for gain in (1, 2, 4, 8, 16, 32, 64):
+            self.pga_combo.addItem(str(gain), gain)
+        self.pga_combo.setEnabled(False)
+        self.pga_combo.currentIndexChanged.connect(self.on_pga_changed)
+        config_layout.addWidget(self.pga_combo)
+        config_layout.addWidget(QLabel("通道掩码:"))
+        self.channel_mask_spin = QSpinBox()
+        self.channel_mask_spin.setRange(0, 0xFF)
+        self.channel_mask_spin.setDisplayIntegerBase(16)
+        self.channel_mask_spin.setPrefix("0x")
+        self.channel_mask_spin.setEnabled(False)
+        self.channel_mask_spin.editingFinished.connect(self.on_channel_mask_changed)
+        config_layout.addWidget(self.channel_mask_spin)
+        self.restore_defaults_btn = QPushButton("恢复默认配置")
+        self.restore_defaults_btn.setEnabled(False)
+        self.restore_defaults_btn.clicked.connect(self.on_restore_defaults_clicked)
+        config_layout.addWidget(self.restore_defaults_btn)
+        self.config_state_label = QLabel("等待 MCU 配置")
+        config_layout.addWidget(self.config_state_label)
+        config_layout.addStretch()
+        layout.addWidget(config_group)
+
         # Table for data display
         self.data_table = QTableWidget()
-        self.data_table.setColumnCount(5)
+        self.data_table.setColumnCount(7)
         self.data_table.setRowCount(NUM_CHANNELS)
 
         # Set channel numbers and initialize data columns
@@ -1018,6 +1179,8 @@ class ReducerMonitorWindow(QMainWindow):
             self.data_table.setItem(i, 2, QTableWidgetItem("-"))
             self.data_table.setItem(i, 3, QTableWidgetItem("-"))
             self.data_table.setItem(i, 4, QTableWidgetItem("-"))
+            self.data_table.setItem(i, 5, QTableWidgetItem("-"))
+            self.data_table.setItem(i, 6, QTableWidgetItem("-"))
 
         # Stretch columns
         header = self.data_table.horizontalHeader()
@@ -1066,7 +1229,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.conn_group.setTitle(self._tr("can_connection"))
         self.interface_label.setText(self._tr("interface"))
         self.channel_label.setText(self._tr("channel"))
-        self.can_baud_label.setText(self._tr("can_baudrate"))
         self.connect_btn.setText(
             self._tr("disconnect") if self.is_connected else self._tr("connect")
         )
@@ -1079,11 +1241,18 @@ class ReducerMonitorWindow(QMainWindow):
         self.cmd_group.setTitle(self._tr("commands"))
         self.zero_btn.setText(self._tr("zero_sensor"))
         self.calib_btn.setText(self._tr("calibrate"))
-        self.save_zero_btn.setText(self._tr("save_zero"))
-        self.load_zero_btn.setText(self._tr("load_zero"))
         self.clear_zero_btn.setText(self._tr("clear_zero"))
         self.sample_rate_label.setText(self._tr("sample_rate"))
         self.filter_size_label.setText(self._tr("filter_size"))
+        self.telemetry_mode_label.setText(self._tr("telemetry_mode"))
+        raw_index = self.telemetry_mode_combo.findData(TELEMETRY_MODE_RAW)
+        if raw_index >= 0:
+            self.telemetry_mode_combo.setItemText(raw_index, self._tr("telemetry_raw"))
+        physical_index = self.telemetry_mode_combo.findData(TELEMETRY_MODE_PHYSICAL)
+        if physical_index >= 0:
+            self.telemetry_mode_combo.setItemText(
+                physical_index, self._tr("telemetry_physical")
+            )
         self._refresh_health_panel(update_rx_rate=False)
         self._update_stream_summary()
 
@@ -1091,6 +1260,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.tabs.setTabText(1, self._tr("data_panel"))
         self.auto_scale_checkbox.setText(self._tr("auto_scale"))
         self.auto_scale_checkbox.setToolTip(self._tr("auto_scale_tooltip"))
+        self.opengl_checkbox.setText(self._tr("opengl_plot"))
+        self.opengl_checkbox.setToolTip(self._tr("opengl_plot_tooltip"))
         self.clear_plots_btn.setText(self._tr("clear_plots"))
         self.clear_plots_btn.setToolTip(self._tr("clear_plots_tooltip"))
         self.import_csv_btn.setText(self._tr("import_csv"))
@@ -1106,6 +1277,8 @@ class ReducerMonitorWindow(QMainWindow):
             self._tr("voltage_mv"),
             self._tr("strain_ue"),
             self._tr("stress_mpa"),
+            "Raw",
+            "零点 Raw",
             self._tr("samples"),
         ])
         self.stats_group.setTitle(self._tr("voltage_statistics"))
@@ -1136,6 +1309,20 @@ class ReducerMonitorWindow(QMainWindow):
         if self.language == "zh":
             return STATUS_TRANSLATIONS.get(reason, reason)
         return reason
+
+    def _physical_values_from_raw(self, raw_values) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        raw = np.asarray(raw_values, dtype=np.float64)
+        raw_to_mv_scale = (
+            (2.0 * (self.vref_uv / 1_000_000.0)) / self.pga_gain
+        ) * (1000.0 / 8388608.0)
+        voltage = raw * raw_to_mv_scale
+        strain = np.clip(
+            voltage * MV_TO_MICROSTRAIN_SCALE,
+            -MAX_STRAIN_UE,
+            MAX_STRAIN_UE,
+        )
+        stress = strain * ELASTIC_MODULUS_MPA / 1000000.0
+        return voltage, strain, stress
 
     def _refresh_statistics_labels(self):
         for channel in range(NUM_CHANNELS):
@@ -1185,6 +1372,7 @@ class ReducerMonitorWindow(QMainWindow):
     def _set_connection_controls_enabled(self, enabled: bool):
         self.interface_combo.setEnabled(enabled)
         self.channel_combo.setEnabled(enabled)
+        self.slcan_speed_combo.setEnabled(enabled)
         self.refresh_btn.setEnabled(enabled)
 
     @staticmethod
@@ -1201,28 +1389,22 @@ class ReducerMonitorWindow(QMainWindow):
     def _ads1256_cycling_rate(sample_rate: float) -> float:
         return ADS1256_CYCLING_RATES.get(sample_rate, sample_rate)
 
-    def _telemetry_decimation(self, sample_rate: float) -> int:
-        source_frames_per_second = (
+    def _estimated_telemetry_rate(self, sample_rate: float) -> float:
+        return (
             self._ads1256_cycling_rate(sample_rate) * self._active_adc_count()
-        )
-        return max(
-            1,
-            int(
-                (source_frames_per_second + CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND - 1)
-                // CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND
-            ),
         )
 
-    def _estimated_telemetry_rate(self, sample_rate: float) -> float:
-        source_frames_per_second = (
-            self._ads1256_cycling_rate(sample_rate) * self._active_adc_count()
+    def _telemetry_mode_text(self, mode: Optional[int] = None) -> str:
+        selected = self.telemetry_mode if mode is None else mode
+        return (
+            self._tr("telemetry_physical")
+            if selected == TELEMETRY_MODE_PHYSICAL
+            else self._tr("telemetry_raw")
         )
-        return source_frames_per_second / self._telemetry_decimation(sample_rate)
 
     def _update_stream_summary(self):
         if not hasattr(self, "stream_summary_label"):
             return
-        decimation = self._telemetry_decimation(self.sample_rate_sps)
         self.stream_summary_label.setText(
             self._tr(
                 "stream_summary",
@@ -1232,7 +1414,7 @@ class ReducerMonitorWindow(QMainWindow):
                     self._active_adc_count()
                 ),
                 telemetry_rate=self._estimated_telemetry_rate(self.sample_rate_sps),
-                decimation=decimation,
+                mode=self._telemetry_mode_text(),
             )
         )
 
@@ -1260,15 +1442,15 @@ class ReducerMonitorWindow(QMainWindow):
     @staticmethod
     def _create_waveform_buffers():
         voltage_buffers = [
-            deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
+            WaveformRingBuffer(WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
         ]
         return voltage_buffers, {
             "voltage": voltage_buffers,
             "strain": [
-                deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
+                WaveformRingBuffer(WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
             ],
             "stress": [
-                deque(maxlen=WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
+                WaveformRingBuffer(WAVEFORM_BUFFER_SIZE) for _ in range(NUM_CHANNELS)
             ],
         }
 
@@ -1388,7 +1570,6 @@ class ReducerMonitorWindow(QMainWindow):
 
         self._refresh_waveform_layout()
         self._update_plot_controls()
-        self._sync_mcu_channel_mask()
 
     def _remove_waveform_plot(self, panel: QWidget):
         if panel not in self.plot_panels:
@@ -1417,7 +1598,6 @@ class ReducerMonitorWindow(QMainWindow):
 
         self._refresh_waveform_layout()
         self._update_plot_controls()
-        self._sync_mcu_channel_mask()
 
     def _on_plot_channel_changed(self, plot: pg.PlotWidget):
         if plot not in self.plot_widgets:
@@ -1436,7 +1616,6 @@ class ReducerMonitorWindow(QMainWindow):
         self._update_plot_presentation(plot_index)
         if self.maximized_plot_panel is self.plot_panels[plot_index]:
             self.maximized_plot_channel = int(channel)
-        self._sync_mcu_channel_mask()
 
     def _on_plot_metric_toggled(
         self, plot: pg.PlotWidget, metric: str, enabled: bool
@@ -1517,9 +1696,13 @@ class ReducerMonitorWindow(QMainWindow):
         nearest = None
         for metric in self._selected_plot_metrics(plot_index):
             values = self.waveform_metric_buffers[metric][channel]
-            if not 0 <= sample < len(values):
+            total = len(values)
+            visible = values.to_array(PLOT_VISIBLE_SAMPLES)
+            first_sample = max(0, total - len(visible))
+            local_sample = sample - first_sample
+            if not 0 <= local_sample < len(visible):
                 continue
-            value = values[sample]
+            value = float(visible[local_sample])
             distance = abs(mouse.y() - value)
             if nearest is None or distance < nearest[0]:
                 nearest = (distance, metric, value)
@@ -1554,7 +1737,14 @@ class ReducerMonitorWindow(QMainWindow):
     def _refresh_plot_data(self, plot_index: int):
         channel = self.plot_channels[plot_index]
         for metric, curve in self.plot_metric_curves[plot_index].items():
-            curve.setData(list(self.waveform_metric_buffers[metric][channel]))
+            values = self.waveform_metric_buffers[metric][channel].to_array(
+                PLOT_VISIBLE_SAMPLES
+            )
+            if values.size:
+                first_sample = max(0, len(self.waveform_metric_buffers[metric][channel]) - values.size)
+                curve.setData(np.arange(first_sample, first_sample + values.size), values)
+            else:
+                curve.setData([], [])
 
     def _update_plot_presentation(self, plot_index: int):
         channel = self.plot_channels[plot_index]
@@ -1645,6 +1835,15 @@ class ReducerMonitorWindow(QMainWindow):
         if enabled:
             self.plot_dirty = [True for _ in range(NUM_CHANNELS)]
 
+    def _on_opengl_toggled(self, enabled: bool):
+        applied = configure_plot_backend(enabled)
+        if enabled and not applied:
+            with QSignalBlocker(self.opengl_checkbox):
+                self.opengl_checkbox.setChecked(False)
+            self._show_status("opengl_unavailable")
+        for plot_index in range(len(self.plot_widgets)):
+            self._refresh_plot_data(plot_index)
+
     def _set_plot_refresh_rate(self, refresh_hz: int):
         interval_ms = max(1, round(1000 / refresh_hz))
         self.update_timer.start(interval_ms)
@@ -1655,6 +1854,8 @@ class ReducerMonitorWindow(QMainWindow):
                 self._create_waveform_buffers()
             )
             self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
+            self.pending_telemetry_batches.clear()
+            self.csv_pending_rows.clear()
 
         for curves in self.plot_metric_curves:
             for curve in curves.values():
@@ -1747,10 +1948,15 @@ class ReducerMonitorWindow(QMainWindow):
             self.last_rx_telemetry_count = 0
             self.rx_telemetry_rate_hz = 0.0
             self.latest_health = None
+            self.health_tx_drop_delta = 0
+            self.health_adc_overflow_delta = 0
+            self.health_adc_recovery_delta = 0
+            self.pending_telemetry_batches.clear()
+            self.csv_pending_rows.clear()
 
         if hasattr(self, 'data_table'):
             for row in range(NUM_CHANNELS):
-                for col in range(1, 5):
+                for col in range(1, 7):
                     self.data_table.item(row, col).setText("-")
 
         if hasattr(self, 'stats_labels'):
@@ -1841,30 +2047,25 @@ class ReducerMonitorWindow(QMainWindow):
             param=sample_rate_param,
             value=sample_rate_value,
         ):
-            self.sample_rate_sps = sample_rate
-            self._update_stream_summary()
             logger.info("Sample rate set to %s SPS", sample_rate)
         else:
             self._show_status("sample_rate_failed")
             logger.warning("Failed to send sample rate command")
 
-    def on_save_zero_clicked(self):
-        """Handle Save Zero button click - saves current offsets to Flash"""
-        if self.send_command(CAN_CMD_SAVE_ZERO):
-            self._show_status("save_zero_sent")
-            logger.info("Save Zero command sent")
-        else:
-            self._show_status("save_zero_failed")
-            logger.warning("Failed to save zero offset")
+    def on_telemetry_mode_changed(self, index: int):
+        if index < 0 or not self.is_connected:
+            return
 
-    def on_load_zero_clicked(self):
-        """Handle Load Zero button click - loads offsets from Flash"""
-        if self.send_command(CAN_CMD_LOAD_ZERO):
-            self._show_status("load_zero_sent")
-            logger.info("Load Zero command sent")
+        mode = self.telemetry_mode_combo.currentData()
+        if mode is None:
+            return
+
+        mode = int(mode)
+        if self.send_command(CAN_CMD_SET_TELEMETRY_MODE, param=0, value=mode):
+            logger.info("Telemetry mode set to %s", mode)
         else:
-            self._show_status("load_zero_failed")
-            logger.warning("Failed to load zero offset")
+            self._show_status("telemetry_mode_failed")
+            logger.warning("Failed to send telemetry mode command")
 
     def on_clear_zero_clicked(self):
         """Handle Clear Zero button click - clears offsets from Flash"""
@@ -1874,6 +2075,61 @@ class ReducerMonitorWindow(QMainWindow):
         else:
             self._show_status("clear_zero_failed")
             logger.warning("Failed to clear zero offset")
+
+    def on_vref_changed(self):
+        if self.is_connected:
+            self.send_command(CAN_CMD_SET_VREF_UV, value=round(self.vref_spin.value() * 1_000_000))
+
+    def on_pga_changed(self, index: int):
+        if self.is_connected and index >= 0:
+            gain = self.pga_combo.currentData()
+            if gain is not None:
+                self.send_command(CAN_CMD_SET_PGA, value=int(gain))
+
+    def on_channel_mask_changed(self):
+        if self.is_connected:
+            self.send_command(CAN_CMD_SET_CHANNEL_MASK, value=self.channel_mask_spin.value())
+
+    def on_restore_defaults_clicked(self):
+        answer = QMessageBox.question(
+            self, "恢复默认配置", "恢复默认配置会清除所有零点，是否继续？"
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.send_command(CAN_CMD_RESTORE_DEFAULTS)
+
+    def _apply_config_snapshot(self, config):
+        self.vref_uv = config.vref_uv
+        self.pga_gain = config.pga_gain
+        self.config_sequence = config.sequence
+        self.zero_offsets = list(config.zero_offsets)
+        self.zero_valid = config.zero_valid
+        self.sample_rate_sps = config.sample_rate_x10 / 10.0
+        self.telemetry_mode = config.telemetry_mode
+        with QSignalBlocker(self.vref_spin):
+            self.vref_spin.setValue(self.vref_uv / 1_000_000.0)
+        with QSignalBlocker(self.pga_combo):
+            index = self.pga_combo.findData(self.pga_gain)
+            if index >= 0:
+                self.pga_combo.setCurrentIndex(index)
+        with QSignalBlocker(self.channel_mask_spin):
+            self.channel_mask_spin.setValue(config.channel_mask)
+        with QSignalBlocker(self.filter_size_spin):
+            self.filter_size_spin.setValue(config.filter_length)
+        with QSignalBlocker(self.sample_rate_combo):
+            index = self.sample_rate_combo.findData(self.sample_rate_sps)
+            if index >= 0:
+                self.sample_rate_combo.setCurrentIndex(index)
+        with QSignalBlocker(self.telemetry_mode_combo):
+            index = self.telemetry_mode_combo.findData(self.telemetry_mode)
+            if index >= 0:
+                self.telemetry_mode_combo.setCurrentIndex(index)
+        self.data_table.setColumnHidden(4, self.telemetry_mode != TELEMETRY_MODE_RAW)
+        self.data_table.setColumnHidden(5, self.telemetry_mode != TELEMETRY_MODE_RAW)
+        self.config_state_label.setText(
+            ("已保存" if config.saved else "等待保存") +
+            (" | 零点有效" if config.zero_valid else " | 需要重新调零")
+        )
+        self._update_stream_summary()
 
     def _create_command_group(self) -> QGroupBox:
         """Create the command control group"""
@@ -1890,17 +2146,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.calib_btn.clicked.connect(self.on_calib_clicked)
         self.calib_btn.setEnabled(False)
         controls.addWidget(self.calib_btn)
-
-        # Zero offset Flash storage controls
-        self.save_zero_btn = QPushButton()
-        self.save_zero_btn.clicked.connect(self.on_save_zero_clicked)
-        self.save_zero_btn.setEnabled(False)
-        controls.addWidget(self.save_zero_btn)
-
-        self.load_zero_btn = QPushButton()
-        self.load_zero_btn.clicked.connect(self.on_load_zero_clicked)
-        self.load_zero_btn.setEnabled(False)
-        controls.addWidget(self.load_zero_btn)
 
         self.clear_zero_btn = QPushButton()
         self.clear_zero_btn.clicked.connect(self.on_clear_zero_clicked)
@@ -1930,6 +2175,17 @@ class ReducerMonitorWindow(QMainWindow):
         self.filter_size_spin.setEnabled(False)
         self.filter_size_spin.valueChanged.connect(self.on_filter_size_changed)
         controls.addWidget(self.filter_size_spin)
+
+        self.telemetry_mode_label = QLabel()
+        controls.addWidget(self.telemetry_mode_label)
+        self.telemetry_mode_combo = QComboBox()
+        self.telemetry_mode_combo.addItem("", TELEMETRY_MODE_RAW)
+        self.telemetry_mode_combo.addItem("", TELEMETRY_MODE_PHYSICAL)
+        self.telemetry_mode_combo.setEnabled(False)
+        self.telemetry_mode_combo.currentIndexChanged.connect(
+            self.on_telemetry_mode_changed
+        )
+        controls.addWidget(self.telemetry_mode_combo)
 
         controls.addStretch()
         layout.addLayout(controls)
@@ -1965,9 +2221,9 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         counters = (
-            health.tx_drop_count,
-            health.adc_overflow_count,
-            health.adc_recovery_count,
+            self.health_tx_drop_delta,
+            self.health_adc_overflow_delta,
+            self.health_adc_recovery_delta,
             self.rx_bad_protocol_count,
         )
         state = "ok" if health.adc_running and not any(counters) else "warning"
@@ -1982,8 +2238,12 @@ class ReducerMonitorWindow(QMainWindow):
                 ),
                 rx_rate=self.rx_telemetry_rate_hz,
                 sample_rate=self._format_sample_rate(health.sample_rate_sps),
-                decimation=health.telemetry_decimation,
+                mode=self._telemetry_mode_text(health.telemetry_mode),
+                tx_samples=health.telemetry_samples_per_second,
+                tx_frames=health.telemetry_frames_per_second,
+                drop_delta=self.health_tx_drop_delta,
                 tx_drop=health.tx_drop_count,
+                overflow_delta=self.health_adc_overflow_delta,
                 overflow=health.adc_overflow_count,
                 recovery=health.adc_recovery_count,
                 bad=self.rx_bad_protocol_count,
@@ -2007,16 +2267,28 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         baudrate = FIXED_CAN_BITRATE
-        tty_baudrate = DEFAULT_SLCAN_TTY_BAUDRATE
+        tty_baudrate = int(self.slcan_speed_combo.currentData() or DEFAULT_SLCAN_TTY_BAUDRATE)
 
         try:
             self.can_bus = PythonCANInterface()
-            if not self.can_bus.connect(
-                interface,
-                channel,
-                baudrate,
-                tty_baudrate=tty_baudrate,
-            ):
+            speeds = [tty_baudrate]
+            if interface == "slcan":
+                speeds.extend(
+                    speed for speed in (921_600, 460_800, 115_200)
+                    if speed < tty_baudrate
+                )
+            connected = False
+            for speed in speeds:
+                if self.can_bus.connect(
+                    interface, channel, baudrate, tty_baudrate=speed
+                ):
+                    tty_baudrate = speed
+                    speed_index = self.slcan_speed_combo.findData(speed)
+                    if speed_index >= 0:
+                        self.slcan_speed_combo.setCurrentIndex(speed_index)
+                    connected = True
+                    break
+            if not connected:
                 interface_help = (
                     self._tr("slcan_help")
                     if interface == "slcan"
@@ -2050,31 +2322,16 @@ class ReducerMonitorWindow(QMainWindow):
             self.log_btn.setEnabled(True)
             self.zero_btn.setEnabled(True)
             self.calib_btn.setEnabled(True)
-            self.save_zero_btn.setEnabled(True)
-            self.load_zero_btn.setEnabled(True)
             self.clear_zero_btn.setEnabled(True)
             self.sample_rate_combo.setEnabled(True)
             self.filter_size_spin.setEnabled(True)
-            channel_mask_synced = self._sync_mcu_channel_mask(
-                show_status=False, force=True
-            )
-            if not channel_mask_synced:
-                self._show_status("channel_mask_failed")
-            elif interface == "slcan":
-                self._show_status(
-                    "connected_slcan",
-                    channel=channel,
-                    can_baudrate=baudrate.bps,
-                    data_bitrate=CAN_FD_DATA_BITRATE,
-                )
-            else:
-                self._show_status(
-                    "connected_generic",
-                    interface=interface,
-                    channel=channel,
-                    can_baudrate=baudrate.bps,
-                    data_bitrate=CAN_FD_DATA_BITRATE,
-                )
+            self.telemetry_mode_combo.setEnabled(True)
+            self.vref_spin.setEnabled(True)
+            self.pga_combo.setEnabled(True)
+            self.channel_mask_spin.setEnabled(True)
+            self.restore_defaults_btn.setEnabled(True)
+            self.send_command(CAN_CMD_GET_CONFIG)
+            self._show_status("connected_device", interface=interface, channel=channel)
 
             logger.info(
                 "Connected to %s:%s (CAN FD bitrate %s/%s)",
@@ -2117,11 +2374,14 @@ class ReducerMonitorWindow(QMainWindow):
         self.log_btn.setEnabled(False)
         self.zero_btn.setEnabled(False)
         self.calib_btn.setEnabled(False)
-        self.save_zero_btn.setEnabled(False)
-        self.load_zero_btn.setEnabled(False)
         self.clear_zero_btn.setEnabled(False)
         self.sample_rate_combo.setEnabled(False)
         self.filter_size_spin.setEnabled(False)
+        self.telemetry_mode_combo.setEnabled(False)
+        self.vref_spin.setEnabled(False)
+        self.pga_combo.setEnabled(False)
+        self.channel_mask_spin.setEnabled(False)
+        self.restore_defaults_btn.setEnabled(False)
         self._show_status("disconnected")
         logger.info("Disconnected")
 
@@ -2133,29 +2393,62 @@ class ReducerMonitorWindow(QMainWindow):
             self._handle_status_frame(status)
             return
 
+        config = parse_config_frame(frame)
+        if config is not None:
+            self._apply_config_snapshot(config)
+            return
+
         health = parse_health_frame(frame)
         if health is not None:
+            previous_health = self.latest_health
+            if previous_health is None:
+                self.health_tx_drop_delta = 0
+                self.health_adc_overflow_delta = 0
+                self.health_adc_recovery_delta = 0
+            else:
+                self.health_tx_drop_delta = max(
+                    0, health.tx_drop_count - previous_health.tx_drop_count
+                )
+                self.health_adc_overflow_delta = max(
+                    0,
+                    health.adc_overflow_count -
+                    previous_health.adc_overflow_count,
+                )
+                self.health_adc_recovery_delta = max(
+                    0,
+                    health.adc_recovery_count -
+                    previous_health.adc_recovery_count,
+                )
             self.latest_health = health
             self.sample_rate_sps = health.sample_rate_sps
+            self.telemetry_mode = health.telemetry_mode
             with QSignalBlocker(self.sample_rate_combo):
                 sample_rate_index = self.sample_rate_combo.findData(
                     self.sample_rate_sps
                 )
                 if sample_rate_index >= 0:
                     self.sample_rate_combo.setCurrentIndex(sample_rate_index)
+            with QSignalBlocker(self.telemetry_mode_combo):
+                mode_index = self.telemetry_mode_combo.findData(self.telemetry_mode)
+                if mode_index >= 0:
+                    self.telemetry_mode_combo.setCurrentIndex(mode_index)
             self._update_stream_summary()
             self._refresh_health_panel(update_rx_rate=False)
             return
 
         telemetry_frames = parse_telemetry_frames(frame)
         if telemetry_frames is None:
-            if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS, CAN_ID_TX_HEALTH):
+            if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS,
+                            CAN_ID_TX_HEALTH, CAN_ID_TX_CONFIG):
                 self.rx_bad_protocol_count += 1
                 logger.warning("Rejected malformed protocol frame on CAN ID 0x%03X", frame.id)
             return
 
-        for telemetry in telemetry_frames:
-            self._ingest_telemetry(telemetry, frame.timestamp)
+        with self.lock:
+            if len(self.pending_telemetry_batches) == self.pending_telemetry_batches.maxlen:
+                self.display_drop_count += len(self.pending_telemetry_batches[0][0])
+            self.pending_telemetry_batches.append((telemetry_frames, frame.timestamp))
+            self.rx_telemetry_count += len(telemetry_frames)
 
     def _ingest_telemetry(self, telemetry, timestamp: Optional[float]):
         channel = telemetry.channel
@@ -2165,24 +2458,100 @@ class ReducerMonitorWindow(QMainWindow):
             logger.warning(f"Invalid channel: {channel}")
             return
 
-        with self.lock:
-            data = self.channel_data[channel]
-            data.voltage_001mv = telemetry.voltage_001mv
-            data.voltage_mv = telemetry.voltage_001mv / 100.0
-            data.strain_ue = float(telemetry.strain_ue)
-            data.stress_01mpa = telemetry.stress_01mpa
-            data.stress_mpa = telemetry.strain_ue * ELASTIC_MODULUS_MPA / 1000000.0
-            data.samples += 1
-            data.last_timestamp = timestamp if timestamp is not None else time.time()
-            payload = {
-                'voltage': data.voltage_mv,
-                'strain': data.strain_ue,
-                'stress': data.stress_mpa,
-                'samples': data.samples,
-            }
-        self.rx_telemetry_count += 1
+        if telemetry.raw_value is not None:
+            voltage, strain, stress = self._physical_values_from_raw([telemetry.raw_value])
+            voltage_mv = float(voltage[0])
+            strain_ue = float(strain[0])
+            stress_mpa = float(stress[0])
+            voltage_001mv = int(round(voltage_mv * 100.0))
+            stress_01mpa = int(round(stress_mpa * 10.0))
+            raw_value = telemetry.raw_value
+        else:
+            voltage_mv = (
+                telemetry.voltage_uv / 1000.0
+                if telemetry.voltage_uv is not None
+                else telemetry.voltage_001mv / 100.0
+            )
+            voltage_001mv = int(round(voltage_mv * 100.0))
+            strain_ue = float(telemetry.strain_ue)
+            stress_mpa = (
+                telemetry.stress_qmpa * 0.25
+                if telemetry.stress_qmpa is not None
+                else telemetry.stress_01mpa / 10.0
+            )
+            stress_01mpa = int(round(stress_mpa * 10.0))
+            raw_value = None
 
-        self.data_updated.emit(channel, payload)
+        self._apply_telemetry_values(
+            channel, voltage_mv, strain_ue, stress_mpa,
+            voltage_001mv, stress_01mpa, timestamp, raw_value,
+        )
+
+    def _apply_telemetry_values(
+        self,
+        channel: int,
+        voltage_mv: float,
+        strain_ue: float,
+        stress_mpa: float,
+        voltage_001mv: int,
+        stress_01mpa: int,
+        timestamp: Optional[float],
+        raw_value: Optional[int] = None,
+    ) -> None:
+        data = self.channel_data[channel]
+        data.voltage_001mv = voltage_001mv
+        data.voltage_mv = voltage_mv
+        data.strain_ue = strain_ue
+        data.stress_01mpa = stress_01mpa
+        data.stress_mpa = stress_mpa
+        data.samples += 1
+        data.last_timestamp = timestamp if timestamp is not None else time.time()
+        payload = {
+            'voltage': voltage_mv,
+            'strain': strain_ue,
+            'stress': stress_mpa,
+            'samples': data.samples,
+            'raw': raw_value,
+        }
+        self.on_data_updated(channel, payload)
+
+    def _drain_pending_telemetry(self) -> set[int]:
+        dirty_channels = set()
+        while self.pending_telemetry_batches:
+            telemetry_frames, timestamp = self.pending_telemetry_batches.popleft()
+            raw_frames = [
+                telemetry for telemetry in telemetry_frames
+                if telemetry.raw_value is not None and telemetry.channel < NUM_CHANNELS
+            ]
+            if raw_frames:
+                voltage, strain, stress = self._physical_values_from_raw(
+                    [telemetry.raw_value for telemetry in raw_frames]
+                )
+                for telemetry, voltage_mv, strain_ue, stress_mpa in zip(
+                    raw_frames, voltage, strain, stress
+                ):
+                    self._apply_telemetry_values(
+                        telemetry.channel,
+                        float(voltage_mv),
+                        float(strain_ue),
+                        float(stress_mpa),
+                        int(round(float(voltage_mv) * 100.0)),
+                        int(round(float(stress_mpa) * 10.0)),
+                        timestamp,
+                        telemetry.raw_value,
+                    )
+                    dirty_channels.add(telemetry.channel)
+            for telemetry in telemetry_frames:
+                channel = telemetry.channel
+                if channel >= NUM_CHANNELS:
+                    self.rx_bad_protocol_count += 1
+                    logger.warning("Invalid channel: %s", channel)
+                    continue
+                if telemetry.raw_value is not None:
+                    continue
+                self._ingest_telemetry(telemetry, timestamp)
+                dirty_channels.add(channel)
+        return dirty_channels
 
     def on_data_updated(self, channel: int, data: dict):
         """Handle data update signal"""
@@ -2204,15 +2573,18 @@ class ReducerMonitorWindow(QMainWindow):
             timestamp = datetime.datetime.now().isoformat()
             row = [timestamp, channel,
                    data['voltage'], data['strain'],
-                   data['stress'], data['samples']]
-            self.csv_writer.writerow(row)
+                   data['stress'], data.get('raw', ''), self.telemetry_mode,
+                   self.config_sequence, data['samples']]
+            self.csv_pending_rows.append(row)
 
     def update_plots(self):
         """Update waveform plots (called by timer)"""
         with self.lock:
+            drained_channels = self._drain_pending_telemetry()
             dirty_channels = {
                 ch for ch in range(NUM_CHANNELS) if self.plot_dirty[ch]
             }
+            dirty_channels.update(drained_channels)
             for plot_index, channel in enumerate(self.plot_channels):
                 if channel in dirty_channels:
                     self._refresh_plot_data(plot_index)
@@ -2222,6 +2594,9 @@ class ReducerMonitorWindow(QMainWindow):
                 self.plot_dirty[channel] = False
                 self._update_data_table_row(channel)
                 self._update_statistics_label(channel)
+            if self.csv_writer and self.csv_pending_rows:
+                self.csv_writer.writerows(self.csv_pending_rows)
+                self.csv_pending_rows.clear()
 
     def _update_data_table_row(self, channel: int):
         if channel >= self.data_table.rowCount():
@@ -2233,30 +2608,34 @@ class ReducerMonitorWindow(QMainWindow):
         self.data_table.item(channel, 1).setText(f"{data['voltage']:.3f}")
         self.data_table.item(channel, 2).setText(f"{data['strain']:.2f}")
         self.data_table.item(channel, 3).setText(f"{data['stress']:.4f}")
-        self.data_table.item(channel, 4).setText(str(data['samples']))
+        raw = data.get("raw")
+        self.data_table.item(channel, 4).setText("-" if raw is None else str(raw))
+        self.data_table.item(channel, 5).setText(
+            str(self.zero_offsets[channel]) if self.telemetry_mode == TELEMETRY_MODE_RAW else "-"
+        )
+        self.data_table.item(channel, 6).setText(str(data['samples']))
 
     def _update_plot_range(self, plot_index: int):
         channel = self.plot_channels[plot_index]
         series = [
-            list(self.waveform_metric_buffers[metric][channel])
+            self.waveform_metric_buffers[metric][channel].to_array(PLOT_VISIBLE_SAMPLES)
             for metric in self._selected_plot_metrics(plot_index)
         ]
-        series = [values for values in series if values]
+        series = [values for values in series if values.size]
         if not series:
             return
 
-        sample_count = max(len(values) for values in series)
+        sample_count = max(
+            len(self.waveform_metric_buffers[metric][channel])
+            for metric in self._selected_plot_metrics(plot_index)
+        )
         visible_count = min(sample_count, PLOT_VISIBLE_SAMPLES)
-        first_sample = sample_count - visible_count
+        first_sample = max(0, sample_count - visible_count)
         last_sample = max(first_sample + 1, sample_count - 1)
-        visible_values = [
-            value
-            for values in series
-            for value in values[-visible_count:]
-        ]
+        visible_values = np.concatenate(series)
 
-        minimum = min(visible_values)
-        maximum = max(visible_values)
+        minimum = float(np.min(visible_values))
+        maximum = float(np.max(visible_values))
         center = (minimum + maximum) / 2.0
         y_range = max(maximum - minimum, PLOT_MIN_Y_RANGE_MV)
         y_padding = y_range * 0.1
@@ -2290,7 +2669,8 @@ class ReducerMonitorWindow(QMainWindow):
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow([
                 'timestamp', 'channel',
-                'voltage_mv', 'strain_ue', 'stress_mpa', 'samples'
+                'voltage_mv', 'strain_ue', 'stress_mpa', 'raw_value',
+                'telemetry_mode', 'config_sequence', 'samples'
             ])
             self.logging_enabled = True
             self.log_btn.setText(self._tr("stop_logging"))
@@ -2305,6 +2685,12 @@ class ReducerMonitorWindow(QMainWindow):
 
     def stop_logging(self):
         """Stop CSV logging"""
+        if self.csv_writer and self.csv_pending_rows:
+            try:
+                self.csv_writer.writerows(self.csv_pending_rows)
+                self.csv_pending_rows.clear()
+            except Exception:
+                logger.exception("Failed to flush pending CSV rows")
         if self.csv_file:
             try:
                 self.csv_file.close()

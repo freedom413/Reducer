@@ -15,6 +15,7 @@
 // Constants and Configuration
 // ============================================================================
 #define ADC_CHANNEL_COUNT   ADS1256_LOGICAL_CHANNEL_COUNT
+#define ADC_SAMPLE_BATCH_COUNT 32U
 #define CAN_COMMANDS_PER_LOOP 4
 #define CAN_INTERVAL_TEST_ENABLED    0U
 #if CAN_INTERVAL_TEST_ENABLED
@@ -22,26 +23,44 @@
 #define CAN_INTERVAL_TEST_PERIOD_MS  100U
 #endif
 #define CAN_TX_WAIT_TIMEOUT_MS       5U
-#define CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND  10000U
 #define CAN_TELEMETRY_QUEUE_RECORD_COUNT      128U
-#define CAN_TELEMETRY_FLUSH_PERIOD_MS         2U
+#define CAN_TELEMETRY_FLUSH_PERIOD_MIN_MS     2U
+#define CAN_TELEMETRY_FLUSH_PERIOD_MAX_MS     50U
 #define CAN_HEALTH_PERIOD_MS         1000U
+#define CONFIG_SAVE_DELAY_MS         750U
+
+typedef struct {
+    uint8_t channel;
+    int32_t raw_filtered;
+    int32_t voltage_uv;
+    int16_t strain_ue;
+    int16_t stress_qmpa;
+} can_telemetry_sample_t;
 
 // ============================================================================
 // Module State
 // ============================================================================
-static ads1256_data_t adc_ads1256_data[ADC_CHANNEL_COUNT] = {0};
+static ads1256_data_t adc_ads1256_data[ADC_SAMPLE_BATCH_COUNT] = {0};
 static bool can_ready = false;
-static uint16_t can_telemetry_decimation = 1U;
-static uint16_t can_telemetry_sample_count[ADC_CHANNEL_COUNT] = {0};
-static can_tx_telemetry_record_t
+static uint8_t can_telemetry_mode = CAN_TELEMETRY_MODE_RAW;
+static uint8_t can_telemetry_sequence = 0U;
+static can_telemetry_sample_t
     can_telemetry_queue[CAN_TELEMETRY_QUEUE_RECORD_COUNT] = {0};
 static uint16_t can_telemetry_queue_read = 0U;
 static uint16_t can_telemetry_queue_write = 0U;
 static uint16_t can_telemetry_queue_count = 0U;
 static uint32_t can_telemetry_queue_first_tick = 0U;
+static uint32_t can_telemetry_flush_period_ms =
+    CAN_TELEMETRY_FLUSH_PERIOD_MAX_MS;
 static uint16_t can_tx_drop_count = 0U;
+static uint16_t can_tx_drop_reported_count = 0U;
 static uint32_t can_health_last_tx_tick = 0U;
+static uint16_t can_telemetry_samples_since_health = 0U;
+static uint16_t can_telemetry_frames_since_health = 0U;
+static persistent_config_t persistent_config;
+static bool config_dirty = false;
+static bool config_snapshot_pending = false;
+static uint32_t config_save_deadline = 0U;
 #if CAN_INTERVAL_TEST_ENABLED
 static uint32_t can_test_last_tx_tick = 0;
 static uint8_t can_test_sequence = 0;
@@ -50,14 +69,7 @@ static uint8_t can_test_sequence = 0;
 // Physical parameters for flexspline calculation
 static flexspline_params_t flexspline_params;
 
-// Filtered raw values for each channel
-static int32_t adc_filtered_value[ADC_CHANNEL_COUNT] = {0};
-
-static float running_mean[ADC_CHANNEL_COUNT] = {0};
-static float running_m2[ADC_CHANNEL_COUNT] = {0};
-static uint16_t sample_count[ADC_CHANNEL_COUNT] = {0};
-
-static void update_can_telemetry_decimation(void);
+static void reset_can_telemetry_queue(void);
 static void flush_can_telemetry(void);
 
 #if CAN_INTERVAL_TEST_ENABLED
@@ -92,46 +104,47 @@ void setup(void)
     return;
 #endif
 
-    adc_ads1256_start();
-    update_can_telemetry_decimation();
-
-    // Register flash hardware operations (user provides implementation)
     flash_storage_register_user_ops();
-
-    // Initialize filter (will load zero offset from flash if available)
-    filter_init();
-
-    // Initialize flexspline parameters with defaults
-    flexspline_params_set_default(&flexspline_params);
-}
-
-static void update_statistics(uint8_t ch, int32_t value)
-{
-    if (sample_count[ch] == UINT16_MAX) {
-        return;
+    if (flash_storage_load_config(&persistent_config) != 0) {
+        flash_storage_config_defaults(&persistent_config);
+        (void)flash_storage_save_config(&persistent_config);
     }
-    sample_count[ch]++;
 
-    // Welford's online algorithm for running variance
-    float delta = (float)value - running_mean[ch];
-    running_mean[ch] += delta / (float)sample_count[ch];
-    float delta2 = (float)value - running_mean[ch];
-    running_m2[ch] += delta * delta2;
+    adc_ads1256_start();
+    if (adc_ads1256_set_vref_uv(persistent_config.vref_uv) != 0 ||
+        adc_ads1256_set_pga_gain(persistent_config.pga_gain) != 0 ||
+        adc_ads1256_set_sample_rate_x10(persistent_config.sample_rate_x10) != 0 ||
+        adc_ads1256_set_channel_mask(persistent_config.channel_mask) != 0 ||
+        persistent_config.filter_length < FILTER_WINDOW_SIZE_MIN ||
+        persistent_config.filter_length > FILTER_WINDOW_SIZE_MAX ||
+        persistent_config.telemetry_mode > CAN_TELEMETRY_MODE_PHYSICAL) {
+        flash_storage_config_defaults(&persistent_config);
+        (void)adc_ads1256_set_vref_uv(persistent_config.vref_uv);
+        (void)adc_ads1256_set_pga_gain(persistent_config.pga_gain);
+        (void)adc_ads1256_set_sample_rate_x10(persistent_config.sample_rate_x10);
+        (void)adc_ads1256_set_channel_mask(persistent_config.channel_mask);
+        (void)flash_storage_save_config(&persistent_config);
+    }
+    (void)adc_ads1256_calibrate();
+    (void)adc_ads1256_restart();
+    filter_init();
+    filter_set_window_size(persistent_config.filter_length);
+    can_telemetry_mode = persistent_config.telemetry_mode;
+    reset_can_telemetry_queue();
+
+    flexspline_params_set(
+        &flexspline_params,
+        (float)persistent_config.vref_uv / 1000000.0f,
+        persistent_config.pga_gain,
+        FLEXSPLINE_BRIDGE_EXCITATION_V,
+        FLEXSPLINE_GAUGE_FACTOR,
+        FLEXSPLINE_ELASTIC_MODULUS_MPA);
+    config_snapshot_pending = true;
 }
 
 static void reset_channel_statistics(uint8_t ch)
 {
-    running_mean[ch] = 0;
-    running_m2[ch] = 0;
-    adc_filtered_value[ch] = 0;
-    sample_count[ch] = 0;
-}
-
-static void reset_statistics(void)
-{
-    for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
-        reset_channel_statistics(i);
-    }
+    (void)ch;
 }
 
 static uint8_t active_ads1256_count(void)
@@ -151,23 +164,68 @@ static uint8_t active_ads1256_count(void)
     return active_count;
 }
 
-static void update_can_telemetry_decimation(void)
+static uint8_t active_ads1256_channel_count(void)
 {
-    uint32_t source_rate_x10 =
-        adc_ads1256_get_cycling_rate_x10() * active_ads1256_count();
-    uint32_t telemetry_limit_x10 =
-        CAN_TELEMETRY_MAX_SAMPLES_PER_SECOND * 10U;
-    uint32_t decimation =
-        (source_rate_x10 + telemetry_limit_x10 - 1U) / telemetry_limit_x10;
+    uint16_t mask = adc_ads1256_get_channel_mask();
+    uint8_t count = 0U;
 
-    if (decimation == 0U) {
-        decimation = 1U;
+    while (mask != 0U) {
+        count = (uint8_t)(count + (mask & 1U));
+        mask >>= 1U;
     }
-    if (decimation > UINT16_MAX) {
-        decimation = UINT16_MAX;
+    return count;
+}
+
+static uint32_t calculate_can_telemetry_flush_period_ms(uint8_t max_records)
+{
+    uint32_t aggregate_rate_x10 =
+        adc_ads1256_get_cycling_rate_x10() * active_ads1256_count();
+    uint32_t active_channels = active_ads1256_channel_count();
+
+    if (aggregate_rate_x10 == 0U || active_channels == 0U) {
+        return CAN_TELEMETRY_FLUSH_PERIOD_MAX_MS;
     }
-    can_telemetry_decimation = (uint16_t)decimation;
-    memset(can_telemetry_sample_count, 0, sizeof(can_telemetry_sample_count));
+
+    /*
+     * Prefer a full frame, but do not add more than roughly half of the
+     * moving-average window latency. The aggregate source rate includes all
+     * active ADCs; dividing it across enabled channels estimates the
+     * per-channel filter-window duration.
+     */
+    uint32_t fill_ms =
+        ((uint32_t)max_records * 10000U + aggregate_rate_x10 - 1U) /
+        aggregate_rate_x10;
+    uint32_t half_filter_window_ms =
+        ((uint32_t)filter_get_window_size() * active_channels * 5000U +
+         aggregate_rate_x10 - 1U) /
+        aggregate_rate_x10;
+    uint32_t minimum_batch_ms =
+        (((uint32_t)max_records + 1U) / 2U * 10000U +
+         aggregate_rate_x10 - 1U) /
+        aggregate_rate_x10;
+    uint32_t period_ms =
+        fill_ms < half_filter_window_ms ? fill_ms : half_filter_window_ms;
+    if (period_ms < minimum_batch_ms) {
+        period_ms = minimum_batch_ms;
+    }
+
+    if (period_ms < CAN_TELEMETRY_FLUSH_PERIOD_MIN_MS) {
+        return CAN_TELEMETRY_FLUSH_PERIOD_MIN_MS;
+    }
+    if (period_ms > CAN_TELEMETRY_FLUSH_PERIOD_MAX_MS) {
+        return CAN_TELEMETRY_FLUSH_PERIOD_MAX_MS;
+    }
+    return period_ms;
+}
+
+static void reset_can_telemetry_queue(void)
+{
+    uint8_t max_records =
+        can_telemetry_mode == CAN_TELEMETRY_MODE_RAW ?
+            CAN_TELEMETRY_RAW_MAX_RECORDS :
+            CAN_TELEMETRY_PHYSICAL_MAX_RECORDS;
+    can_telemetry_flush_period_ms =
+        calculate_can_telemetry_flush_period_ms(max_records);
     can_telemetry_queue_read = 0U;
     can_telemetry_queue_write = 0U;
     can_telemetry_queue_count = 0U;
@@ -175,7 +233,7 @@ static void update_can_telemetry_decimation(void)
 }
 
 static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
-                            uint16_t value, uint8_t detail)
+                            uint32_t value, uint8_t detail)
 {
     if (!can_ready) {
         return;
@@ -198,19 +256,28 @@ static void count_can_tx_drops(uint16_t count)
     can_tx_drop_count = total > UINT16_MAX ? UINT16_MAX : (uint16_t)total;
 }
 
+static uint16_t can_tx_drop_delta(void)
+{
+    if (can_tx_drop_count < can_tx_drop_reported_count) {
+        return 0U;
+    }
+    return (uint16_t)(can_tx_drop_count - can_tx_drop_reported_count);
+}
+
 static void pop_can_telemetry_records(uint8_t record_count)
 {
     can_telemetry_queue_read =
-        (uint16_t)((can_telemetry_queue_read + record_count) %
-                   CAN_TELEMETRY_QUEUE_RECORD_COUNT);
+        (uint16_t)((can_telemetry_queue_read + record_count) &
+                   (CAN_TELEMETRY_QUEUE_RECORD_COUNT - 1U));
     can_telemetry_queue_count -= record_count;
     if (can_telemetry_queue_count > 0U) {
         can_telemetry_queue_first_tick = HAL_GetTick();
     }
 }
 
-static void queue_can_telemetry(uint8_t channel, int16_t voltage_001mv,
-                                int16_t strain_ue, int8_t stress_01mpa)
+static void queue_can_telemetry(uint8_t channel, int32_t raw_filtered,
+                                int32_t voltage_uv, int16_t strain_ue,
+                                int16_t stress_qmpa)
 {
     if (!can_ready || channel >= ADC_CHANNEL_COUNT) {
         return;
@@ -223,11 +290,14 @@ static void queue_can_telemetry(uint8_t channel, int16_t voltage_001mv,
     if (can_telemetry_queue_count == 0U) {
         can_telemetry_queue_first_tick = HAL_GetTick();
     }
-    can_build_telemetry_record(&can_telemetry_queue[can_telemetry_queue_write],
-                               channel, voltage_001mv, strain_ue, stress_01mpa);
+    can_telemetry_queue[can_telemetry_queue_write].channel = channel;
+    can_telemetry_queue[can_telemetry_queue_write].raw_filtered = raw_filtered;
+    can_telemetry_queue[can_telemetry_queue_write].voltage_uv = voltage_uv;
+    can_telemetry_queue[can_telemetry_queue_write].strain_ue = strain_ue;
+    can_telemetry_queue[can_telemetry_queue_write].stress_qmpa = stress_qmpa;
     can_telemetry_queue_write =
-        (uint16_t)((can_telemetry_queue_write + 1U) %
-                   CAN_TELEMETRY_QUEUE_RECORD_COUNT);
+        (uint16_t)((can_telemetry_queue_write + 1U) &
+                   (CAN_TELEMETRY_QUEUE_RECORD_COUNT - 1U));
     can_telemetry_queue_count++;
 }
 
@@ -238,36 +308,87 @@ static void flush_can_telemetry(void)
     }
 
     while (can_telemetry_queue_count > 0U) {
+        uint8_t max_records =
+            can_telemetry_mode == CAN_TELEMETRY_MODE_RAW ?
+                CAN_TELEMETRY_RAW_MAX_RECORDS :
+                CAN_TELEMETRY_PHYSICAL_MAX_RECORDS;
         uint32_t now = HAL_GetTick();
-        if (can_telemetry_queue_count < CAN_TELEMETRY_BATCH_MAX_RECORDS &&
+        if (can_telemetry_queue_count < max_records &&
             (uint32_t)(now - can_telemetry_queue_first_tick) <
-                CAN_TELEMETRY_FLUSH_PERIOD_MS) {
+                can_telemetry_flush_period_ms) {
             return;
         }
 
         uint8_t record_count =
-            can_telemetry_queue_count > CAN_TELEMETRY_BATCH_MAX_RECORDS ?
-                CAN_TELEMETRY_BATCH_MAX_RECORDS :
-                (uint8_t)can_telemetry_queue_count;
-        can_tx_telemetry_record_t records[CAN_TELEMETRY_BATCH_MAX_RECORDS];
-        for (uint8_t i = 0U; i < record_count; i++) {
-            uint16_t queue_index =
-                (uint16_t)((can_telemetry_queue_read + i) %
-                           CAN_TELEMETRY_QUEUE_RECORD_COUNT);
-            records[i] = can_telemetry_queue[queue_index];
+            can_telemetry_queue_count > max_records ?
+                max_records : (uint8_t)can_telemetry_queue_count;
+        uint16_t drop_delta = can_tx_drop_delta();
+        int ret;
+        if (can_telemetry_mode == CAN_TELEMETRY_MODE_RAW) {
+            can_tx_raw_telemetry_batch_frame_t frame = {0};
+            frame.frame_type = CAN_FRAME_TYPE_TELEMETRY_RAW_BATCH;
+            frame.version = CAN_PROTOCOL_VERSION;
+            frame.telemetry_mode = CAN_TELEMETRY_MODE_RAW;
+            frame.sequence = can_telemetry_sequence;
+            frame.record_count = record_count;
+            frame.drop_delta_le[0] = (uint8_t)(drop_delta & 0xFFU);
+            frame.drop_delta_le[1] = (uint8_t)((drop_delta >> 8) & 0xFFU);
+            for (uint8_t i = 0U; i < record_count; i++) {
+                uint16_t queue_index =
+                    (uint16_t)((can_telemetry_queue_read + i) &
+                               (CAN_TELEMETRY_QUEUE_RECORD_COUNT - 1U));
+                const can_telemetry_sample_t *sample =
+                    &can_telemetry_queue[queue_index];
+                can_build_raw_telemetry_record(&frame.records[i],
+                                               sample->channel,
+                                               sample->raw_filtered);
+            }
+            ret = can_fd_data_frame_send(
+                CAN_ID_TX_TELEMETRY,
+                (const uint8_t *)&frame,
+                sizeof(frame));
+        } else {
+            can_tx_physical_telemetry_batch_frame_t frame = {0};
+            frame.frame_type = CAN_FRAME_TYPE_TELEMETRY_PHYSICAL_BATCH;
+            frame.version = CAN_PROTOCOL_VERSION;
+            frame.telemetry_mode = CAN_TELEMETRY_MODE_PHYSICAL;
+            frame.sequence = can_telemetry_sequence;
+            frame.record_count = record_count;
+            frame.drop_delta_le[0] = (uint8_t)(drop_delta & 0xFFU);
+            frame.drop_delta_le[1] = (uint8_t)((drop_delta >> 8) & 0xFFU);
+            for (uint8_t i = 0U; i < record_count; i++) {
+                uint16_t queue_index =
+                    (uint16_t)((can_telemetry_queue_read + i) &
+                               (CAN_TELEMETRY_QUEUE_RECORD_COUNT - 1U));
+                const can_telemetry_sample_t *sample =
+                    &can_telemetry_queue[queue_index];
+                can_build_physical_telemetry_record(&frame.records[i],
+                                                    sample->channel,
+                                                    sample->voltage_uv,
+                                                    sample->strain_ue,
+                                                    sample->stress_qmpa);
+            }
+            ret = can_fd_data_frame_send(
+                CAN_ID_TX_TELEMETRY,
+                (const uint8_t *)&frame,
+                sizeof(frame));
         }
-
-        can_tx_telemetry_batch_frame_t frame;
-        can_build_telemetry_batch_frame(&frame, records, record_count);
-        int ret = can_fd_data_frame_send(
-            CAN_ID_TX_TELEMETRY,
-            (const uint8_t *)&frame,
-            sizeof(frame));
         if (ret == -3) {
             return;
         }
-        if (ret != (int)sizeof(frame)) {
+        if (ret != (int)CAN_TELEMETRY_BATCH_FRAME_LEN) {
             count_can_tx_drops(record_count);
+        } else {
+            can_tx_drop_reported_count = can_tx_drop_count;
+            can_telemetry_sequence++;
+            uint32_t samples_total =
+                (uint32_t)can_telemetry_samples_since_health + record_count;
+            uint32_t frames_total =
+                (uint32_t)can_telemetry_frames_since_health + 1U;
+            can_telemetry_samples_since_health =
+                samples_total > UINT16_MAX ? UINT16_MAX : (uint16_t)samples_total;
+            can_telemetry_frames_since_health =
+                frames_total > UINT16_MAX ? UINT16_MAX : (uint16_t)frames_total;
         }
         pop_can_telemetry_records(record_count);
     }
@@ -283,19 +404,118 @@ static void send_can_health(void)
     can_health_last_tx_tick = now;
 
     uint8_t flags = adc_ads1256_is_running() != 0U ? 0x01U : 0x00U;
+    flags |= config_dirty ? 0x02U : 0U;
+    flags |= (persistent_config.flags & PERSISTENT_CONFIG_FLAG_ZERO_VALID) != 0U ?
+             0x04U : 0U;
     can_tx_health_frame_t frame;
     can_build_health_frame(&frame,
                            adc_ads1256_get_sample_rate_x10(),
-                           can_telemetry_decimation,
                            can_tx_drop_count,
                            adc_ads1256_get_overflow_count(),
                            adc_ads1256_get_recovery_count(),
+                           can_telemetry_samples_since_health,
+                           can_telemetry_frames_since_health,
                            active_ads1256_count(),
+                           can_telemetry_mode,
                            flags);
     if (can_fd_data_frame_send(CAN_ID_TX_HEALTH,
                                (const uint8_t *)&frame, sizeof(frame)) !=
         (int)sizeof(frame)) {
         count_can_tx_drops(1U);
+    } else {
+        can_telemetry_samples_since_health = 0U;
+        can_telemetry_frames_since_health = 0U;
+    }
+}
+
+static void u32_le_store(uint8_t value_le[4], uint32_t value)
+{
+    value_le[0] = (uint8_t)value;
+    value_le[1] = (uint8_t)(value >> 8);
+    value_le[2] = (uint8_t)(value >> 16);
+    value_le[3] = (uint8_t)(value >> 24);
+}
+
+static void sync_persistent_config_from_runtime(void)
+{
+    persistent_config.vref_uv = adc_ads1256_get_vref_uv();
+    persistent_config.sample_rate_x10 = adc_ads1256_get_sample_rate_x10();
+    persistent_config.channel_mask = adc_ads1256_get_channel_mask();
+    persistent_config.pga_gain = adc_ads1256_get_pga_gain();
+    persistent_config.filter_length = filter_get_window_size();
+    persistent_config.telemetry_mode = can_telemetry_mode;
+    for (uint8_t channel = 0U; channel < ADC_CHANNEL_COUNT; channel++) {
+        int32_t offset;
+        filter_get_zero_offset(channel, &offset);
+        persistent_config.zero_offset[channel] = offset;
+    }
+}
+
+static void request_config_save(bool immediate)
+{
+    sync_persistent_config_from_runtime();
+    config_dirty = true;
+    config_snapshot_pending = true;
+    config_save_deadline = immediate ? HAL_GetTick() :
+        HAL_GetTick() + CONFIG_SAVE_DELAY_MS;
+}
+
+static int save_config_now(void)
+{
+    sync_persistent_config_from_runtime();
+    if (flash_storage_save_config(&persistent_config) != 0) {
+        config_dirty = true;
+        config_snapshot_pending = true;
+        config_save_deadline = HAL_GetTick() + CONFIG_SAVE_DELAY_MS;
+        return -1;
+    }
+    config_dirty = false;
+    config_snapshot_pending = true;
+    return 0;
+}
+
+static void service_config_save(void)
+{
+    if (!config_dirty ||
+        (int32_t)(HAL_GetTick() - config_save_deadline) < 0) {
+        return;
+    }
+    sync_persistent_config_from_runtime();
+    if (flash_storage_save_config(&persistent_config) == 0) {
+        config_dirty = false;
+        config_snapshot_pending = true;
+    } else {
+        config_save_deadline = HAL_GetTick() + CONFIG_SAVE_DELAY_MS;
+    }
+}
+
+static void send_config_snapshot(void)
+{
+    if (!can_ready || !config_snapshot_pending) {
+        return;
+    }
+    sync_persistent_config_from_runtime();
+    can_tx_config_frame_t frame = {0};
+    frame.frame_type = CAN_FRAME_TYPE_CONFIG;
+    frame.version = CAN_PROTOCOL_VERSION;
+    frame.flags = (config_dirty ? 0U : 0x01U) |
+                  ((persistent_config.flags &
+                    PERSISTENT_CONFIG_FLAG_ZERO_VALID) != 0U ? 0x02U : 0U);
+    frame.pga_gain = persistent_config.pga_gain;
+    frame.filter_length = persistent_config.filter_length;
+    frame.telemetry_mode = persistent_config.telemetry_mode;
+    frame.channel_mask_le[0] = (uint8_t)persistent_config.channel_mask;
+    frame.channel_mask_le[1] = (uint8_t)(persistent_config.channel_mask >> 8);
+    u32_le_store(frame.sample_rate_x10_le, persistent_config.sample_rate_x10);
+    u32_le_store(frame.vref_uv_le, persistent_config.vref_uv);
+    u32_le_store(frame.config_sequence_le, persistent_config.sequence);
+    for (uint8_t channel = 0U; channel < ADC_CHANNEL_COUNT; channel++) {
+        u32_le_store(frame.zero_offset_le[channel],
+                     (uint32_t)persistent_config.zero_offset[channel]);
+    }
+    if (can_fd_data_frame_send(CAN_ID_TX_CONFIG, (const uint8_t *)&frame,
+                               sizeof(frame)) == (int)sizeof(frame)) {
+        config_snapshot_pending = false;
     }
 }
 
@@ -311,48 +531,26 @@ static int16_t clamp_i16_from_float(float value)
     return (int16_t)rounded;
 }
 
-static int8_t clamp_i8_from_float(float value)
-{
-    long rounded = lrintf(value);
-    if (rounded > INT8_MAX) {
-        return INT8_MAX;
-    }
-    if (rounded < INT8_MIN) {
-        return INT8_MIN;
-    }
-    return (int8_t)rounded;
-}
-
 static void process_adc_sample(uint8_t channel, int32_t raw_value)
 {
     int32_t filtered = filter_apply(channel, raw_value);
 
-    /*
-     * Keep the moving average, but do not reject large changes here.
-     * A real load step is indistinguishable from an outlier at this
-     * layer and must still reach telemetry.
-     */
-    update_statistics(channel, filtered);
-    adc_filtered_value[channel] = filtered;
+    if (can_telemetry_mode == CAN_TELEMETRY_MODE_RAW) {
+        queue_can_telemetry(channel, filtered, 0, 0, 0);
+        return;
+    }
 
     flexspline_result_t result;
     flexspline_calculate(filtered, &flexspline_params, &result);
 
-    // voltage in 0.01 mV units (e.g., 12.34 mV -> 1234)
-    int16_t voltage_001mv = clamp_i16_from_float(result.voltage * 100.0f);
-    // strain in micro-strain units
+    int32_t voltage_uv = (int32_t)lroundf(result.voltage * 1000.0f);
     int16_t strain_ue = clamp_i16_from_float(result.strain);
-    // stress preview in 0.1 MPa units, clipped to fit the compact 1-byte field
-    int8_t stress_01mpa = clamp_i8_from_float(result.stress * 10.0f);
-    can_telemetry_sample_count[channel]++;
-    if (can_telemetry_sample_count[channel] >= can_telemetry_decimation) {
-        can_telemetry_sample_count[channel] = 0;
-        queue_can_telemetry(channel, voltage_001mv, strain_ue, stress_01mpa);
-    }
+    int16_t stress_qmpa = clamp_i16_from_float(result.stress * 4.0f);
+    queue_can_telemetry(channel, filtered, voltage_uv, strain_ue, stress_qmpa);
 }
 
-static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t value,
-                                   uint16_t *applied_value, uint8_t *detail)
+static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value,
+                                   uint32_t *applied_value, uint8_t *detail)
 {
     (void)param;
     if (applied_value != NULL) {
@@ -365,7 +563,6 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
     switch (cmd_type) {
         case CAN_CMD_ZERO_DATUM: {
             // Save current filtered values as zero offset, then reset
-            int32_t previous_offsets[ADC_CHANNEL_COUNT];
             uint16_t channel_mask = adc_ads1256_get_channel_mask();
             if (channel_mask == 0U) {
                 return CAN_STATUS_BAD_VALUE;
@@ -380,7 +577,6 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
                     }
                     return CAN_STATUS_BAD_VALUE;
                 }
-                filter_get_zero_offset(i, &previous_offsets[i]);
             }
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
                 if ((channel_mask & (1U << i)) == 0U) {
@@ -389,26 +585,21 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
                 int32_t raw_filtered = filter_get_raw_filtered(i);
                 filter_set_zero_offset(i, raw_filtered);
             }
-            if (filter_save_zero_to_flash() != 0) {
-                for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
-                    if ((channel_mask & (1U << i)) == 0U) {
-                        continue;
-                    }
-                    filter_set_zero_offset(i, previous_offsets[i]);
-                }
-                if (detail != NULL) {
-                    *detail = 1;
-                }
+            persistent_config.flags |= PERSISTENT_CONFIG_FLAG_ZERO_VALID;
+            if (save_config_now() != 0) {
                 return CAN_STATUS_STORAGE_ERROR;
             }
             filter_reset_all();
-            reset_statistics();
+            reset_can_telemetry_queue();
             return CAN_STATUS_OK;
         }
 
         case CAN_CMD_SET_CHANNEL_MASK: {
+            if (value > ADS1256_ALL_CHANNEL_MASK) {
+                return CAN_STATUS_BAD_VALUE;
+            }
             uint16_t previous_mask = adc_ads1256_get_channel_mask();
-            if (adc_ads1256_set_channel_mask(value) != 0) {
+            if (adc_ads1256_set_channel_mask((uint16_t)value) != 0) {
                 if (detail != NULL) {
                     *detail = (uint8_t)value;
                 }
@@ -424,7 +615,7 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
                     reset_channel_statistics(i);
                 }
             }
-            update_can_telemetry_decimation();
+            reset_can_telemetry_queue();
             return CAN_STATUS_OK;
         }
 
@@ -439,6 +630,8 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
             if (applied_value != NULL) {
                 *applied_value = value;
             }
+            reset_can_telemetry_queue();
+            request_config_save(false);
             return CAN_STATUS_OK;
 
         case CAN_CMD_SET_SAMPLE_RATE: {
@@ -466,8 +659,8 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
                     adc_ads1256_get_sample_rate());
             }
             filter_reset_all();
-            reset_statistics();
-            update_can_telemetry_decimation();
+            reset_can_telemetry_queue();
+            request_config_save(false);
             return CAN_STATUS_OK;
         }
 
@@ -479,41 +672,103 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint16_t val
                 return CAN_STATUS_BAD_VALUE;
             }
             filter_reset_all();
-            reset_statistics();
-            return CAN_STATUS_OK;
-
-        case CAN_CMD_SAVE_ZERO:
-            if (filter_save_zero_to_flash() != 0) {
-                if (detail != NULL) {
-                    *detail = 1;
-                }
-                return CAN_STATUS_STORAGE_ERROR;
-            }
-            return CAN_STATUS_OK;
-
-        case CAN_CMD_LOAD_ZERO:
-            if (filter_load_zero_from_flash() != 0) {
-                if (detail != NULL) {
-                    *detail = 2;
-                }
-                return CAN_STATUS_STORAGE_ERROR;
-            }
-            filter_reset_all();
-            reset_statistics();
+            reset_can_telemetry_queue();
+            request_config_save(false);
             return CAN_STATUS_OK;
 
         case CAN_CMD_CLEAR_ZERO:
-            if (flash_storage_clear() != 0) {
-                if (detail != NULL) {
-                    *detail = 3;
-                }
-                return CAN_STATUS_STORAGE_ERROR;
-            }
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
                 filter_set_zero_offset(i, 0);
             }
+            persistent_config.flags &= (uint8_t)~PERSISTENT_CONFIG_FLAG_ZERO_VALID;
+            if (save_config_now() != 0) {
+                return CAN_STATUS_STORAGE_ERROR;
+            }
             filter_reset_all();
-            reset_statistics();
+            reset_can_telemetry_queue();
+            return CAN_STATUS_OK;
+
+        case CAN_CMD_SET_TELEMETRY_MODE:
+            if (value != CAN_TELEMETRY_MODE_RAW &&
+                value != CAN_TELEMETRY_MODE_PHYSICAL) {
+                if (detail != NULL) {
+                    *detail = (uint8_t)value;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
+            can_telemetry_mode = (uint8_t)value;
+            reset_can_telemetry_queue();
+            if (applied_value != NULL) {
+                *applied_value = can_telemetry_mode;
+            }
+            request_config_save(false);
+            return CAN_STATUS_OK;
+
+        case CAN_CMD_GET_CONFIG:
+            config_snapshot_pending = true;
+            return CAN_STATUS_OK;
+
+        case CAN_CMD_SET_VREF_UV:
+            if (adc_ads1256_set_vref_uv(value) != 0) {
+                return CAN_STATUS_BAD_VALUE;
+            }
+            flexspline_params_set(
+                &flexspline_params, (float)value / 1000000.0f,
+                adc_ads1256_get_pga_gain(), FLEXSPLINE_BRIDGE_EXCITATION_V,
+                FLEXSPLINE_GAUGE_FACTOR, FLEXSPLINE_ELASTIC_MODULUS_MPA);
+            request_config_save(false);
+            return CAN_STATUS_OK;
+
+        case CAN_CMD_SET_PGA:
+            if (value > UINT8_MAX) {
+                return CAN_STATUS_BAD_VALUE;
+            }
+            {
+                uint8_t previous_gain = adc_ads1256_get_pga_gain();
+                if (adc_ads1256_set_pga_gain((uint8_t)value) != 0) {
+                    return CAN_STATUS_BAD_VALUE;
+                }
+                if (adc_ads1256_calibrate() != 0 || adc_ads1256_restart() != 0) {
+                    (void)adc_ads1256_set_pga_gain(previous_gain);
+                    (void)adc_ads1256_restart();
+                    return CAN_STATUS_BAD_VALUE;
+                }
+            }
+            for (uint8_t i = 0U; i < ADC_CHANNEL_COUNT; i++) {
+                filter_set_zero_offset(i, 0);
+            }
+            persistent_config.flags &= (uint8_t)~PERSISTENT_CONFIG_FLAG_ZERO_VALID;
+            flexspline_params_set(
+                &flexspline_params,
+                (float)adc_ads1256_get_vref_uv() / 1000000.0f,
+                adc_ads1256_get_pga_gain(), FLEXSPLINE_BRIDGE_EXCITATION_V,
+                FLEXSPLINE_GAUGE_FACTOR, FLEXSPLINE_ELASTIC_MODULUS_MPA);
+            filter_reset_all();
+            reset_can_telemetry_queue();
+            if (save_config_now() != 0) {
+                return CAN_STATUS_STORAGE_ERROR;
+            }
+            return CAN_STATUS_OK;
+
+        case CAN_CMD_RESTORE_DEFAULTS:
+            flash_storage_config_defaults(&persistent_config);
+            for (uint8_t i = 0U; i < ADC_CHANNEL_COUNT; i++) {
+                filter_set_zero_offset(i, 0);
+            }
+            (void)adc_ads1256_set_vref_uv(persistent_config.vref_uv);
+            (void)adc_ads1256_set_pga_gain(persistent_config.pga_gain);
+            (void)adc_ads1256_set_sample_rate_x10(persistent_config.sample_rate_x10);
+            (void)adc_ads1256_set_channel_mask(persistent_config.channel_mask);
+            (void)adc_ads1256_calibrate();
+            (void)adc_ads1256_restart();
+            filter_set_window_size(persistent_config.filter_length);
+            can_telemetry_mode = persistent_config.telemetry_mode;
+            flexspline_params_set_default(&flexspline_params);
+            filter_reset_all();
+            reset_can_telemetry_queue();
+            if (save_config_now() != 0) {
+                return CAN_STATUS_STORAGE_ERROR;
+            }
             return CAN_STATUS_OK;
 
         default:
@@ -545,18 +800,17 @@ static void process_can_commands(void)
         }
 
         const can_rx_command_frame_t *frame = (const can_rx_command_frame_t *)msg.data;
-        uint8_t expected_crc = can_calc_crc8(msg.data, 7);
-        uint16_t value = can_frame_u16_le_get(frame->value_le);
+        uint32_t value = can_frame_u32_le_get(frame->value_le);
         uint8_t detail = 0;
 
         if (frame->frame_type != CAN_FRAME_TYPE_COMMAND) {
             send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_TYPE,
                             value, frame->frame_type);
-        } else if (frame->crc8 != expected_crc) {
-            send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_CRC,
-                            value, expected_crc);
+        } else if (frame->version != CAN_PROTOCOL_VERSION) {
+            send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_TYPE,
+                            value, frame->version);
         } else {
-            uint16_t applied_value = value;
+            uint32_t applied_value = value;
             uint8_t status = process_can_command(frame->cmd_type, frame->param, value,
                                                  &applied_value, &detail);
             send_can_status(frame->sequence, frame->cmd_type, status,
@@ -579,12 +833,14 @@ void loop(void)
 #endif
 
     process_can_commands();
+    service_config_save();
+    send_config_snapshot();
     send_can_health();
     flush_can_telemetry();
 
     adc_ads1256_poll();
 
-    int recv_count = adc_ads1256_get_data(adc_ads1256_data, ADC_CHANNEL_COUNT);
+    int recv_count = adc_ads1256_get_data(adc_ads1256_data, ADC_SAMPLE_BATCH_COUNT);
 
     for (int i = 0; i < recv_count; i++) {
         uint8_t ch = adc_ads1256_data[i].channel;

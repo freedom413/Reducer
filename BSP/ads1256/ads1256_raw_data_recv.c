@@ -38,6 +38,8 @@ static lwrb_t ads1256_data_rb;
 static char ads1256_data_buf[ADS1256_DATA_BUFF_SIZE];
 static uint32_t ads1256_sample_rate_x10 = 1000U;
 static uint16_t ads1256_channel_mask = ADS1256_ALL_CHANNEL_MASK;
+static uint8_t ads1256_pga_gain = 16U;
+static uint32_t ads1256_vref_uv = 2500000U;
 static bool ads1256_started = false;
 static uint8_t ads1256_poll_error_count = 0;
 static uint32_t ads1256_last_recovery_tick = 0;
@@ -246,6 +248,16 @@ void adc_ads1256_start(void)
         ads1256_last_recovery_tick = HAL_GetTick();
         return;
     }
+    ret = adc_ads1256_set_vref_uv(ads1256_vref_uv);
+    if (ret < 0) {
+        ads1256_last_recovery_tick = HAL_GetTick();
+        return;
+    }
+    ret = adc_ads1256_set_pga_gain(ads1256_pga_gain);
+    if (ret < 0 || adc_ads1256_calibrate() != 0) {
+        ads1256_last_recovery_tick = HAL_GetTick();
+        return;
+    }
 
     if (ads1256_sample_rate_x10 == 1000U) {
         ret = adc_ads1256_restart();
@@ -437,4 +449,66 @@ int adc_ads1256_set_channel_mask(uint16_t channel_mask)
 uint16_t adc_ads1256_get_channel_mask(void)
 {
     return ads1256_channel_mask;
+}
+
+static bool ads1256_gain_to_enum(uint8_t gain, ads1256_pga_t *pga)
+{
+    uint8_t value = gain;
+    uint8_t exponent = 0U;
+    if (gain == 0U || gain > 64U || (gain & (gain - 1U)) != 0U) {
+        return false;
+    }
+    while (value > 1U) {
+        value >>= 1U;
+        exponent++;
+    }
+    *pga = (ads1256_pga_t)exponent;
+    return true;
+}
+
+int adc_ads1256_set_pga_gain(uint8_t gain)
+{
+    ads1256_pga_t pga;
+    if (!ads1256_gain_to_enum(gain, &pga)) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < ADS1256_ARRAY_SIZE(ads1256_devices); i++) {
+        ads1256_scan_device_t *dev = &ads1256_devices[i];
+        if (!dev->enabled) {
+            continue;
+        }
+        ads1256_pga_t applied;
+        if (ads1256_set_pga(dev->adc, pga) < 0 ||
+            ads1256_get_pga(dev->adc, &applied) < 0 || applied != pga) {
+            return -1;
+        }
+    }
+    ads1256_pga_gain = gain;
+    return 0;
+}
+
+uint8_t adc_ads1256_get_pga_gain(void)
+{
+    return ads1256_pga_gain;
+}
+
+int adc_ads1256_set_vref_uv(uint32_t vref_uv)
+{
+    if (vref_uv < 1000000U || vref_uv > 5000000U) {
+        return -1;
+    }
+    float vref = (float)vref_uv / 1000000.0f;
+    for (uint32_t i = 0; i < ADS1256_ARRAY_SIZE(ads1256_devices); i++) {
+        ads1256_scan_device_t *dev = &ads1256_devices[i];
+        if (dev->enabled && ads1256_set_vref(dev->adc, vref) < 0) {
+            return -1;
+        }
+    }
+    ads1256_vref_uv = vref_uv;
+    return 0;
+}
+
+uint32_t adc_ads1256_get_vref_uv(void)
+{
+    return ads1256_vref_uv;
 }
