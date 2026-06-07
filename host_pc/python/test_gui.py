@@ -14,9 +14,10 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QAbstractButton, QLabel
 from PyQt6.QtCore import QEvent, QPointF
 
+import reducer_monitor as reducer_monitor_module
 from can_protocol import (
     CANFrame,
     ConfigFrame,
@@ -62,7 +63,9 @@ from reducer_monitor import (
     CAN_CMD_SET_CHANNEL_MASK,
     CAN_CMD_SET_SAMPLE_RATE,
     CAN_CMD_SET_FILTER_SIZE,
+    CAN_CMD_SET_ZERO_OFFSET,
     CAN_CMD_SET_TELEMETRY_MODE,
+    CAN_CMD_GET_CONFIG,
     CAN_CMD_START_CALIB,
     CAN_CMD_ZERO_DATUM,
     DEFAULT_VISIBLE_PLOTS,
@@ -230,6 +233,11 @@ class TestProtocolHelpers(unittest.TestCase):
         parsed = parse_status_frame(CANFrame(id=CAN_ID_TX_STATUS, data=bytes(payload)))
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.value, 2_498_500)
+
+    def test_status_ack_id_has_higher_priority_than_command_and_telemetry(self):
+        self.assertEqual(CAN_ID_TX_STATUS, 0x0F0)
+        self.assertLess(CAN_ID_TX_STATUS, CAN_ID_RX_COMMAND)
+        self.assertLess(CAN_ID_TX_STATUS, CAN_ID_TX_TELEMETRY)
 
     def test_parse_v3_physical_telemetry_uses_wide_units(self):
         payload = bytearray(64)
@@ -585,6 +593,101 @@ class TestCANReceiver(unittest.TestCase):
         can_bus.register_rx_callback.assert_called_once()
         receiver.stop()
 
+    def test_queues_control_frames_before_telemetry_frames(self):
+        can_bus = MagicMock()
+        receiver = CANReceiver(can_bus)
+        callback = can_bus.register_rx_callback.call_args.args[0]
+        telemetry_frame = CANFrame(
+            id=CAN_ID_TX_TELEMETRY,
+            data=build_raw_v2_payload([(0, 1)]),
+        )
+        status_frame = CANFrame(
+            id=CAN_ID_TX_STATUS,
+            data=build_status_payload(
+                sequence=7,
+                cmd_type=CAN_CMD_SET_FILTER_SIZE,
+                status=CAN_STATUS_OK,
+                value=32,
+            ),
+        )
+
+        callback(telemetry_frame)
+        callback(status_frame)
+
+        control_frames, telemetry_frames = receiver.take_pending_frames()
+        self.assertEqual(control_frames, [status_frame])
+        self.assertEqual(telemetry_frames, [telemetry_frame])
+        receiver.stop()
+
+    def test_control_frame_emits_signal_even_with_telemetry_backlog(self):
+        can_bus = MagicMock()
+        receiver = CANReceiver(can_bus)
+        callback = can_bus.register_rx_callback.call_args.args[0]
+        emitted = []
+        receiver.frames_available.connect(lambda: emitted.append(True))
+        telemetry_frame = CANFrame(
+            id=CAN_ID_TX_TELEMETRY,
+            data=build_raw_v2_payload([(0, 1)]),
+        )
+        status_frame = CANFrame(
+            id=CAN_ID_TX_STATUS,
+            data=build_status_payload(
+                sequence=7,
+                cmd_type=CAN_CMD_SET_FILTER_SIZE,
+                status=CAN_STATUS_OK,
+                value=32,
+            ),
+        )
+
+        callback(telemetry_frame)
+        receiver.take_pending_frames(telemetry_limit=0)
+        emitted.clear()
+        callback(status_frame)
+
+        self.assertEqual(len(emitted), 1)
+        control_frames, telemetry_frames = receiver.take_pending_frames(
+            telemetry_limit=0
+        )
+        self.assertEqual(control_frames, [status_frame])
+        self.assertEqual(telemetry_frames, [])
+        receiver.stop()
+
+
+class TestFirmwareSource(unittest.TestCase):
+    def test_channel_mask_command_requests_persistent_save(self):
+        user_c = Path(__file__).resolve().parents[2] / "Application" / "user.c"
+        source = user_c.read_text(encoding="utf-8")
+        branch = source.split("case CAN_CMD_SET_CHANNEL_MASK:", 1)[1].split(
+            "case CAN_CMD_SET_FILTER_SIZE:", 1
+        )[0]
+
+        self.assertIn("request_config_save(false);", branch)
+
+    def test_set_zero_offset_command_updates_runtime_and_flash_config(self):
+        root = Path(__file__).resolve().parents[2]
+        can_header = (root / "Application" / "algorithm" / "can_data.h").read_text(
+            encoding="utf-8"
+        )
+        user_source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        branch = user_source.split("case CAN_CMD_SET_ZERO_OFFSET:", 1)[1].split(
+            "case CAN_CMD_SET_CHANNEL_MASK:", 1
+        )[0]
+
+        self.assertIn("#define CAN_CMD_SET_ZERO_OFFSET", can_header)
+        self.assertIn("filter_set_zero_offset(param, (int32_t)value);", branch)
+        self.assertIn("PERSISTENT_CONFIG_FLAG_ZERO_VALID", branch)
+        self.assertIn("request_config_save(false);", branch)
+
+    def test_fdcan_tx_queue_mode_allows_ack_id_priority(self):
+        root = Path(__file__).resolve().parents[2]
+        fdcan_source = (root / "Core" / "Src" / "fdcan.c").read_text(
+            encoding="utf-8"
+        )
+        ioc_source = (root / "Reducer.ioc").read_text(encoding="utf-8")
+
+        self.assertIn("FDCAN_TX_QUEUE_OPERATION", fdcan_source)
+        self.assertIn("FDCAN1.TxFifoQueueMode=FDCAN_TX_QUEUE_OPERATION", ioc_source)
+
 
 class TestReducerMonitorWindow(unittest.TestCase):
     @classmethod
@@ -640,6 +743,170 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(self.window.cmd_group.layout().count(), 2)
         self.assertIn("Raw", self.window.stream_summary_label.text())
 
+    def test_log_button_lives_with_waveform_tools(self):
+        self.assertEqual(self.window.conn_group.layout().indexOf(self.window.log_btn), -1)
+        self.assertGreater(
+            self.window.waveform_controls_layout.indexOf(self.window.log_btn),
+            self.window.waveform_controls_layout.indexOf(self.window.add_plot_btn),
+        )
+
+    def test_opengl_plot_option_is_removed(self):
+        self.assertFalse(hasattr(reducer_monitor_module, "OPENGL_PLOT_AVAILABLE"))
+        self.assertFalse(hasattr(self.window, "opengl_checkbox"))
+
+    def test_metric_color_buttons_are_global_controls_only(self):
+        self.assertEqual(set(self.window.metric_color_buttons), {"voltage", "strain", "stress"})
+        self.assertFalse(hasattr(self.window, "plot_metric_color_buttons"))
+        for button in self.window.metric_color_buttons.values():
+            self.assertFalse(button.isHidden())
+
+    def test_metric_color_controls_are_right_aligned_with_metric_hints(self):
+        self._switch_to_english()
+
+        self.assertGreater(
+            self.window.waveform_controls_layout.indexOf(self.window.metric_colors_label),
+            self.window.waveform_controls_layout.indexOf(self.window.add_plot_btn),
+        )
+        expected_labels = {
+            "voltage": "Voltage",
+            "strain": "Strain",
+            "stress": "Stress",
+        }
+        for metric, label in expected_labels.items():
+            button = self.window.metric_color_buttons[metric]
+            self.assertIn(label, button.toolTip())
+            self.assertIn(label, button.accessibleName())
+
+    def test_pyqtgraph_context_menus_default_to_chinese(self):
+        plot_item = self.window.plot_widgets[0].getPlotItem()
+
+        view_menu_texts = [action.text() for action in plot_item.vb.menu.actions()]
+        plot_menu_texts = [action.text() for action in plot_item.ctrlMenu.actions()]
+
+        self.assertIn("显示全部", view_menu_texts)
+        self.assertEqual(plot_item.ctrlMenu.title(), "绘图选项")
+        self.assertIn("降采样", plot_menu_texts)
+        self.assertNotIn("View All", view_menu_texts)
+
+    def test_pyqtgraph_nested_context_menus_default_to_chinese(self):
+        plot_item = self.window.plot_widgets[0].getPlotItem()
+        transform_action = next(
+            action
+            for action in plot_item.ctrlMenu.actions()
+            if action.property("reducer_original_text") == "Transforms"
+        )
+        transform_menu = transform_action.menu()
+
+        transform_menu.aboutToShow.emit()
+        transform_texts = self._menu_widget_texts(transform_menu)
+
+        self.assertIn("功率谱 (FFT)", transform_texts)
+        self.assertIn("减去均值", transform_texts)
+        self.assertNotIn("Power Spectrum (FFT)", transform_texts)
+        self.assertNotIn("Subtract Mean", transform_texts)
+
+    def test_pyqtgraph_axis_context_menus_default_to_chinese(self):
+        plot_item = self.window.plot_widgets[0].getPlotItem()
+        x_axis_action = next(
+            action
+            for action in plot_item.vb.menu.actions()
+            if action.property("reducer_original_text") == "X axis"
+        )
+        x_axis_menu = x_axis_action.menu()
+
+        x_axis_menu.aboutToShow.emit()
+        axis_texts = self._menu_widget_texts(x_axis_menu)
+
+        self.assertIn("链接坐标轴：", axis_texts)
+        self.assertIn("手动", axis_texts)
+        self.assertIn("反转坐标轴", axis_texts)
+        self.assertIn("启用鼠标", axis_texts)
+        self.assertIn("仅可见数据", axis_texts)
+        self.assertIn("仅自动平移", axis_texts)
+        self.assertNotIn("Link Axis:", axis_texts)
+        self.assertNotIn("Manual", axis_texts)
+
+    def test_pyqtgraph_context_menus_restore_english_when_language_changes(self):
+        self._switch_to_english()
+        plot_item = self.window.plot_widgets[0].getPlotItem()
+
+        view_menu_texts = [action.text() for action in plot_item.vb.menu.actions()]
+
+        self.assertIn("View All", view_menu_texts)
+        self.assertEqual(plot_item.ctrlMenu.title(), "Plot Options")
+
+    def _tree_texts(self, tree):
+        texts = []
+
+        def visit(item):
+            for column in range(item.columnCount()):
+                text = item.text(column)
+                if text:
+                    texts.append(text)
+            for index in range(item.childCount()):
+                visit(item.child(index))
+
+        for index in range(tree.topLevelItemCount()):
+            visit(tree.topLevelItem(index))
+        return texts
+
+    def _menu_widget_texts(self, menu):
+        texts = []
+        for action in menu.actions():
+            widget = action.defaultWidget() if hasattr(action, "defaultWidget") else None
+            if widget is None:
+                continue
+            for child in widget.findChildren(QLabel) + widget.findChildren(QAbstractButton):
+                text = child.text()
+                if text:
+                    texts.append(text)
+        return texts
+
+    def test_pyqtgraph_export_dialog_defaults_to_chinese(self):
+        scene = self.window.plot_widgets[0].scene()
+        scene.contextMenuItem = self.window.plot_widgets[0].getPlotItem()
+        scene.showExportDialog()
+        dialog = scene.exportDialog
+        self.addCleanup(dialog.close)
+
+        format_texts = [
+            dialog.ui.formatList.item(index).text()
+            for index in range(dialog.ui.formatList.count())
+        ]
+        option_texts = self._tree_texts(dialog.ui.paramTree)
+
+        self.assertEqual(dialog.windowTitle(), "导出")
+        self.assertEqual(dialog.ui.label.text(), "导出对象：")
+        self.assertEqual(dialog.ui.label_2.text(), "导出格式")
+        self.assertEqual(dialog.ui.label_3.text(), "导出选项")
+        self.assertEqual(dialog.ui.copyBtn.text(), "复制")
+        self.assertEqual(dialog.ui.exportBtn.text(), "导出")
+        self.assertEqual(dialog.ui.closeBtn.text(), "关闭")
+        self.assertIn("整个场景", self._tree_texts(dialog.ui.itemTree))
+        self.assertIn("原始曲线数据 CSV", format_texts)
+        self.assertIn("图片文件 (PNG, TIF, JPG, ...)", format_texts)
+        self.assertIn("分隔符", option_texts)
+        self.assertIn("精度", option_texts)
+        self.assertIn("列模式", option_texts)
+
+    def test_pyqtgraph_export_dialog_restores_english_when_language_changes(self):
+        scene = self.window.plot_widgets[0].scene()
+        scene.contextMenuItem = self.window.plot_widgets[0].getPlotItem()
+        scene.showExportDialog()
+        dialog = scene.exportDialog
+        self.addCleanup(dialog.close)
+
+        self._switch_to_english()
+        format_texts = [
+            dialog.ui.formatList.item(index).text()
+            for index in range(dialog.ui.formatList.count())
+        ]
+
+        self.assertEqual(dialog.windowTitle(), "Export")
+        self.assertEqual(dialog.ui.label.text(), "Item to export:")
+        self.assertIn("Entire Scene", self._tree_texts(dialog.ui.itemTree))
+        self.assertIn("CSV of original plot data", format_texts)
+
     def test_waveform_plot_defaults_to_voltage_curve(self):
         checkboxes = self.window.plot_metric_checkboxes[0]
 
@@ -665,13 +932,17 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertTrue(all(curve.isVisible() for curve in curves.values()))
 
     def test_waveform_curve_color_can_be_customized(self):
-        self.window._set_plot_metric_color(0, "voltage", "#abcdef")
+        self.window._set_metric_color("voltage", "#abcdef")
 
-        curve = self.window.plot_metric_curves[0]["voltage"]
-        button = self.window.plot_metric_color_buttons[0]["voltage"]
-        self.assertEqual(self.window.plot_metric_colors[0]["voltage"], "#abcdef")
-        self.assertEqual(curve.opts["pen"].color().name(), "#abcdef")
-        self.assertIn("#abcdef", button.styleSheet())
+        self.assertEqual(self.window.global_metric_colors["voltage"], "#abcdef")
+        for curves, colors in zip(
+            self.window.plot_metric_curves,
+            self.window.plot_metric_colors,
+        ):
+            self.assertEqual(colors["voltage"], "#abcdef")
+            self.assertEqual(curves["voltage"].opts["pen"].color().name(), "#abcdef")
+            self.assertNotEqual(curves["strain"].opts["pen"].color().name(), "#abcdef")
+        self.assertIn("#abcdef", self.window.metric_color_buttons["voltage"].styleSheet())
 
     def test_waveform_hover_shows_nearest_curve_coordinates(self):
         self.window.on_data_updated(0, {
@@ -710,6 +981,11 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(len(self.window.plot_panels), MAX_VISIBLE_PLOTS)
         self.assertEqual(self.window.plot_channels, [0, 1, 2, 3, 4, 5, 6, 7])
         self.assertFalse(self.window.add_plot_btn.isEnabled())
+        for plot_index, panel in enumerate(self.window.plot_panels):
+            index = self.window.waveform_layout.indexOf(panel)
+            row, column, row_span, column_span = self.window.waveform_layout.getItemPosition(index)
+            self.assertEqual((row, column, row_span, column_span),
+                             (plot_index // 4, plot_index % 4, 1, 1))
 
         self.window._add_waveform_plot()
         self.assertEqual(len(self.window.plot_panels), MAX_VISIBLE_PLOTS)
@@ -718,6 +994,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.can_bus.send_frame.reset_mock()
         self.window._add_waveform_plot()
         self.window.can_bus.send_frame.assert_not_called()
+        self.assertEqual(self.window._displayed_channel_mask(), 0xFF)
 
     def test_waveform_plot_can_change_bound_channel(self):
         self.window.plot_channel_combos[0].setCurrentIndex(5)
@@ -748,7 +1025,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
             self.window._remove_waveform_plot(panel)
 
         self.assertEqual(self.window.plot_panels, [])
-        self.assertEqual(self.window._displayed_channel_mask(), 0)
+        self.assertEqual(self.window._displayed_channel_mask(), 0xFF)
         self.window.can_bus.send_frame.assert_not_called()
 
     def test_duplicate_plots_subscribe_mcu_channel_once(self):
@@ -757,8 +1034,67 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.window._add_waveform_plot(channel=0)
 
-        self.assertEqual(self.window._displayed_channel_mask(), 0x0F)
+        self.assertEqual(self.window._displayed_channel_mask(), 0xFF)
         self.window.can_bus.send_frame.assert_not_called()
+
+    def test_config_snapshot_updates_acquisition_channel_checkboxes(self):
+        self.window._apply_config_snapshot(ConfigFrame(
+            saved=True,
+            zero_valid=False,
+            pga_gain=8,
+            filter_length=7,
+            telemetry_mode=TELEMETRY_MODE_RAW,
+            channel_mask=0x0F,
+            sample_rate_x10=10000,
+            vref_uv=2_498_500,
+            sequence=12,
+            zero_offsets=list(range(8)),
+        ))
+
+        self.assertFalse(hasattr(self.window, "channel_mask_spin"))
+        self.assertEqual(self.window.acquisition_channel_mask, 0x0F)
+        self.assertEqual(
+            [checkbox.isChecked() for checkbox in self.window.acquisition_channel_checkboxes],
+            [True, True, True, True, False, False, False, False],
+        )
+        self.assertEqual(self.window._displayed_channel_mask(), 0x0F)
+
+    def test_acquisition_checkbox_sends_channel_mask_command(self):
+        self.window._apply_config_snapshot(ConfigFrame(
+            saved=True,
+            zero_valid=False,
+            pga_gain=8,
+            filter_length=7,
+            telemetry_mode=TELEMETRY_MODE_RAW,
+            channel_mask=0x0F,
+            sample_rate_x10=10000,
+            vref_uv=2_498_500,
+            sequence=12,
+            zero_offsets=list(range(8)),
+        ))
+        self.window.can_bus.send_frame.reset_mock()
+
+        self.window.acquisition_channel_checkboxes[5].setChecked(True)
+
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_CHANNEL_MASK)
+        self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), 0x2F)
+        self.assertEqual(self.window.acquisition_channel_mask, 0x2F)
+
+    def test_acquisition_checkboxes_allow_zero_mask(self):
+        self.window._set_acquisition_channel_mask(0x01)
+        self.window.can_bus.send_frame.reset_mock()
+
+        self.window.acquisition_channel_checkboxes[0].setChecked(False)
+
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_CHANNEL_MASK)
+        self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), 0)
+        self.assertEqual(
+            [checkbox.isChecked() for checkbox in self.window.acquisition_channel_checkboxes],
+            [False] * NUM_CHANNELS,
+        )
+        self.assertEqual(self.window._displayed_channel_mask(), 0)
 
     def test_parse_valid_telemetry_updates_channel(self):
         frame = CANFrame(
@@ -915,6 +1251,35 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(sent_frame.id, CAN_ID_RX_COMMAND)
         self.assertEqual(sent_frame.data[3], CAN_CMD_ZERO_DATUM)
 
+    def test_target_stress_sets_zero_offset_from_latest_raw_sample(self):
+        self.window.zero_offsets[2] = 1000
+        self.window._apply_telemetry_values(
+            2,
+            voltage_mv=1.25,
+            strain_ue=118.0,
+            stress_mpa=24.8,
+            voltage_001mv=125,
+            stress_01mpa=248,
+            timestamp=None,
+            raw_value=32000,
+        )
+        self.window.zero_offset_channel_combo.setCurrentIndex(2)
+        self.window.zero_offset_target_stress_spin.setValue(21.0)
+
+        self.window.on_target_stress_zero_clicked()
+
+        sent_frame = self.window.can_bus.send_frame.call_args[0][0]
+        target_voltage_mv = self.window._stress_mpa_to_voltage_mv(21.0)
+        target_raw = round(target_voltage_mv / self.window._raw_to_mv_scale())
+        expected_offset = 32000 + 1000 - target_raw
+        self.assertEqual(sent_frame.data[3], CAN_CMD_SET_ZERO_OFFSET)
+        self.assertEqual(sent_frame.data[4], 2)
+        self.assertEqual(
+            int.from_bytes(sent_frame.data[6:10], "little"),
+            expected_offset & 0xFFFFFFFF,
+        )
+        self.assertIn(str(expected_offset), self.window.zero_offset_result_label.text())
+
     def test_config_snapshot_updates_adc_controls(self):
         self.window._apply_config_snapshot(ConfigFrame(
             saved=True,
@@ -930,7 +1295,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
         ))
         self.assertAlmostEqual(self.window.vref_spin.value(), 2.4985)
         self.assertEqual(self.window.pga_combo.currentData(), 8)
-        self.assertEqual(self.window.channel_mask_spin.value(), 0x0F)
+        self.assertEqual(self.window.acquisition_channel_mask, 0x0F)
         self.assertIn("需要重新调零", self.window.config_state_label.text())
 
     def test_redundant_zero_buttons_are_removed(self):
@@ -984,8 +1349,10 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), 25)
 
     def test_high_ads_rate_does_not_auto_decimate_telemetry(self):
+        self.window._set_acquisition_channel_mask(0x0F)
         self.assertEqual(self.window._estimated_telemetry_rate(30000), 4374)
 
+        self.window._set_acquisition_channel_mask(0xFF)
         self.window._add_waveform_plot()
 
         self.assertEqual(self.window._estimated_telemetry_rate(30000), 8748)
@@ -1064,6 +1431,12 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "baud_combo"))
         self.assertFalse(hasattr(self.window, "can_baud_value"))
 
+    def test_slcan_usb_serial_speed_defaults_to_adapter_compatible_value(self):
+        self.assertEqual(
+            self.window.slcan_speed_combo.currentData(),
+            DEFAULT_SLCAN_TTY_BAUDRATE,
+        )
+
     def test_command_fails_when_disconnected(self):
         self.window.is_connected = False
         self.window.can_bus = None
@@ -1103,6 +1476,64 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.update_plots()
 
         self.assertFalse(self.window.auto_scale_checkbox.isChecked())
+
+    def test_paused_view_freezes_curves_while_buffers_continue(self):
+        self.window.on_data_updated(0, {
+            "voltage": 1.0,
+            "strain": 2.0,
+            "stress": 3.0,
+            "samples": 1,
+        })
+        self.window.update_plots()
+        self.window._set_view_paused(True)
+
+        self.window.on_data_updated(0, {
+            "voltage": 4.0,
+            "strain": 5.0,
+            "stress": 6.0,
+            "samples": 2,
+        })
+        self.window.update_plots()
+
+        _, y_data = self.window.plot_curves[0].getData()
+        self.assertEqual(list(y_data), [1.0])
+        self.assertEqual(len(self.window.waveform_buffers[0]), 2)
+
+        self.window._set_view_paused(False)
+        self.window.update_plots()
+
+        _, y_data = self.window.plot_curves[0].getData()
+        self.assertEqual(list(y_data), [1.0, 4.0])
+
+    def test_paused_visible_range_export_uses_frozen_snapshot(self):
+        for sample, value in enumerate((10.0, 20.0, 30.0), start=1):
+            self.window.on_data_updated(0, {
+                "voltage": value,
+                "strain": value + 1.0,
+                "stress": value + 2.0,
+                "samples": sample,
+            })
+        self.window.update_plots()
+        self.window._set_view_paused(True)
+        self.window.on_data_updated(0, {
+            "voltage": 99.0,
+            "strain": 99.0,
+            "stress": 99.0,
+            "samples": 4,
+        })
+        self.window.plot_widgets[0].setXRange(1, 2, padding=0)
+
+        export_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        export_file.close()
+        try:
+            self.window._export_paused_selection_to_csv(export_file.name)
+            with open(export_file.name, "r", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        finally:
+            os.unlink(export_file.name)
+
+        self.assertEqual([row["voltage_mv"] for row in rows], ["20.0", "30.0"])
+        self.assertEqual([row["samples"] for row in rows], ["2", "3"])
 
     def test_plot_refresh_rate_is_fixed_at_60_hz(self):
         self.assertFalse(hasattr(self.window, "plot_refresh_combo"))
@@ -1218,6 +1649,11 @@ class TestCsvLogging(unittest.TestCase):
 
         offline_window._toggle_plot_maximize(0)
         self.assertEqual(offline_window.maximized_plot_channel, 0)
+        index = offline_window.waveform_layout.indexOf(offline_window.plot_widgets[0])
+        row, column, row_span, column_span = offline_window.waveform_layout.getItemPosition(index)
+        self.assertEqual((row, column, row_span, column_span), (0, 0, 1, 2))
+        self.assertEqual(offline_window.waveform_layout.rowStretch(0), 1)
+        self.assertEqual(offline_window.waveform_layout.rowStretch(1), 0)
         offline_window._toggle_plot_maximize(0)
         self.assertIsNone(offline_window.maximized_plot_channel)
         self.assertEqual(offline_window.waveform_layout.count(), 2)
@@ -1231,6 +1667,19 @@ class TestCsvLogging(unittest.TestCase):
         )
         self.assertEqual(window.plot_channels, [0, 2])
         self.assertEqual(len(window.plot_widgets), 2)
+        window.close()
+
+    def test_offline_window_uses_four_columns_for_five_or_more_plots(self):
+        window = OfflineWaveformWindow(
+            "wide.csv",
+            [[float(channel)] for channel in range(5)] + [[], [], []],
+            "zh",
+        )
+
+        index = window.waveform_layout.indexOf(window.plot_widgets[4])
+        row, column, row_span, column_span = window.waveform_layout.getItemPosition(index)
+
+        self.assertEqual((row, column, row_span, column_span), (1, 0, 1, 1))
         window.close()
 
 

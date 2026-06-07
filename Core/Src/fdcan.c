@@ -55,7 +55,7 @@ void MX_FDCAN1_Init(void)
   hfdcan1.Init.DataTimeSeg2 = 2;
   hfdcan1.Init.StdFiltersNbr = 1;
   hfdcan1.Init.ExtFiltersNbr = 0;
-  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_QUEUE_OPERATION;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
   {
     Error_Handler();

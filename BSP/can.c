@@ -66,7 +66,9 @@ int can_data_len_get(uint32_t frame_len)
     }
 }
 
-int can_fd_data_frame_send(uint32_t id, const uint8_t *data, uint32_t len)
+static int can_fd_data_frame_send_reserved(uint32_t id, const uint8_t *data,
+                                           uint32_t len,
+                                           uint32_t reserved_free_level)
 {
     FDCAN_TxHeaderTypeDef tx_header = {0};
     uint32_t dlc = can_dlc_from_len(len);
@@ -88,7 +90,7 @@ int can_fd_data_frame_send(uint32_t id, const uint8_t *data, uint32_t len)
     tx_header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     tx_header.MessageMarker = 0;
 
-    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0U) {
+    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) <= reserved_free_level) {
         return -3;
     }
 
@@ -97,6 +99,17 @@ int can_fd_data_frame_send(uint32_t id, const uint8_t *data, uint32_t len)
     }
 
     return (int)len;
+}
+
+int can_fd_data_frame_send(uint32_t id, const uint8_t *data, uint32_t len)
+{
+    return can_fd_data_frame_send_reserved(id, data, len, 0U);
+}
+
+int can_fd_data_frame_send_low_priority(uint32_t id, const uint8_t *data,
+                                        uint32_t len)
+{
+    return can_fd_data_frame_send_reserved(id, data, len, 1U);
 }
 
 static void can_recv_push(const can_msg_t *msg)

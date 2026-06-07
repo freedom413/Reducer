@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 CAN_ID_RX_COMMAND = 0x100
 CAN_ID_TX_TELEMETRY = 0x101
-CAN_ID_TX_STATUS = 0x102
+CAN_ID_TX_STATUS = 0x0F0
 CAN_ID_TX_HEALTH = 0x103
 CAN_ID_TX_CONFIG = 0x104
 
@@ -63,6 +63,7 @@ COMMAND_NAMES = {
     0x0B: "Set Vref",
     0x0C: "Set PGA",
     0x0D: "Restore Defaults",
+    0x0E: "Set Zero Offset",
 }
 
 STATUS_NAMES = {
