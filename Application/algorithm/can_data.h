@@ -8,7 +8,7 @@
 // ============================================================================
 #define CAN_ID_RX_COMMAND    0x100  // Uplink: PC -> STM32
 #define CAN_ID_TX_TELEMETRY  0x101  // Downlink: STM32 -> PC telemetry
-#define CAN_ID_TX_STATUS     0x102  // Downlink: STM32 -> PC command status
+#define CAN_ID_TX_STATUS     0x0F0  // Downlink: STM32 -> PC command status
 #define CAN_ID_TX_HEALTH     0x103  // Downlink: STM32 -> PC health summary
 #define CAN_ID_TX_CONFIG     0x104  // Downlink: STM32 -> PC persistent config
 
@@ -233,6 +233,7 @@ _Static_assert(sizeof(can_tx_health_frame_t) == 24, "can_tx_health_frame_t must 
 #define CAN_CMD_SET_VREF_UV        0x0B
 #define CAN_CMD_SET_PGA            0x0C
 #define CAN_CMD_RESTORE_DEFAULTS   0x0D
+#define CAN_CMD_SET_ZERO_OFFSET    0x0E  // param=channel, value=int32 raw zero offset
 
 #define CAN_SAMPLE_RATE_PARAM_SPS       0x00
 #define CAN_SAMPLE_RATE_PARAM_DECI_SPS  0x01

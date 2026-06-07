@@ -343,7 +343,7 @@ static void flush_can_telemetry(void)
                                                sample->channel,
                                                sample->raw_filtered);
             }
-            ret = can_fd_data_frame_send(
+            ret = can_fd_data_frame_send_low_priority(
                 CAN_ID_TX_TELEMETRY,
                 (const uint8_t *)&frame,
                 sizeof(frame));
@@ -368,7 +368,7 @@ static void flush_can_telemetry(void)
                                                     sample->strain_ue,
                                                     sample->stress_qmpa);
             }
-            ret = can_fd_data_frame_send(
+            ret = can_fd_data_frame_send_low_priority(
                 CAN_ID_TX_TELEMETRY,
                 (const uint8_t *)&frame,
                 sizeof(frame));
@@ -552,7 +552,6 @@ static void process_adc_sample(uint8_t channel, int32_t raw_value)
 static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t value,
                                    uint32_t *applied_value, uint8_t *detail)
 {
-    (void)param;
     if (applied_value != NULL) {
         *applied_value = value;
     }
@@ -594,6 +593,21 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
             return CAN_STATUS_OK;
         }
 
+        case CAN_CMD_SET_ZERO_OFFSET:
+            if (param >= ADC_CHANNEL_COUNT) {
+                if (detail != NULL) {
+                    *detail = param;
+                }
+                return CAN_STATUS_BAD_VALUE;
+            }
+            filter_set_zero_offset(param, (int32_t)value);
+            persistent_config.flags |= PERSISTENT_CONFIG_FLAG_ZERO_VALID;
+            filter_reset(param);
+            reset_channel_statistics(param);
+            reset_can_telemetry_queue();
+            request_config_save(false);
+            return CAN_STATUS_OK;
+
         case CAN_CMD_SET_CHANNEL_MASK: {
             if (value > ADS1256_ALL_CHANNEL_MASK) {
                 return CAN_STATUS_BAD_VALUE;
@@ -616,6 +630,7 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
                 }
             }
             reset_can_telemetry_queue();
+            request_config_save(false);
             return CAN_STATUS_OK;
         }
 

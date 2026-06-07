@@ -7,7 +7,7 @@ State Detection System. Uses CANable 2.0 SLCAN FD and python-can adapters.
 
 import csv
 import datetime
-import importlib.util
+import importlib
 import logging
 import os
 import sys
@@ -26,30 +26,14 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QPushButton, QComboBox,
     QSpinBox, QStatusBar, QFileDialog, QCheckBox,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem,
-    QColorDialog, QDoubleSpinBox,
+    QColorDialog, QDoubleSpinBox, QAbstractButton,
 )
 from PyQt6.QtCore import QEvent, QSignalBlocker, QTimer, pyqtSignal, QThread, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 
 # Plotting
 import pyqtgraph as pg
-
-OPENGL_DEPENDENCIES_AVAILABLE = importlib.util.find_spec("OpenGL") is not None
-
-
-def configure_plot_backend(use_opengl: bool) -> bool:
-    if use_opengl and not OPENGL_DEPENDENCIES_AVAILABLE:
-        pg.setConfigOptions(useOpenGL=False, antialias=False)
-        return False
-    try:
-        pg.setConfigOptions(useOpenGL=bool(use_opengl), antialias=False)
-        return bool(use_opengl)
-    except Exception:
-        pg.setConfigOptions(useOpenGL=False, antialias=False)
-        return False
-
-
-OPENGL_PLOT_AVAILABLE = configure_plot_backend(True)
+pg.setConfigOptions(useOpenGL=False, antialias=False)
 
 from can_protocol import (
     Baudrate,
@@ -90,6 +74,7 @@ CAN_CMD_GET_CONFIG = 0x0A
 CAN_CMD_SET_VREF_UV = 0x0B
 CAN_CMD_SET_PGA = 0x0C
 CAN_CMD_RESTORE_DEFAULTS = 0x0D
+CAN_CMD_SET_ZERO_OFFSET = 0x0E
 
 # Number of channels
 NUM_CHANNELS = 8
@@ -319,6 +304,289 @@ def apply_plot_theme(plot: pg.PlotWidget, theme: str) -> None:
         axis.setTextPen(pg.mkPen(colors["plot_axis"]))
 
 
+def plot_grid_columns(count: int) -> int:
+    return 2 if count <= 4 else 4
+
+
+def configure_curve_performance(curve) -> None:
+    if hasattr(curve, "setClipToView"):
+        curve.setClipToView(True)
+    if hasattr(curve, "setDownsampling"):
+        curve.setDownsampling(auto=True, method="peak")
+
+
+PYQTGRAPH_MENU_TRANSLATIONS_ZH = {
+    "ViewBox options": "视图选项",
+    "View All": "显示全部",
+    "X axis": "X 轴",
+    "Y axis": "Y 轴",
+    "Mouse Mode": "鼠标模式",
+    "3 button": "三键模式",
+    "1 button": "单键模式",
+    "Plot Options": "绘图选项",
+    "Export...": "导出...",
+    "Transforms": "变换",
+    "Downsample": "降采样",
+    "Average": "平均",
+    "Alpha": "透明度",
+    "Grid": "网格",
+    "Points": "点",
+    "Power Spectrum (FFT)": "功率谱 (FFT)",
+    "Subtract Mean": "减去均值",
+    "Log X": "X 对数",
+    "Log Y": "Y 对数",
+    "dy/dx": "微分 dy/dx",
+    "Y vs. Y'": "Y 对 Y'",
+    "Clip to View": "裁剪到视图",
+    "Max Traces:": "最大曲线数：",
+    "Forget hidden traces": "忽略隐藏曲线",
+    "Auto": "自动",
+    "Peak": "峰值",
+    "Mean": "均值",
+    "Subsample": "抽样",
+    "Opacity": "不透明度",
+    "Show X Grid": "显示 X 网格",
+    "Show Y Grid": "显示 Y 网格",
+    "Link Axis:": "链接坐标轴：",
+    "Manual": "手动",
+    "Invert Axis": "反转坐标轴",
+    "Mouse Enabled": "启用鼠标",
+    "Visible Data Only": "仅可见数据",
+    "Auto Pan Only": "仅自动平移",
+}
+
+PYQTGRAPH_EXPORT_TRANSLATIONS_ZH = {
+    "Export": "导出",
+    "Item to export:": "导出对象：",
+    "Entire Scene": "整个场景",
+    "Plot": "图表",
+    "ViewBox": "视图框",
+    "Export format": "导出格式",
+    "CSV of original plot data": "原始曲线数据 CSV",
+    "Image File (PNG, TIF, JPG, ...)": "图片文件 (PNG, TIF, JPG, ...)",
+    "Matplotlib Window": "Matplotlib 窗口",
+    "Scalable Vector Graphics (SVG)": "可缩放矢量图 (SVG)",
+    "Export options": "导出选项",
+    "Copy": "复制",
+    "Close": "关闭",
+    "separator": "分隔符",
+    "precision": "精度",
+    "columnMode": "列模式",
+    "comma": "逗号",
+    "tab": "制表符",
+    "(x,y) per plot": "每条曲线一组 (x,y)",
+    "(x,y,y,y) for all plots": "所有曲线共用 x",
+    "width": "宽度",
+    "height": "高度",
+    "antialias": "抗锯齿",
+    "background": "背景",
+    "invertValue": "反色",
+    "scaling stroke": "缩放线宽",
+}
+
+ORIGINAL_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 730
+
+
+def localized_pyqtgraph_text(text: str, language: str) -> str:
+    if language == "zh":
+        return PYQTGRAPH_EXPORT_TRANSLATIONS_ZH.get(
+            text, PYQTGRAPH_MENU_TRANSLATIONS_ZH.get(text, text)
+        )
+    return text
+
+
+def _localize_widget_text(widget, text: str, property_name: str, setter, language: str) -> None:
+    if widget.property(property_name) is None:
+        widget.setProperty(property_name, text)
+    original_text = widget.property(property_name)
+    if isinstance(original_text, str) and original_text:
+        setter(localized_pyqtgraph_text(original_text, language))
+
+
+def localize_menu_widget_tree(widget, language: str) -> None:
+    if widget is None:
+        return
+
+    for child in [widget] + widget.findChildren(QWidget):
+        if isinstance(child, QAbstractButton):
+            _localize_widget_text(
+                child,
+                child.text(),
+                "reducer_original_text",
+                child.setText,
+                language,
+            )
+        elif isinstance(child, QLabel):
+            _localize_widget_text(
+                child,
+                child.text(),
+                "reducer_original_text",
+                child.setText,
+                language,
+            )
+        if isinstance(child, QGroupBox):
+            _localize_widget_text(
+                child,
+                child.title(),
+                "reducer_original_title_text",
+                child.setTitle,
+                language,
+            )
+
+
+def localize_menu_tree(menu, language: str) -> None:
+    if menu is None:
+        return
+
+    menu.setProperty("reducer_language", language)
+    if not menu.property("reducer_localizer_connected"):
+        menu.aboutToShow.connect(
+            lambda menu=menu: localize_menu_tree(
+                menu, str(menu.property("reducer_language") or "zh")
+            )
+        )
+        menu.setProperty("reducer_localizer_connected", True)
+
+    if menu.property("reducer_original_title") is None:
+        menu.setProperty("reducer_original_title", menu.title())
+    original_title = menu.property("reducer_original_title")
+    menu.setTitle(
+        PYQTGRAPH_MENU_TRANSLATIONS_ZH.get(original_title, original_title)
+        if language == "zh"
+        else original_title
+    )
+
+    for action in menu.actions():
+        if action.property("reducer_original_text") is None:
+            action.setProperty("reducer_original_text", action.text())
+        original_text = action.property("reducer_original_text")
+        action.setText(localized_pyqtgraph_text(original_text, language))
+        submenu = action.menu()
+        if submenu is not None and isinstance(original_text, str) and original_text:
+            current_original_title = submenu.property("reducer_original_title")
+            if current_original_title is None or current_original_title == localized_pyqtgraph_text(original_text, "zh"):
+                submenu.setProperty("reducer_original_title", original_text)
+        if hasattr(action, "defaultWidget"):
+            localize_menu_widget_tree(action.defaultWidget(), language)
+        localize_menu_tree(submenu, language)
+
+
+def _localize_tree_widget_item(item, language: str) -> None:
+    for column in range(item.columnCount()):
+        if item.data(column, ORIGINAL_TEXT_ROLE) is None:
+            item.setData(column, ORIGINAL_TEXT_ROLE, item.text(column))
+        original_text = item.data(column, ORIGINAL_TEXT_ROLE)
+        if isinstance(original_text, str):
+            item.setText(column, localized_pyqtgraph_text(original_text, language))
+    for index in range(item.childCount()):
+        _localize_tree_widget_item(item.child(index), language)
+
+
+def _localize_tree_widget(tree, language: str) -> None:
+    for index in range(tree.topLevelItemCount()):
+        _localize_tree_widget_item(tree.topLevelItem(index), language)
+
+
+def _localize_list_widget_items(list_widget, language: str) -> None:
+    for index in range(list_widget.count()):
+        item = list_widget.item(index)
+        if item.data(ORIGINAL_TEXT_ROLE) is None:
+            item.setData(ORIGINAL_TEXT_ROLE, item.text())
+        original_text = item.data(ORIGINAL_TEXT_ROLE)
+        if isinstance(original_text, str):
+            item.setText(localized_pyqtgraph_text(original_text, language))
+
+
+def localize_export_dialog(dialog, language: str) -> None:
+    if dialog is None or not hasattr(dialog, "ui"):
+        return
+
+    if dialog.property("reducer_original_title") is None:
+        dialog.setProperty("reducer_original_title", dialog.windowTitle())
+    original_title = dialog.property("reducer_original_title")
+    dialog.setWindowTitle(localized_pyqtgraph_text(original_title, language))
+
+    ui = dialog.ui
+    widget_texts = (
+        (ui.label, "Item to export:"),
+        (ui.label_2, "Export format"),
+        (ui.label_3, "Export options"),
+        (ui.copyBtn, "Copy"),
+        (ui.exportBtn, "Export"),
+        (ui.closeBtn, "Close"),
+    )
+    for widget, original_text in widget_texts:
+        widget.setText(localized_pyqtgraph_text(original_text, language))
+
+    _localize_tree_widget(ui.itemTree, language)
+    _localize_list_widget_items(ui.formatList, language)
+    _localize_tree_widget(ui.paramTree, language)
+
+
+def install_pyqtgraph_export_dialog_localizer() -> None:
+    try:
+        export_dialog_module = importlib.import_module(
+            "pyqtgraph.GraphicsScene.exportDialog"
+        )
+    except Exception:
+        return
+
+    export_dialog_class = export_dialog_module.ExportDialog
+    if getattr(export_dialog_class, "_reducer_localizer_installed", False):
+        return
+
+    original_show = export_dialog_class.show
+    original_update_item_list = export_dialog_class.updateItemList
+    original_update_format_list = export_dialog_class.updateFormatList
+    original_export_format_changed = export_dialog_class.exportFormatChanged
+
+    def dialog_language(dialog) -> str:
+        if hasattr(dialog.scene, "property"):
+            language = dialog.scene.property("reducer_language")
+            if language:
+                return str(language)
+        return "zh"
+
+    def localized_show(self, item=None):
+        result = original_show(self, item)
+        localize_export_dialog(self, dialog_language(self))
+        return result
+
+    def localized_update_item_list(self, select=None):
+        result = original_update_item_list(self, select)
+        localize_export_dialog(self, dialog_language(self))
+        return result
+
+    def localized_update_format_list(self):
+        result = original_update_format_list(self)
+        localize_export_dialog(self, dialog_language(self))
+        return result
+
+    def localized_export_format_changed(self, item, prev):
+        result = original_export_format_changed(self, item, prev)
+        localize_export_dialog(self, dialog_language(self))
+        return result
+
+    export_dialog_class.show = localized_show
+    export_dialog_class.updateItemList = localized_update_item_list
+    export_dialog_class.updateFormatList = localized_update_format_list
+    export_dialog_class.exportFormatChanged = localized_export_format_changed
+    export_dialog_class._reducer_localizer_installed = True
+
+
+install_pyqtgraph_export_dialog_localizer()
+
+
+def localize_plot_menus(plot: pg.PlotWidget, language: str) -> None:
+    scene = plot.scene()
+    if hasattr(scene, "setProperty"):
+        scene.setProperty("reducer_language", language)
+    plot_item = plot.getPlotItem()
+    localize_menu_tree(getattr(plot_item.vb, "menu", None), language)
+    localize_menu_tree(getattr(plot_item, "ctrlMenu", None), language)
+    localize_export_dialog(getattr(scene, "exportDialog", None), language)
+
+
 def curve_color_button_stylesheet(color: str) -> str:
     return (
         f"background: {color}; border: 1px solid #6a6a6a; "
@@ -385,13 +653,25 @@ TRANSLATIONS = {
         "data_panel": "Data Panel",
         "auto_scale": "Auto Scale",
         "auto_scale_tooltip": "Automatically fit each plot to recent samples. Uncheck to keep a fixed scale.",
-        "opengl_plot": "OpenGL Plot",
-        "opengl_plot_tooltip": "Use pyqtgraph OpenGL rendering when PyOpenGL is available; numeric conversion stays on CPU.",
-        "opengl_unavailable": "OpenGL plotting is unavailable, using normal rendering",
         "clear_plots": "Clear Plots",
         "clear_plots_tooltip": "Clear waveform history without changing MCU settings or current values",
         "import_csv": "Import CSV",
         "import_csv_tooltip": "Load recorded CSV data into the waveform plots",
+        "metric_colors": "Colors:",
+        "metric_colors_tooltip": "The three swatches are Voltage, Strain, and Stress colors",
+        "metric_color_tooltip": "{metric} color, applied to every plot",
+        "acquisition_channels": "Acquire:",
+        "acquisition_channel_tooltip": "Enable or disable MCU ADC acquisition for CH{channel}",
+        "pause_view": "Pause View",
+        "pause_view_tooltip": "Freeze the plotted curves while acquisition and logging continue",
+        "resume_view": "Resume View",
+        "resume_view_tooltip": "Resume live waveform updates",
+        "export_selection": "Export Selection",
+        "export_selection_tooltip": "Export the paused plot's visible sample range to CSV",
+        "export_paused_selection": "Export paused selection",
+        "selection_exported": "Exported selected paused samples to {filename}",
+        "export_requires_pause": "Pause the view before exporting a selection",
+        "failed_export_selection": "Failed to export selection: {error}",
         "add_plot": "Add Plot",
         "add_plot_tooltip": "Add a waveform plot and request MCU sampling, up to 8 plots total",
         "remove_plot": "Remove",
@@ -422,6 +702,10 @@ TRANSLATIONS = {
         "save_zero": "Save Zero",
         "load_zero": "Load Zero",
         "clear_zero": "Clear Zero",
+        "zero_offset_channel": "Zero CH:",
+        "target_stress": "Target Stress:",
+        "apply_stress_zero": "Apply Zero Offset",
+        "stress_zero_tooltip": "Use the latest sample to set this channel zero offset so the current value equals the target stress",
         "sample_rate": "Sample Rate:",
         "filter_size": "Filter Size:",
         "telemetry_mode": "Telemetry:",
@@ -463,6 +747,10 @@ TRANSLATIONS = {
         "load_zero_failed": "Failed to load zero offset",
         "clear_zero_sent": "Clear Zero command sent, waiting for device ACK",
         "clear_zero_failed": "Failed to clear zero offset",
+        "stress_zero_sent": "Zero offset sent for CH{channel}: {offset} raw, target {voltage:.4f} mV",
+        "stress_zero_failed": "Failed to send zero offset",
+        "stress_zero_needs_sample": "CH{channel} needs one sample before calculating zero offset",
+        "stress_zero_result": "CH{channel} zero offset {offset} raw | target {voltage:.4f} mV",
         "channel_mask_sent": "ADC channel selection sent: 0x{mask:02X}",
         "channel_mask_failed": "Failed to update ADC channel selection",
         "logging_to": "Logging to {filename}",
@@ -475,6 +763,17 @@ TRANSLATIONS = {
         "command_sequence": "Command sequence {sequence}",
     },
     "zh": {
+        "metric_colors": "颜色：",
+        "metric_colors_tooltip": "三个色块依次表示电压、应变、应力颜色",
+        "metric_color_tooltip": "{metric}颜色，应用到所有图表",
+        "zero_offset_channel": "零点 CH：",
+        "target_stress": "目标应力：",
+        "apply_stress_zero": "应用零点偏置",
+        "stress_zero_tooltip": "用最新采样反推该通道零点偏置，使当前值等于输入目标应力",
+        "stress_zero_sent": "CH{channel} 零点偏置已发送：{offset} raw，目标 {voltage:.4f} mV",
+        "stress_zero_failed": "零点偏置发送失败",
+        "stress_zero_needs_sample": "CH{channel} 需要至少一个采样后才能计算零点偏置",
+        "stress_zero_result": "CH{channel} 零点偏置 {offset} raw | 目标 {voltage:.4f} mV",
         "channel_mask_sent": "ADC 通道选择已发送：0x{mask:02X}",
         "channel_mask_failed": "ADC 通道选择更新失败",
         "add_plot": "新增图表",
@@ -505,6 +804,18 @@ TRANSLATIONS = {
         "clear_plots_tooltip": "清空波形历史，不改变 MCU 设置和当前数值",
         "import_csv": "导入 CSV",
         "import_csv_tooltip": "将已记录的 CSV 数据加载到波形窗口",
+        "acquisition_channels": "采集：",
+        "acquisition_channel_tooltip": "启用或停止 MCU 对 CH{channel} 的 ADC 采集",
+        "pause_view": "暂停视图",
+        "pause_view_tooltip": "冻结曲线显示，采集和记录继续运行",
+        "resume_view": "继续显示",
+        "resume_view_tooltip": "恢复实时波形刷新",
+        "export_selection": "导出选区",
+        "export_selection_tooltip": "将暂停曲线当前可见采样范围导出为 CSV",
+        "export_paused_selection": "导出暂停选区",
+        "selection_exported": "已导出暂停选区到 {filename}",
+        "export_requires_pause": "请先暂停视图再导出选区",
+        "failed_export_selection": "导出选区失败：{error}",
         "plot_title": "CH{channel} 曲线",
         "value": "数值",
         "voltage": "电压",
@@ -587,6 +898,7 @@ COMMAND_TRANSLATIONS = {
     "Load Zero": "加载零点",
     "Clear Zero": "清除零点",
     "Set Channel Mask": "设置 ADC 通道",
+    "Set Zero Offset": "设置零点偏置",
 }
 
 STATUS_TRANSLATIONS = {
@@ -619,6 +931,7 @@ class ChannelData:
     stress_mpa: float = 0.0
     voltage_001mv: int = 0
     stress_01mpa: int = 0
+    raw_value: Optional[int] = None
     samples: int = 0
     last_timestamp: float = 0.0
 
@@ -627,17 +940,52 @@ class CANReceiver(QThread):
     """Background thread for forwarding python-can frames to the UI thread"""
 
     frame_received = pyqtSignal(object)
+    frames_available = pyqtSignal()
 
     def __init__(self, can_bus: PythonCANInterface):
         super().__init__()
         self.can_bus = can_bus
         self.running = True
-        self._callback = lambda frame: self.frame_received.emit(frame)
+        self._queue_lock = Lock()
+        self._control_frames = deque()
+        self._telemetry_frames = deque()
+        self._control_drain_signal_pending = False
+        self._callback = self._queue_frame
         self.can_bus.register_rx_callback(self._callback)
 
     def run(self):
         while self.running:
             QThread.msleep(100)
+
+    def _queue_frame(self, frame: CANFrame) -> None:
+        should_emit = False
+        with self._queue_lock:
+            if frame.id == CAN_ID_TX_TELEMETRY:
+                self._telemetry_frames.append(frame)
+            else:
+                self._control_frames.append(frame)
+                if not self._control_drain_signal_pending:
+                    self._control_drain_signal_pending = True
+                    should_emit = True
+        if should_emit:
+            self.frames_available.emit()
+
+    def take_pending_frames(
+        self, telemetry_limit: Optional[int] = None
+    ) -> tuple[list[CANFrame], list[CANFrame]]:
+        with self._queue_lock:
+            control_frames = list(self._control_frames)
+            self._control_frames.clear()
+            self._control_drain_signal_pending = False
+
+            if telemetry_limit is None:
+                telemetry_frames = list(self._telemetry_frames)
+                self._telemetry_frames.clear()
+            else:
+                telemetry_frames = []
+                for _ in range(min(telemetry_limit, len(self._telemetry_frames))):
+                    telemetry_frames.append(self._telemetry_frames.popleft())
+        return control_frames, telemetry_frames
 
     def stop(self):
         self.running = False
@@ -712,6 +1060,7 @@ class OfflineWaveformWindow(QMainWindow):
                 waveform_buffers[channel],
                 pen=pg.mkPen(color=self._get_channel_color(channel), width=1.5),
             )
+            configure_curve_performance(curve)
             self.plot_widgets.append(plot)
             self.plot_curves.append(curve)
             self.plot_hover_items.append(hover_items)
@@ -754,6 +1103,7 @@ class OfflineWaveformWindow(QMainWindow):
             plot.setLabel("left", translate(self.language, "voltage"), units="mV")
             plot.setLabel("bottom", translate(self.language, "sample"))
             plot.setToolTip(translate(self.language, "plot_tooltip"))
+            localize_plot_menus(plot, self.language)
         self.statusBar().showMessage(
             translate(self.language, "loaded_log", filename=self.filename)
         )
@@ -826,25 +1176,23 @@ class OfflineWaveformWindow(QMainWindow):
 
         for plot in self.plot_widgets:
             plot.hide()
-
-        if self.maximized_plot_channel is not None:
-            for row in range(2):
-                self.waveform_layout.setRowStretch(row, 0)
-            for column in range(3):
-                self.waveform_layout.setColumnStretch(column, 0)
-
-            plot = self.plot_widgets[self.plot_channels.index(self.maximized_plot_channel)]
-            self.waveform_layout.addWidget(plot, 0, 0)
-            plot.show()
-            return
-
-        count = len(self.plot_widgets)
-        columns = 1 if count <= 2 else 2 if count <= 4 else 3
-        rows = max(1, (count + columns - 1) // columns)
         for row in range(NUM_CHANNELS):
             self.waveform_layout.setRowStretch(row, 0)
         for column in range(NUM_CHANNELS):
             self.waveform_layout.setColumnStretch(column, 0)
+
+        if self.maximized_plot_channel is not None:
+            columns = plot_grid_columns(len(self.plot_widgets))
+            plot = self.plot_widgets[self.plot_channels.index(self.maximized_plot_channel)]
+            self.waveform_layout.setRowStretch(0, 1)
+            self.waveform_layout.setColumnStretch(0, 1)
+            self.waveform_layout.addWidget(plot, 0, 0, 1, columns)
+            plot.show()
+            return
+
+        count = len(self.plot_widgets)
+        columns = plot_grid_columns(count)
+        rows = max(1, (count + columns - 1) // columns)
         for row in range(rows):
             self.waveform_layout.setRowStretch(row, 1)
         for column in range(columns):
@@ -916,6 +1264,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.csv_file: Optional[object] = None
         self.logging_enabled = False
         self.offline_waveform_windows: List[OfflineWaveformWindow] = []
+        self.view_paused = False
+        self.paused_waveform_snapshot: Optional[Dict[str, List[np.ndarray]]] = None
 
         # UI state
         self.is_connected = False
@@ -934,6 +1284,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.config_sequence = 0
         self.zero_offsets = [0 for _ in range(NUM_CHANNELS)]
         self.zero_valid = False
+        self.acquisition_channel_mask = (1 << NUM_CHANNELS) - 1
+        self.global_metric_colors = {
+            metric: config["color"] for metric, config in PLOT_METRICS.items()
+        }
         self.pending_telemetry_batches = deque(maxlen=2048)
         self.display_drop_count = 0
         self.csv_pending_rows = []
@@ -1034,6 +1388,9 @@ class ReducerMonitorWindow(QMainWindow):
         self.slcan_speed_combo = QComboBox()
         for speed in (2_000_000, 921_600, 460_800, 115_200):
             self.slcan_speed_combo.addItem(str(speed), speed)
+        default_speed_index = self.slcan_speed_combo.findData(DEFAULT_SLCAN_TTY_BAUDRATE)
+        if default_speed_index >= 0:
+            self.slcan_speed_combo.setCurrentIndex(default_speed_index)
         layout.addWidget(self.slcan_speed_combo)
 
         # Connect button
@@ -1047,12 +1404,6 @@ class ReducerMonitorWindow(QMainWindow):
         layout.addWidget(self.refresh_btn)
 
         layout.addStretch()
-
-        # Log button
-        self.log_btn = QPushButton()
-        self.log_btn.clicked.connect(self.on_log_clicked)
-        self.log_btn.setEnabled(False)
-        layout.addWidget(self.log_btn)
 
         self.language_label = QLabel()
         layout.addWidget(self.language_label)
@@ -1083,11 +1434,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.auto_scale_checkbox.toggled.connect(self._on_auto_scale_toggled)
         controls.addWidget(self.auto_scale_checkbox)
 
-        self.opengl_checkbox = QCheckBox()
-        self.opengl_checkbox.setChecked(OPENGL_PLOT_AVAILABLE)
-        self.opengl_checkbox.toggled.connect(self._on_opengl_toggled)
-        controls.addWidget(self.opengl_checkbox)
-
         self.clear_plots_btn = QPushButton()
         self.clear_plots_btn.clicked.connect(self._clear_plots)
         controls.addWidget(self.clear_plots_btn)
@@ -1096,11 +1442,43 @@ class ReducerMonitorWindow(QMainWindow):
         self.import_csv_btn.clicked.connect(self.import_csv)
         controls.addWidget(self.import_csv_btn)
 
+        self.pause_view_btn = QPushButton()
+        self.pause_view_btn.setCheckable(True)
+        self.pause_view_btn.toggled.connect(self._set_view_paused)
+        controls.addWidget(self.pause_view_btn)
+
+        self.export_selection_btn = QPushButton()
+        self.export_selection_btn.clicked.connect(
+            self._on_export_paused_selection_clicked
+        )
+        self.export_selection_btn.setEnabled(False)
+        controls.addWidget(self.export_selection_btn)
+
         self.add_plot_btn = QPushButton()
         self.add_plot_btn.clicked.connect(self._add_waveform_plot)
         controls.addWidget(self.add_plot_btn)
 
+        self.log_btn = QPushButton()
+        self.log_btn.clicked.connect(self.on_log_clicked)
+        self.log_btn.setEnabled(False)
+        controls.addWidget(self.log_btn)
+
         controls.addStretch()
+        self.metric_colors_label = QLabel()
+        controls.addWidget(self.metric_colors_label)
+        self.metric_color_buttons = {}
+        for metric in PLOT_METRICS:
+            color_button = QPushButton()
+            color_button.setFixedSize(18, 18)
+            color_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            color_button.clicked.connect(
+                lambda _checked=False, selected_metric=metric:
+                    self._choose_metric_color(selected_metric)
+            )
+            self.metric_color_buttons[metric] = color_button
+            controls.addWidget(color_button)
+
+        self.waveform_controls_layout = controls
         layout.addLayout(controls)
 
         plots_widget = QWidget()
@@ -1116,7 +1494,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_source_labels = []
         self.plot_metrics_labels = []
         self.plot_metric_checkboxes = []
-        self.plot_metric_color_buttons = []
         self.plot_metric_colors = []
         self.plot_metric_curves = []
         self.plot_hover_items = []
@@ -1150,14 +1527,19 @@ class ReducerMonitorWindow(QMainWindow):
         self.pga_combo.setEnabled(False)
         self.pga_combo.currentIndexChanged.connect(self.on_pga_changed)
         config_layout.addWidget(self.pga_combo)
-        config_layout.addWidget(QLabel("通道掩码:"))
-        self.channel_mask_spin = QSpinBox()
-        self.channel_mask_spin.setRange(0, 0xFF)
-        self.channel_mask_spin.setDisplayIntegerBase(16)
-        self.channel_mask_spin.setPrefix("0x")
-        self.channel_mask_spin.setEnabled(False)
-        self.channel_mask_spin.editingFinished.connect(self.on_channel_mask_changed)
-        config_layout.addWidget(self.channel_mask_spin)
+        self.acquisition_channels_label = QLabel()
+        config_layout.addWidget(self.acquisition_channels_label)
+        self.acquisition_channel_checkboxes = []
+        for channel in range(NUM_CHANNELS):
+            checkbox = QCheckBox(f"CH{channel}")
+            checkbox.setChecked(True)
+            checkbox.setEnabled(False)
+            checkbox.toggled.connect(
+                lambda checked, selected_channel=channel:
+                    self._on_acquisition_channel_toggled(selected_channel, checked)
+            )
+            self.acquisition_channel_checkboxes.append(checkbox)
+            config_layout.addWidget(checkbox)
         self.restore_defaults_btn = QPushButton("恢复默认配置")
         self.restore_defaults_btn.setEnabled(False)
         self.restore_defaults_btn.clicked.connect(self.on_restore_defaults_clicked)
@@ -1242,6 +1624,10 @@ class ReducerMonitorWindow(QMainWindow):
         self.zero_btn.setText(self._tr("zero_sensor"))
         self.calib_btn.setText(self._tr("calibrate"))
         self.clear_zero_btn.setText(self._tr("clear_zero"))
+        self.zero_offset_channel_label.setText(self._tr("zero_offset_channel"))
+        self.zero_offset_target_stress_label.setText(self._tr("target_stress"))
+        self.zero_offset_apply_btn.setText(self._tr("apply_stress_zero"))
+        self.zero_offset_apply_btn.setToolTip(self._tr("stress_zero_tooltip"))
         self.sample_rate_label.setText(self._tr("sample_rate"))
         self.filter_size_label.setText(self._tr("filter_size"))
         self.telemetry_mode_label.setText(self._tr("telemetry_mode"))
@@ -1260,12 +1646,43 @@ class ReducerMonitorWindow(QMainWindow):
         self.tabs.setTabText(1, self._tr("data_panel"))
         self.auto_scale_checkbox.setText(self._tr("auto_scale"))
         self.auto_scale_checkbox.setToolTip(self._tr("auto_scale_tooltip"))
-        self.opengl_checkbox.setText(self._tr("opengl_plot"))
-        self.opengl_checkbox.setToolTip(self._tr("opengl_plot_tooltip"))
         self.clear_plots_btn.setText(self._tr("clear_plots"))
         self.clear_plots_btn.setToolTip(self._tr("clear_plots_tooltip"))
         self.import_csv_btn.setText(self._tr("import_csv"))
         self.import_csv_btn.setToolTip(self._tr("import_csv_tooltip"))
+        self.acquisition_channels_label.setText(self._tr("acquisition_channels"))
+        for channel, checkbox in enumerate(self.acquisition_channel_checkboxes):
+            checkbox.setText(f"CH{channel}")
+            checkbox.setToolTip(
+                self._tr("acquisition_channel_tooltip", channel=channel)
+            )
+        self.pause_view_btn.setText(
+            self._tr("resume_view" if self.view_paused else "pause_view")
+        )
+        self.pause_view_btn.setToolTip(
+            self._tr(
+                "resume_view_tooltip"
+                if self.view_paused else
+                "pause_view_tooltip"
+            )
+        )
+        self.export_selection_btn.setText(self._tr("export_selection"))
+        self.export_selection_btn.setToolTip(self._tr("export_selection_tooltip"))
+        self.metric_colors_label.setText(self._tr("metric_colors"))
+        self.metric_colors_label.setToolTip(self._tr("metric_colors_tooltip"))
+        for metric, button in self.metric_color_buttons.items():
+            metric_name = self._tr(PLOT_METRICS[metric]["axis_key"])
+            button.setStyleSheet(
+                curve_color_button_stylesheet(self.global_metric_colors[metric])
+            )
+            button.setToolTip(
+                self._tr(
+                    "metric_color_tooltip",
+                    metric=metric_name,
+                )
+            )
+            button.setStatusTip(button.toolTip())
+            button.setAccessibleName(button.toolTip())
         self.add_plot_btn.setText(self._tr("add_plot"))
         self.add_plot_btn.setToolTip(self._tr("add_plot_tooltip"))
 
@@ -1310,12 +1727,41 @@ class ReducerMonitorWindow(QMainWindow):
             return STATUS_TRANSLATIONS.get(reason, reason)
         return reason
 
-    def _physical_values_from_raw(self, raw_values) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        raw = np.asarray(raw_values, dtype=np.float64)
-        raw_to_mv_scale = (
+    def _raw_to_mv_scale(self) -> float:
+        return (
             (2.0 * (self.vref_uv / 1_000_000.0)) / self.pga_gain
         ) * (1000.0 / 8388608.0)
-        voltage = raw * raw_to_mv_scale
+
+    def _stress_mpa_to_voltage_mv(self, stress_mpa: float) -> float:
+        strain_ue = float(stress_mpa) * 1000000.0 / ELASTIC_MODULUS_MPA
+        return strain_ue / MV_TO_MICROSTRAIN_SCALE
+
+    def _calculate_zero_offset_for_target_stress(
+        self, channel: int, stress_mpa: float
+    ) -> tuple[int, float]:
+        if channel < 0 or channel >= NUM_CHANNELS:
+            raise ValueError("channel out of range")
+
+        data = self.channel_data[channel]
+        if data.samples <= 0:
+            raise ValueError("sample required")
+
+        raw_scale = self._raw_to_mv_scale()
+        if abs(raw_scale) < 1e-12:
+            raise ValueError("invalid raw scale")
+
+        current_raw = (
+            int(data.raw_value)
+            if data.raw_value is not None
+            else int(round(data.voltage_mv / raw_scale))
+        )
+        target_voltage_mv = self._stress_mpa_to_voltage_mv(stress_mpa)
+        target_raw = int(round(target_voltage_mv / raw_scale))
+        return int(current_raw + self.zero_offsets[channel] - target_raw), target_voltage_mv
+
+    def _physical_values_from_raw(self, raw_values) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        raw = np.asarray(raw_values, dtype=np.float64)
+        voltage = raw * self._raw_to_mv_scale()
         strain = np.clip(
             voltage * MV_TO_MICROSTRAIN_SCALE,
             -MAX_STRAIN_UE,
@@ -1482,20 +1928,12 @@ class ReducerMonitorWindow(QMainWindow):
         metrics_label = QLabel()
         header.addWidget(metrics_label)
         metric_checkboxes = {}
-        metric_color_buttons = {}
-        metric_colors = {
-            metric: config["color"] for metric, config in PLOT_METRICS.items()
-        }
+        metric_colors = dict(self.global_metric_colors)
         for metric in PLOT_METRICS:
             checkbox = QCheckBox()
             checkbox.setChecked(metric == "voltage")
             metric_checkboxes[metric] = checkbox
             header.addWidget(checkbox)
-            color_button = QPushButton()
-            color_button.setFixedSize(18, 18)
-            color_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            metric_color_buttons[metric] = color_button
-            header.addWidget(color_button)
         header.addStretch()
 
         remove_button = QPushButton()
@@ -1527,6 +1965,7 @@ class ReducerMonitorWindow(QMainWindow):
             curve = plot.plot(
                 pen=pg.mkPen(color=metric_colors[metric], width=1.5)
             )
+            configure_curve_performance(curve)
             curve.setVisible(metric == "voltage")
             metric_curves[metric] = curve
         panel_layout.addWidget(plot)
@@ -1538,7 +1977,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_source_labels.append(source_label)
         self.plot_metrics_labels.append(metrics_label)
         self.plot_metric_checkboxes.append(metric_checkboxes)
-        self.plot_metric_color_buttons.append(metric_color_buttons)
         self.plot_metric_colors.append(metric_colors)
         self.plot_metric_curves.append(metric_curves)
         self.plot_hover_items.append(hover_items)
@@ -1556,12 +1994,6 @@ class ReducerMonitorWindow(QMainWindow):
                         selected_plot, selected_metric, checked
                 )
             )
-        for metric, button in metric_color_buttons.items():
-            button.clicked.connect(
-                lambda _checked=False, selected_plot=plot, selected_metric=metric:
-                    self._choose_plot_metric_color(selected_plot, selected_metric)
-            )
-
         plot_index = len(self.plot_widgets) - 1
         self._update_plot_presentation(plot_index)
         self._refresh_plot_data(plot_index)
@@ -1588,7 +2020,6 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_source_labels.pop(plot_index)
         self.plot_metrics_labels.pop(plot_index)
         self.plot_metric_checkboxes.pop(plot_index)
-        self.plot_metric_color_buttons.pop(plot_index)
         self.plot_metric_colors.pop(plot_index)
         self.plot_metric_curves.pop(plot_index)
         self.plot_hover_items.pop(plot_index)
@@ -1646,32 +2077,34 @@ class ReducerMonitorWindow(QMainWindow):
             if checkbox.isChecked()
         ]
 
-    def _choose_plot_metric_color(self, plot: pg.PlotWidget, metric: str):
-        if plot not in self.plot_widgets:
-            return
-
-        plot_index = self.plot_widgets.index(plot)
+    def _choose_metric_color(self, metric: str):
         selected = QColorDialog.getColor(
-            QColor(self.plot_metric_colors[plot_index][metric]),
+            QColor(self.global_metric_colors[metric]),
             self,
             self._tr(PLOT_METRICS[metric]["label_key"]),
         )
         if selected.isValid():
-            self._set_plot_metric_color(plot_index, metric, selected.name())
+            self._set_metric_color(metric, selected.name())
 
-    def _set_plot_metric_color(self, plot_index: int, metric: str, color: str):
+    def _set_metric_color(self, metric: str, color: str):
         selected = QColor(color)
         if not selected.isValid():
             return
 
         normalized = selected.name()
-        self.plot_metric_colors[plot_index][metric] = normalized
-        self.plot_metric_curves[plot_index][metric].setPen(
-            pg.mkPen(normalized, width=1.5)
-        )
-        self.plot_metric_color_buttons[plot_index][metric].setStyleSheet(
-            curve_color_button_stylesheet(normalized)
-        )
+        self.global_metric_colors[metric] = normalized
+        if metric in self.metric_color_buttons:
+            self.metric_color_buttons[metric].setStyleSheet(
+                curve_color_button_stylesheet(normalized)
+            )
+        for index in range(len(self.plot_metric_curves)):
+            self.plot_metric_colors[index][metric] = normalized
+            self.plot_metric_curves[index][metric].setPen(
+                pg.mkPen(normalized, width=1.5)
+            )
+
+    def _set_plot_metric_color(self, plot_index: int, metric: str, color: str):
+        self._set_metric_color(metric, color)
 
     def _on_plot_mouse_moved(self, plot: pg.PlotWidget, scene_pos):
         if plot not in self.plot_widgets:
@@ -1695,9 +2128,8 @@ class ReducerMonitorWindow(QMainWindow):
         channel = self.plot_channels[plot_index]
         nearest = None
         for metric in self._selected_plot_metrics(plot_index):
-            values = self.waveform_metric_buffers[metric][channel]
-            total = len(values)
-            visible = values.to_array(PLOT_VISIBLE_SAMPLES)
+            total = self._plot_metric_count(metric, channel)
+            visible = self._plot_metric_values(metric, channel, PLOT_VISIBLE_SAMPLES)
             first_sample = max(0, total - len(visible))
             local_sample = sample - first_sample
             if not 0 <= local_sample < len(visible):
@@ -1713,7 +2145,7 @@ class ReducerMonitorWindow(QMainWindow):
 
         _, metric, value = nearest
         config = PLOT_METRICS[metric]
-        color = self.plot_metric_colors[plot_index][metric]
+        color = self.global_metric_colors[metric]
         hover_items["line"].setPos(sample)
         hover_items["marker"].setData([sample], [value], brush=pg.mkBrush(color))
         hover_items["label"].setText(
@@ -1737,12 +2169,15 @@ class ReducerMonitorWindow(QMainWindow):
     def _refresh_plot_data(self, plot_index: int):
         channel = self.plot_channels[plot_index]
         for metric, curve in self.plot_metric_curves[plot_index].items():
-            values = self.waveform_metric_buffers[metric][channel].to_array(
-                PLOT_VISIBLE_SAMPLES
-            )
+            values = self._plot_metric_values(metric, channel, PLOT_VISIBLE_SAMPLES)
             if values.size:
-                first_sample = max(0, len(self.waveform_metric_buffers[metric][channel]) - values.size)
-                curve.setData(np.arange(first_sample, first_sample + values.size), values)
+                first_sample = max(
+                    0, self._plot_metric_count(metric, channel) - values.size
+                )
+                curve.setData(
+                    np.arange(first_sample, first_sample + values.size),
+                    values,
+                )
             else:
                 curve.setData([], [])
 
@@ -1770,30 +2205,41 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_metrics_labels[plot_index].setText(self._tr("plot_metrics"))
         for metric, checkbox in self.plot_metric_checkboxes[plot_index].items():
             config = PLOT_METRICS[metric]
-            color = self.plot_metric_colors[plot_index][metric]
             checkbox.setText(self._tr(config["label_key"]))
             checkbox.setToolTip(self._tr("plot_metrics_tooltip"))
             checkbox.setStyleSheet(
                 f"color: {THEME_COLORS[self.theme]['text']};"
             )
-            color_button = self.plot_metric_color_buttons[plot_index][metric]
-            color_button.setStyleSheet(curve_color_button_stylesheet(color))
-            color_button.setToolTip(self._tr("plot_metrics_tooltip"))
         self.plot_remove_buttons[plot_index].setText(self._tr("remove_plot"))
         self.plot_remove_buttons[plot_index].setToolTip(
             self._tr("remove_plot_tooltip")
         )
+        localize_plot_menus(plot, self.language)
 
     def _update_plot_controls(self):
         self.add_plot_btn.setEnabled(len(self.plot_panels) < MAX_VISIBLE_PLOTS)
         for button in self.plot_remove_buttons:
             button.setEnabled(True)
 
+    def _set_acquisition_channel_mask(self, mask: int) -> None:
+        self.acquisition_channel_mask = int(mask) & 0xFF
+        for channel, checkbox in enumerate(self.acquisition_channel_checkboxes):
+            with QSignalBlocker(checkbox):
+                checkbox.setChecked(
+                    bool(self.acquisition_channel_mask & (1 << channel))
+                )
+        self._update_stream_summary()
+
+    def _on_acquisition_channel_toggled(self, channel: int, checked: bool):
+        if checked:
+            channel_mask = self.acquisition_channel_mask | (1 << channel)
+        else:
+            channel_mask = self.acquisition_channel_mask & ~(1 << channel)
+        self._set_acquisition_channel_mask(channel_mask)
+        self._sync_mcu_channel_mask()
+
     def _displayed_channel_mask(self) -> int:
-        channel_mask = 0
-        for channel in self.plot_channels:
-            channel_mask |= 1 << channel
-        return channel_mask
+        return self.acquisition_channel_mask & 0xFF
 
     def _sync_mcu_channel_mask(
         self, *, show_status: bool = True, force: bool = False
@@ -1835,14 +2281,141 @@ class ReducerMonitorWindow(QMainWindow):
         if enabled:
             self.plot_dirty = [True for _ in range(NUM_CHANNELS)]
 
-    def _on_opengl_toggled(self, enabled: bool):
-        applied = configure_plot_backend(enabled)
-        if enabled and not applied:
-            with QSignalBlocker(self.opengl_checkbox):
-                self.opengl_checkbox.setChecked(False)
-            self._show_status("opengl_unavailable")
-        for plot_index in range(len(self.plot_widgets)):
-            self._refresh_plot_data(plot_index)
+    def _capture_waveform_snapshot(self) -> Dict[str, List[np.ndarray]]:
+        return {
+            metric: [
+                self.waveform_metric_buffers[metric][channel].to_array()
+                for channel in range(NUM_CHANNELS)
+            ]
+            for metric in PLOT_METRICS
+        }
+
+    def _plot_metric_values(
+        self, metric: str, channel: int, last: Optional[int] = None
+    ) -> np.ndarray:
+        if self.view_paused and self.paused_waveform_snapshot is not None:
+            values = self.paused_waveform_snapshot[metric][channel]
+            if last is not None and values.size > last:
+                return values[-last:].copy()
+            return values.copy()
+        return self.waveform_metric_buffers[metric][channel].to_array(last)
+
+    def _plot_metric_count(self, metric: str, channel: int) -> int:
+        if self.view_paused and self.paused_waveform_snapshot is not None:
+            return int(self.paused_waveform_snapshot[metric][channel].size)
+        return len(self.waveform_metric_buffers[metric][channel])
+
+    def _set_view_paused(self, paused: bool):
+        paused = bool(paused)
+        if self.view_paused == paused:
+            self._update_pause_controls()
+            return
+
+        self.view_paused = paused
+        if paused:
+            self.paused_waveform_snapshot = self._capture_waveform_snapshot()
+            for plot_index in range(len(self.plot_widgets)):
+                self._refresh_plot_data(plot_index)
+                if self.auto_scale_checkbox.isChecked():
+                    self._update_plot_range(plot_index)
+        else:
+            self.paused_waveform_snapshot = None
+            self.plot_dirty = [True for _ in range(NUM_CHANNELS)]
+
+        self._update_pause_controls()
+
+    def _update_pause_controls(self):
+        if hasattr(self, "pause_view_btn"):
+            with QSignalBlocker(self.pause_view_btn):
+                self.pause_view_btn.setChecked(self.view_paused)
+            self.pause_view_btn.setText(
+                self._tr("resume_view" if self.view_paused else "pause_view")
+            )
+            self.pause_view_btn.setToolTip(
+                self._tr(
+                    "resume_view_tooltip"
+                    if self.view_paused else
+                    "pause_view_tooltip"
+                )
+            )
+        if hasattr(self, "export_selection_btn"):
+            self.export_selection_btn.setEnabled(self.view_paused)
+
+    def _selected_export_range(self) -> tuple[int, int]:
+        if self.maximized_plot_panel is not None:
+            plot_index = self.plot_panels.index(self.maximized_plot_panel)
+        else:
+            plot_index = 0
+        x_range, _ = self.plot_widgets[plot_index].viewRange()
+        first_sample = max(0, int(np.floor(x_range[0])))
+        last_sample = max(first_sample, int(np.ceil(x_range[1])))
+        return first_sample, last_sample
+
+    def _on_export_paused_selection_clicked(self):
+        if not self.view_paused:
+            self._show_status("export_requires_pause")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            self._tr("export_paused_selection"),
+            f"reducer_selection_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            self._tr("csv_files"),
+        )
+        if not filename:
+            return
+
+        try:
+            self._export_paused_selection_to_csv(filename)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                self._tr("error"),
+                self._tr("failed_export_selection", error=exc),
+            )
+            logger.error("Failed to export paused selection %s: %s", filename, exc)
+            return
+
+        self._show_status("selection_exported", filename=filename)
+
+    def _export_paused_selection_to_csv(self, filename: str):
+        if not self.view_paused or self.paused_waveform_snapshot is None:
+            raise RuntimeError(self._tr("export_requires_pause"))
+
+        first_sample, last_sample = self._selected_export_range()
+        channels = []
+        seen_channels = set()
+        for channel in self.plot_channels:
+            if channel not in seen_channels:
+                channels.append(channel)
+                seen_channels.add(channel)
+
+        with open(filename, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "timestamp", "channel",
+                "voltage_mv", "strain_ue", "stress_mpa", "raw_value",
+                "telemetry_mode", "config_sequence", "samples",
+            ])
+            for channel in channels:
+                voltage = self.paused_waveform_snapshot["voltage"][channel]
+                strain = self.paused_waveform_snapshot["strain"][channel]
+                stress = self.paused_waveform_snapshot["stress"][channel]
+                if voltage.size == 0:
+                    continue
+                bounded_last = min(last_sample, voltage.size - 1)
+                for sample_index in range(first_sample, bounded_last + 1):
+                    writer.writerow([
+                        "",
+                        channel,
+                        float(voltage[sample_index]),
+                        float(strain[sample_index]) if sample_index < strain.size else "",
+                        float(stress[sample_index]) if sample_index < stress.size else "",
+                        "",
+                        self.telemetry_mode,
+                        self.config_sequence,
+                        sample_index + 1,
+                    ])
 
     def _set_plot_refresh_rate(self, refresh_hz: int):
         interval_ms = max(1, round(1000 / refresh_hz))
@@ -1856,6 +2429,9 @@ class ReducerMonitorWindow(QMainWindow):
             self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
             self.pending_telemetry_batches.clear()
             self.csv_pending_rows.clear()
+            self.paused_waveform_snapshot = (
+                self._capture_waveform_snapshot() if self.view_paused else None
+            )
 
         for curves in self.plot_metric_curves:
             for curve in curves.values():
@@ -1902,23 +2478,23 @@ class ReducerMonitorWindow(QMainWindow):
 
         for panel in self.plot_panels:
             panel.hide()
-
-        if self.maximized_plot_panel is not None:
-            for row in range(MAX_VISIBLE_PLOTS):
-                self.waveform_layout.setRowStretch(row, 0)
-            for column in range(MAX_VISIBLE_PLOTS):
-                self.waveform_layout.setColumnStretch(column, 0)
-
-            self.waveform_layout.addWidget(self.maximized_plot_panel, 0, 0, 1, 1)
-            self.maximized_plot_panel.show()
-            return
-
-        columns = 2 if len(self.plot_panels) <= 4 else 3
-        rows = (len(self.plot_panels) + columns - 1) // columns
         for row in range(MAX_VISIBLE_PLOTS):
             self.waveform_layout.setRowStretch(row, 0)
         for column in range(MAX_VISIBLE_PLOTS):
             self.waveform_layout.setColumnStretch(column, 0)
+
+        if self.maximized_plot_panel is not None:
+            columns = plot_grid_columns(len(self.plot_panels))
+            self.waveform_layout.setRowStretch(0, 1)
+            self.waveform_layout.setColumnStretch(0, 1)
+            self.waveform_layout.addWidget(
+                self.maximized_plot_panel, 0, 0, 1, columns
+            )
+            self.maximized_plot_panel.show()
+            return
+
+        columns = plot_grid_columns(len(self.plot_panels))
+        rows = (len(self.plot_panels) + columns - 1) // columns
         for row in range(rows):
             self.waveform_layout.setRowStretch(row, 1)
         for column in range(columns):
@@ -1953,6 +2529,8 @@ class ReducerMonitorWindow(QMainWindow):
             self.health_adc_recovery_delta = 0
             self.pending_telemetry_batches.clear()
             self.csv_pending_rows.clear()
+            self.view_paused = False
+            self.paused_waveform_snapshot = None
 
         if hasattr(self, 'data_table'):
             for row in range(NUM_CHANNELS):
@@ -1966,6 +2544,7 @@ class ReducerMonitorWindow(QMainWindow):
             for curves in self.plot_metric_curves:
                 for curve in curves.values():
                     curve.setData([], [])
+        self._update_pause_controls()
         self._refresh_health_panel(update_rx_rate=False)
 
     def on_connect_clicked(self):
@@ -2076,6 +2655,43 @@ class ReducerMonitorWindow(QMainWindow):
             self._show_status("clear_zero_failed")
             logger.warning("Failed to clear zero offset")
 
+    def on_target_stress_zero_clicked(self):
+        channel = self.zero_offset_channel_combo.currentData()
+        if channel is None:
+            return
+
+        channel = int(channel)
+        target_stress = float(self.zero_offset_target_stress_spin.value())
+        try:
+            offset, target_voltage = self._calculate_zero_offset_for_target_stress(
+                channel, target_stress
+            )
+        except ValueError:
+            self._show_status("stress_zero_needs_sample", channel=channel)
+            return
+
+        self.zero_offset_result_label.setText(
+            self._format_message(
+                "stress_zero_result",
+                channel=channel,
+                offset=offset,
+                voltage=target_voltage,
+            )
+        )
+        if self.send_command(
+            CAN_CMD_SET_ZERO_OFFSET,
+            param=channel,
+            value=offset & 0xFFFFFFFF,
+        ):
+            self._show_status(
+                "stress_zero_sent",
+                channel=channel,
+                offset=offset,
+                voltage=target_voltage,
+            )
+        else:
+            self._show_status("stress_zero_failed")
+
     def on_vref_changed(self):
         if self.is_connected:
             self.send_command(CAN_CMD_SET_VREF_UV, value=round(self.vref_spin.value() * 1_000_000))
@@ -2085,10 +2701,6 @@ class ReducerMonitorWindow(QMainWindow):
             gain = self.pga_combo.currentData()
             if gain is not None:
                 self.send_command(CAN_CMD_SET_PGA, value=int(gain))
-
-    def on_channel_mask_changed(self):
-        if self.is_connected:
-            self.send_command(CAN_CMD_SET_CHANNEL_MASK, value=self.channel_mask_spin.value())
 
     def on_restore_defaults_clicked(self):
         answer = QMessageBox.question(
@@ -2111,8 +2723,7 @@ class ReducerMonitorWindow(QMainWindow):
             index = self.pga_combo.findData(self.pga_gain)
             if index >= 0:
                 self.pga_combo.setCurrentIndex(index)
-        with QSignalBlocker(self.channel_mask_spin):
-            self.channel_mask_spin.setValue(config.channel_mask)
+        self._set_acquisition_channel_mask(config.channel_mask)
         with QSignalBlocker(self.filter_size_spin):
             self.filter_size_spin.setValue(config.filter_length)
         with QSignalBlocker(self.sample_rate_combo):
@@ -2151,6 +2762,38 @@ class ReducerMonitorWindow(QMainWindow):
         self.clear_zero_btn.clicked.connect(self.on_clear_zero_clicked)
         self.clear_zero_btn.setEnabled(False)
         controls.addWidget(self.clear_zero_btn)
+
+        self.zero_offset_channel_label = QLabel()
+        controls.addWidget(self.zero_offset_channel_label)
+        self.zero_offset_channel_combo = QComboBox()
+        for channel in range(NUM_CHANNELS):
+            self.zero_offset_channel_combo.addItem(f"CH{channel}", channel)
+        self.zero_offset_channel_combo.setEnabled(False)
+        controls.addWidget(self.zero_offset_channel_combo)
+
+        self.zero_offset_target_stress_label = QLabel()
+        controls.addWidget(self.zero_offset_target_stress_label)
+        self.zero_offset_target_stress_spin = QDoubleSpinBox()
+        self.zero_offset_target_stress_spin.setRange(
+            -MAX_STRAIN_UE * ELASTIC_MODULUS_MPA / 1000000.0,
+            MAX_STRAIN_UE * ELASTIC_MODULUS_MPA / 1000000.0,
+        )
+        self.zero_offset_target_stress_spin.setDecimals(4)
+        self.zero_offset_target_stress_spin.setSingleStep(1.0)
+        self.zero_offset_target_stress_spin.setSuffix(" MPa")
+        self.zero_offset_target_stress_spin.setEnabled(False)
+        controls.addWidget(self.zero_offset_target_stress_spin)
+
+        self.zero_offset_apply_btn = QPushButton()
+        self.zero_offset_apply_btn.clicked.connect(self.on_target_stress_zero_clicked)
+        self.zero_offset_apply_btn.setEnabled(False)
+        controls.addWidget(self.zero_offset_apply_btn)
+
+        self.zero_offset_result_label = QLabel()
+        self.zero_offset_result_label.setStyleSheet(
+            f"color: {THEME_COLORS[self.theme]['muted_text']}; font-weight: 600;"
+        )
+        controls.addWidget(self.zero_offset_result_label)
 
         # Filter size control
         self.sample_rate_label = QLabel()
@@ -2309,7 +2952,9 @@ class ReducerMonitorWindow(QMainWindow):
 
             # Start receiver thread
             self.can_receiver = CANReceiver(self.can_bus)
-            self.can_receiver.frame_received.connect(self.on_can_frame_received)
+            self.can_receiver.frames_available.connect(
+                self._drain_can_receiver_control_frames
+            )
             self.can_receiver.start()
             self._reset_measurements()
             self.pending_commands.clear()
@@ -2323,22 +2968,27 @@ class ReducerMonitorWindow(QMainWindow):
             self.zero_btn.setEnabled(True)
             self.calib_btn.setEnabled(True)
             self.clear_zero_btn.setEnabled(True)
+            self.zero_offset_channel_combo.setEnabled(True)
+            self.zero_offset_target_stress_spin.setEnabled(True)
+            self.zero_offset_apply_btn.setEnabled(True)
             self.sample_rate_combo.setEnabled(True)
             self.filter_size_spin.setEnabled(True)
             self.telemetry_mode_combo.setEnabled(True)
             self.vref_spin.setEnabled(True)
             self.pga_combo.setEnabled(True)
-            self.channel_mask_spin.setEnabled(True)
+            for checkbox in self.acquisition_channel_checkboxes:
+                checkbox.setEnabled(True)
             self.restore_defaults_btn.setEnabled(True)
             self.send_command(CAN_CMD_GET_CONFIG)
             self._show_status("connected_device", interface=interface, channel=channel)
 
             logger.info(
-                "Connected to %s:%s (CAN FD bitrate %s/%s)",
+                "Connected to %s:%s (CAN FD bitrate %s/%s, USB serial %s)",
                 interface,
                 channel,
                 baudrate.bps,
                 CAN_FD_DATA_BITRATE,
+                tty_baudrate if interface == "slcan" else "n/a",
             )
 
         except Exception as e:
@@ -2375,15 +3025,34 @@ class ReducerMonitorWindow(QMainWindow):
         self.zero_btn.setEnabled(False)
         self.calib_btn.setEnabled(False)
         self.clear_zero_btn.setEnabled(False)
+        self.zero_offset_channel_combo.setEnabled(False)
+        self.zero_offset_target_stress_spin.setEnabled(False)
+        self.zero_offset_apply_btn.setEnabled(False)
         self.sample_rate_combo.setEnabled(False)
         self.filter_size_spin.setEnabled(False)
         self.telemetry_mode_combo.setEnabled(False)
         self.vref_spin.setEnabled(False)
         self.pga_combo.setEnabled(False)
-        self.channel_mask_spin.setEnabled(False)
+        for checkbox in self.acquisition_channel_checkboxes:
+            checkbox.setEnabled(False)
         self.restore_defaults_btn.setEnabled(False)
         self._show_status("disconnected")
         logger.info("Disconnected")
+
+    def _drain_can_receiver_control_frames(self):
+        self._drain_can_receiver_frames(telemetry_limit=0)
+
+    def _drain_can_receiver_frames(self, telemetry_limit: Optional[int] = None):
+        if self.can_receiver is None:
+            return
+
+        control_frames, telemetry_frames = self.can_receiver.take_pending_frames(
+            telemetry_limit
+        )
+        for frame in control_frames:
+            self.on_can_frame_received(frame)
+        for frame in telemetry_frames:
+            self.on_can_frame_received(frame)
 
     def on_can_frame_received(self, frame: CANFrame):
         """Handle received CAN frames from the adapter"""
@@ -2504,6 +3173,7 @@ class ReducerMonitorWindow(QMainWindow):
         data.strain_ue = strain_ue
         data.stress_01mpa = stress_01mpa
         data.stress_mpa = stress_mpa
+        data.raw_value = raw_value
         data.samples += 1
         data.last_timestamp = timestamp if timestamp is not None else time.time()
         payload = {
@@ -2579,17 +3249,19 @@ class ReducerMonitorWindow(QMainWindow):
 
     def update_plots(self):
         """Update waveform plots (called by timer)"""
+        self._drain_can_receiver_frames()
         with self.lock:
             drained_channels = self._drain_pending_telemetry()
             dirty_channels = {
                 ch for ch in range(NUM_CHANNELS) if self.plot_dirty[ch]
             }
             dirty_channels.update(drained_channels)
-            for plot_index, channel in enumerate(self.plot_channels):
-                if channel in dirty_channels:
-                    self._refresh_plot_data(plot_index)
-                    if self.auto_scale_checkbox.isChecked():
-                        self._update_plot_range(plot_index)
+            if not self.view_paused:
+                for plot_index, channel in enumerate(self.plot_channels):
+                    if channel in dirty_channels:
+                        self._refresh_plot_data(plot_index)
+                        if self.auto_scale_checkbox.isChecked():
+                            self._update_plot_range(plot_index)
             for channel in dirty_channels:
                 self.plot_dirty[channel] = False
                 self._update_data_table_row(channel)
@@ -2618,7 +3290,7 @@ class ReducerMonitorWindow(QMainWindow):
     def _update_plot_range(self, plot_index: int):
         channel = self.plot_channels[plot_index]
         series = [
-            self.waveform_metric_buffers[metric][channel].to_array(PLOT_VISIBLE_SAMPLES)
+            self._plot_metric_values(metric, channel, PLOT_VISIBLE_SAMPLES)
             for metric in self._selected_plot_metrics(plot_index)
         ]
         series = [values for values in series if values.size]
@@ -2626,7 +3298,7 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         sample_count = max(
-            len(self.waveform_metric_buffers[metric][channel])
+            self._plot_metric_count(metric, channel)
             for metric in self._selected_plot_metrics(plot_index)
         )
         visible_count = min(sample_count, PLOT_VISIBLE_SAMPLES)
@@ -2743,6 +3415,7 @@ class ReducerMonitorWindow(QMainWindow):
         )
 
     def _check_command_timeouts(self) -> None:
+        self._drain_can_receiver_control_frames()
         now = time.monotonic()
         expired = [
             sequence for sequence, deadline in self.pending_command_deadlines.items()
