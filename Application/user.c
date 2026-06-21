@@ -18,7 +18,7 @@
 #define ADC_CHANNEL_COUNT   ADS1256_LOGICAL_CHANNEL_COUNT
 #define ADC_SAMPLE_BATCH_COUNT 32U
 #define CAN_COMMANDS_PER_LOOP 4
-#define CAN_TX_DRIVER_TEST_ENABLED   1U
+#define CAN_TX_DRIVER_TEST_ENABLED   0U
 #if CAN_TX_DRIVER_TEST_ENABLED
 #define CAN_TX_DRIVER_TEST_CLASSIC_ID 0x123U
 #define CAN_TX_DRIVER_TEST_PERIOD_MS  100U
@@ -38,6 +38,13 @@
 #define CAN_HEALTH_PERIOD_MS         1000U
 #define CAN_DIAG_PERIOD_MS           250U
 #define CONFIG_SAVE_DELAY_MS         750U
+#define CAN_RESTORE_STEP_VREF         1U
+#define CAN_RESTORE_STEP_PGA          2U
+#define CAN_RESTORE_STEP_SAMPLE_RATE  3U
+#define CAN_RESTORE_STEP_CHANNEL_MASK 4U
+#define CAN_RESTORE_STEP_CALIBRATION  5U
+#define CAN_RESTORE_STEP_RESTART      6U
+#define CAN_RESTORE_ROLLBACK_FAILED   0x80U
 
 typedef struct {
     uint8_t channel;
@@ -619,6 +626,76 @@ static void service_config_save(void)
     }
 }
 
+static int apply_ads_config(const persistent_config_t *config,
+                            uint8_t *failed_step)
+{
+    if (failed_step != NULL) {
+        *failed_step = 0U;
+    }
+    if (adc_ads1256_set_vref_uv(config->vref_uv) != 0) {
+        if (failed_step != NULL) {
+            *failed_step = CAN_RESTORE_STEP_VREF;
+        }
+        return -1;
+    }
+    if (adc_ads1256_set_pga_gain(config->pga_gain) != 0) {
+        if (failed_step != NULL) {
+            *failed_step = CAN_RESTORE_STEP_PGA;
+        }
+        return -1;
+    }
+    if (adc_ads1256_set_sample_rate_x10(config->sample_rate_x10) != 0) {
+        if (failed_step != NULL) {
+            *failed_step = CAN_RESTORE_STEP_SAMPLE_RATE;
+        }
+        return -1;
+    }
+    if (adc_ads1256_set_channel_mask(config->channel_mask) != 0) {
+        if (failed_step != NULL) {
+            *failed_step = CAN_RESTORE_STEP_CHANNEL_MASK;
+        }
+        return -1;
+    }
+    if (adc_ads1256_calibrate() != 0) {
+        if (failed_step != NULL) {
+            *failed_step = CAN_RESTORE_STEP_CALIBRATION;
+        }
+        return -1;
+    }
+    if (adc_ads1256_restart() != 0) {
+        if (failed_step != NULL) {
+            *failed_step = CAN_RESTORE_STEP_RESTART;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static void apply_non_ads_runtime_config(const persistent_config_t *config)
+{
+    for (uint8_t channel = 0U; channel < ADC_CHANNEL_COUNT; channel++) {
+        filter_set_zero_offset(channel, config->zero_offset[channel]);
+    }
+    filter_set_window_size(config->filter_length);
+    can_telemetry_mode = config->telemetry_mode;
+    flexspline_params_set(
+        &flexspline_params, (float)config->vref_uv / 1000000.0f,
+        config->pga_gain, FLEXSPLINE_BRIDGE_EXCITATION_V,
+        FLEXSPLINE_GAUGE_FACTOR, FLEXSPLINE_ELASTIC_MODULUS_MPA);
+    filter_reset_all();
+    reset_can_telemetry_queue();
+}
+
+static int restore_runtime_config(const persistent_config_t *config)
+{
+    uint8_t failed_step;
+    int result = apply_ads_config(config, &failed_step);
+
+    persistent_config = *config;
+    apply_non_ads_runtime_config(config);
+    return result;
+}
+
 static void send_config_snapshot(void)
 {
     if (!can_ready || !config_snapshot_pending) {
@@ -895,26 +972,31 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
             }
             return CAN_STATUS_OK;
 
-        case CAN_CMD_RESTORE_DEFAULTS:
-            flash_storage_config_defaults(&persistent_config);
-            for (uint8_t i = 0U; i < ADC_CHANNEL_COUNT; i++) {
-                filter_set_zero_offset(i, 0);
+        case CAN_CMD_RESTORE_DEFAULTS: {
+            persistent_config_t previous_config;
+            persistent_config_t default_config;
+            uint8_t failed_step = 0U;
+
+            sync_persistent_config_from_runtime();
+            previous_config = persistent_config;
+            flash_storage_config_defaults(&default_config);
+            if (apply_ads_config(&default_config, &failed_step) != 0) {
+                if (restore_runtime_config(&previous_config) != 0) {
+                    failed_step |= CAN_RESTORE_ROLLBACK_FAILED;
+                }
+                if (detail != NULL) {
+                    *detail = failed_step;
+                }
+                return CAN_STATUS_BAD_VALUE;
             }
-            (void)adc_ads1256_set_vref_uv(persistent_config.vref_uv);
-            (void)adc_ads1256_set_pga_gain(persistent_config.pga_gain);
-            (void)adc_ads1256_set_sample_rate_x10(persistent_config.sample_rate_x10);
-            (void)adc_ads1256_set_channel_mask(persistent_config.channel_mask);
-            (void)adc_ads1256_calibrate();
-            (void)adc_ads1256_restart();
-            filter_set_window_size(persistent_config.filter_length);
-            can_telemetry_mode = persistent_config.telemetry_mode;
-            flexspline_params_set_default(&flexspline_params);
-            filter_reset_all();
-            reset_can_telemetry_queue();
+
+            persistent_config = default_config;
+            apply_non_ads_runtime_config(&persistent_config);
             if (save_config_now() != 0) {
                 return CAN_STATUS_STORAGE_ERROR;
             }
             return CAN_STATUS_OK;
+        }
 
         default:
             if (detail != NULL) {
@@ -982,9 +1064,6 @@ static void process_can_commands(void)
 // ============================================================================
 void loop(void)
 {
-while (1) {
-
-
 #if CAN_TX_DRIVER_TEST_ENABLED
     send_can_tx_driver_test();
     return;
@@ -995,7 +1074,7 @@ while (1) {
     send_can_interval_test();
     return;
 #endif
-}
+
     can_main_loop_seen = true;
     (void)can_recover_bus_off();
     process_can_commands();

@@ -46,6 +46,7 @@ from can_protocol import (
     TELEMETRY_MODE_RAW,
     Baudrate,
     PythonCANInterface,
+    SlcanFdProbeResult,
     _PythonCanListener,
     available_interfaces,
     build_command_frame,
@@ -67,8 +68,10 @@ from reducer_monitor import (
     CAN_CMD_SET_CHANNEL_MASK,
     CAN_CMD_SET_SAMPLE_RATE,
     CAN_CMD_SET_FILTER_SIZE,
+    CAN_CMD_SET_PGA,
     CAN_CMD_SET_ZERO_OFFSET,
     CAN_CMD_SET_TELEMETRY_MODE,
+    CAN_CMD_RESTORE_DEFAULTS,
     CAN_CMD_GET_CONFIG,
     CAN_CMD_START_CALIB,
     CAN_CMD_ZERO_DATUM,
@@ -470,6 +473,16 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(parsed.value, 16)
         self.assertEqual(parsed.detail, 0x55)
 
+    def test_parse_status_frame_rejects_empty_and_truncated_payloads(self):
+        self.assertIsNone(parse_status_frame(
+            CANFrame(id=CAN_ID_TX_STATUS, data=b"")
+        ))
+        for length in range(1, 8):
+            self.assertIsNone(parse_status_frame(CANFrame(
+                id=CAN_ID_TX_STATUS,
+                data=bytes([CAN_FRAME_TYPE_STATUS]) + bytes(length - 1),
+            )))
+
     def test_parse_health_frame(self):
         parsed = parse_health_frame(
             CANFrame(id=CAN_ID_TX_HEALTH, data=build_health_v2_payload())
@@ -535,11 +548,17 @@ class TestProtocolHelpers(unittest.TestCase):
     def test_python_can_interface_connect_slcan_passes_canable2_fd_settings(self):
         bus_instance = MagicMock()
         notifier_instance = MagicMock()
+        probe_result = SlcanFdProbeResult(
+            True, ["C", "S6", "Y2", "O"]
+        )
 
         with patch("can_protocol.can.Bus", return_value=bus_instance) as mock_bus, patch(
             "can_protocol.can.Notifier",
             return_value=notifier_instance,
-        ), patch("can_protocol.serial.serial_for_url") as mock_serial:
+        ), patch(
+            "can_protocol.probe_slcan_fd_adapter",
+            return_value=probe_result,
+        ) as mock_probe:
             interface = PythonCANInterface()
             connected = interface.connect(
                 "slcan",
@@ -559,7 +578,48 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(kwargs["sleep_after_open"], 0.25)
         self.assertEqual(interface.tty_baudrate, 460800)
         self.assertIsNone(interface.last_error)
-        mock_serial.assert_not_called()
+        self.assertIs(interface.last_slcan_probe, probe_result)
+        mock_probe.assert_called_once_with("COM7", 460800)
+
+    def test_python_can_interface_aborts_when_slcan_preflight_returns_bel(self):
+        probe_result = SlcanFdProbeResult(
+            False, ["C", "S6", "Y2"], "Y2 returned SLCAN error"
+        )
+        with patch(
+            "can_protocol.probe_slcan_fd_adapter",
+            return_value=probe_result,
+        ), patch("can_protocol.can.Bus") as mock_bus:
+            interface = PythonCANInterface()
+            connected = interface.connect(
+                "slcan", "COM7", Baudrate.BAUD_500K
+            )
+
+        self.assertFalse(connected)
+        self.assertEqual(interface.last_error, probe_result.error)
+        self.assertIs(interface.last_slcan_probe, probe_result)
+        mock_bus.assert_not_called()
+
+    def test_python_can_interface_continues_after_silent_slcan_preflight(self):
+        probe_result = SlcanFdProbeResult(
+            True,
+            ["C", "S6", "Y2", "O"],
+            warning="silent SLCAN command response for C, S6, Y2, O",
+        )
+        with patch(
+            "can_protocol.probe_slcan_fd_adapter",
+            return_value=probe_result,
+        ), patch("can_protocol.can.Bus", return_value=MagicMock()) as mock_bus, patch(
+            "can_protocol.can.Notifier", return_value=MagicMock()
+        ), self.assertLogs("can_protocol", level="WARNING") as logs:
+            interface = PythonCANInterface()
+            connected = interface.connect(
+                "slcan", "COM7", Baudrate.BAUD_500K
+            )
+
+        self.assertTrue(connected)
+        self.assertIs(interface.last_slcan_probe, probe_result)
+        self.assertIn("silent SLCAN", "\n".join(logs.output))
+        mock_bus.assert_called_once()
 
     def test_slcan_fd_preflight_rejects_adapter_without_y2(self):
         serial_port = MagicMock()
@@ -886,7 +946,7 @@ class TestFirmwareSource(unittest.TestCase):
         self.assertIn("#define CAN_INTERVAL_TEST_ENABLED    0U", user_source)
         self.assertNotIn("#define CAN_INTERVAL_TEST_ENABLED    1U", user_source)
 
-    def test_can_tx_driver_test_mode_is_classic_send_only(self):
+    def test_can_tx_driver_test_mode_is_disabled_for_integration(self):
         root = Path(__file__).resolve().parents[2]
         user_source = (root / "Application" / "user.c").read_text(encoding="utf-8")
         setup_body = user_source.split("void setup(void)", 1)[1].split(
@@ -894,7 +954,8 @@ class TestFirmwareSource(unittest.TestCase):
         )[0]
         loop_body = user_source.split("void loop(void)", 1)[1]
 
-        self.assertIn("#define CAN_TX_DRIVER_TEST_ENABLED   1U", user_source)
+        self.assertIn("#define CAN_TX_DRIVER_TEST_ENABLED   0U", user_source)
+        self.assertNotIn("#define CAN_TX_DRIVER_TEST_ENABLED   1U", user_source)
         self.assertIn("#define CAN_TX_DRIVER_TEST_CLASSIC_ID 0x123U", user_source)
         self.assertIn("#define CAN_TX_DRIVER_TEST_SEND_FD   0U", user_source)
         self.assertIn("can_classic_data_frame_send(CAN_TX_DRIVER_TEST_CLASSIC_ID", user_source)
@@ -902,6 +963,8 @@ class TestFirmwareSource(unittest.TestCase):
                         setup_body.index("flash_storage_register_user_ops();"))
         self.assertLess(loop_body.index("send_can_tx_driver_test();"),
                         loop_body.index("process_can_commands();"))
+        self.assertIn("can_main_loop_seen = true;", loop_body)
+        self.assertNotIn("while (1)", loop_body)
 
     def test_can_send_path_recovers_bus_off_before_reporting_fifo_full(self):
         root = Path(__file__).resolve().parents[2]
@@ -910,14 +973,40 @@ class TestFirmwareSource(unittest.TestCase):
             "static int can_data_frame_send_reserved", 1
         )[1].split("int can_fd_data_frame_send", 1)[0]
         fifo_full_branch = send_helper.split(
-            "HAL_FDCAN_GetTxFifoFreeLevel", 1
+            "if (can_tx_effective_free_level() <= reserved_free_level)", 1
         )[1].split("HAL_FDCAN_AddMessageToTxFifoQ", 1)[0]
 
         self.assertIn("can_recover_bus_off()", fifo_full_branch)
+        self.assertIn("can_tx_effective_free_level()", fifo_full_branch)
         self.assertLess(
             fifo_full_branch.index("can_recover_bus_off()"),
             fifo_full_branch.index("return -3;"),
         )
+
+    def test_can_effective_fifo_level_falls_back_to_txbrp(self):
+        root = Path(__file__).resolve().parents[2]
+        can_source = (root / "BSP" / "can.c").read_text(encoding="utf-8")
+        helper = can_source.split(
+            "static uint32_t can_tx_effective_free_level", 1
+        )[1].split("static void can_debug_capture", 1)[0]
+
+        self.assertIn("FDCAN_TXFQS_TFFL", helper)
+        self.assertIn("FDCAN_TXFQS_TFQF", helper)
+        self.assertIn("can_tx_pending_count_from_txbrp", helper)
+        self.assertIn("hfdcan1.Instance->TXBRP", helper)
+
+    def test_restore_defaults_checks_ads_steps_and_rolls_back_on_failure(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        restore_case = source.split("case CAN_CMD_RESTORE_DEFAULTS:", 1)[1].split(
+            "default:", 1
+        )[0]
+
+        self.assertIn("persistent_config_t previous_config", restore_case)
+        self.assertIn("apply_ads_config", restore_case)
+        self.assertIn("restore_runtime_config", restore_case)
+        self.assertIn("return CAN_STATUS_BAD_VALUE", restore_case)
+        self.assertNotIn("(void)adc_ads1256_", restore_case)
 
     def test_canfd_docs_match_500k_2m_runtime_configuration(self):
         root = Path(__file__).resolve().parents[2]
@@ -930,6 +1019,55 @@ class TestFirmwareSource(unittest.TestCase):
         self.assertIn("Tx delay compensation is intentionally left disabled", setup_doc)
         self.assertNotIn("1M / 2M", readme)
         self.assertNotIn("S8", setup_doc)
+
+    def test_docs_match_current_spi_transport_and_storage_behavior(self):
+        root = Path(__file__).resolve().parents[2]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        setup_doc = (root / "docs" / "canfd_2m_setup.md").read_text(
+            encoding="utf-8"
+        )
+        flow_en = (root / "docs" / "user_application_flow.md").read_text(
+            encoding="utf-8"
+        )
+        flow_zh = (root / "docs" / "user_application_flow_zh.md").read_text(
+            encoding="utf-8"
+        )
+
+        for document in (readme, setup_doc, flow_en, flow_zh):
+            self.assertIn("1.328125 Mbit/s", document)
+        self.assertIn("up to 14 raw records", setup_doc)
+        self.assertIn("up to 6 physical records", setup_doc)
+        self.assertIn("does not decimate telemetry", flow_en)
+        self.assertIn("不进行遥测抽取", flow_zh)
+        self.assertIn("64-byte record with CRC32", flow_en)
+        self.assertIn("64 字节记录，使用 CRC32", flow_zh)
+        self.assertIn("legacy reserved commands", flow_en)
+        self.assertIn("旧版保留命令", flow_zh)
+        self.assertIn("host_pc\\python\\.venv\\Scripts\\python.exe", readme)
+        self.assertIn("Cangaroo", readme)
+
+    def test_build_script_selects_stm32cube_bundled_tools(self):
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts" / "build_firmware.ps1").read_text(
+            encoding="utf-8"
+        )
+        cmake_source = (root / "CMakeLists.txt").read_text(encoding="utf-8")
+
+        self.assertIn("$env:LOCALAPPDATA", script)
+        self.assertIn("stm32cube\\bundles\\cmake", script)
+        self.assertIn("stm32cube\\bundles\\ninja", script)
+        self.assertIn("stm32cube\\bundles\\gnu-tools-for-stm32", script)
+        self.assertIn("CMAKE_MAKE_PROGRAM", script)
+        self.assertIn("project(${CMAKE_PROJECT_NAME} LANGUAGES C ASM)", cmake_source)
+
+    def test_gui_surfaces_slcan_preflight_warning(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "host_pc" / "python" / "reducer_monitor.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("last_slcan_probe.warning", source)
+        self.assertIn("slcan_preflight_warning", source)
 
     def test_setup_defers_blocking_ads_start_until_can_service_loop(self):
         root = Path(__file__).resolve().parents[2]
@@ -1733,6 +1871,25 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertFalse(self.window.send_command(CAN_CMD_ZERO_DATUM))
         self.window.can_bus.send_frame.assert_not_called()
+
+    def test_calibration_pga_and_restore_defaults_use_long_ack_timeout(self):
+        for cmd_type in (
+            CAN_CMD_START_CALIB,
+            CAN_CMD_SET_PGA,
+            CAN_CMD_RESTORE_DEFAULTS,
+        ):
+            self.window.pending_commands.clear()
+            self.window.pending_command_deadlines.clear()
+            self.window.command_sequence = 0
+            with patch("reducer_monitor.time.monotonic", return_value=100.0):
+                self.assertTrue(self.window.send_command(cmd_type))
+            self.assertEqual(self.window.pending_command_deadlines[0], 115.0)
+
+    def test_regular_command_keeps_two_second_ack_timeout(self):
+        with patch("reducer_monitor.time.monotonic", return_value=100.0):
+            self.assertTrue(self.window.send_command(CAN_CMD_GET_CONFIG))
+
+        self.assertEqual(self.window.pending_command_deadlines[0], 102.0)
 
     def test_waveform_buffer_limit(self):
         from reducer_monitor import WAVEFORM_BUFFER_SIZE

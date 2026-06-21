@@ -98,6 +98,12 @@ PLOT_VISIBLE_SAMPLES = 300
 PLOT_MIN_Y_RANGE_MV = 0.05
 DEFAULT_PLOT_REFRESH_HZ = 60
 COMMAND_ACK_TIMEOUT_S = 2.0
+LONG_COMMAND_ACK_TIMEOUT_S = 15.0
+LONG_ACK_COMMANDS = frozenset((
+    CAN_CMD_START_CALIB,
+    CAN_CMD_SET_PGA,
+    CAN_CMD_RESTORE_DEFAULTS,
+))
 DEFAULT_THEME = "dark"
 APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "reducer_monitor.svg"
 
@@ -730,6 +736,7 @@ TRANSLATIONS = {
         "connected_slcan": "Connected to {channel} via CANable 2.0 SLCAN FD (USB CDC, CAN FD {can_baudrate}/{data_bitrate} bps, BRS)",
         "connected_generic": "Connected to {interface}:{channel} (CAN FD {can_baudrate}/{data_bitrate} bps, BRS)",
         "connected_device": "Connected to {interface}:{channel}",
+        "slcan_preflight_warning": "Connected to {channel}; SLCAN preflight warning: {warning}",
         "zero_sent": "Zero command sent, waiting for device ACK",
         "zero_failed": "Failed to send zero command",
         "calibration_sent": "Calibration command sent, waiting for device ACK",
@@ -869,6 +876,8 @@ TRANSLATIONS = {
         "connection_failed": "连接失败：{error}",
         "connected_slcan": "已通过 CANable 2.0 SLCAN FD 连接 {channel}（USB CDC，CAN FD {can_baudrate}/{data_bitrate} bps BRS）",
         "connected_generic": "已连接 {interface}:{channel}，CAN FD {can_baudrate}/{data_bitrate} bps BRS",
+        "connected_device": "已连接 {interface}:{channel}",
+        "slcan_preflight_warning": "已连接 {channel}；SLCAN 预检警告：{warning}",
         "zero_sent": "调零命令已发送，正在等待设备确认",
         "zero_failed": "调零命令发送失败",
         "calibration_sent": "校准命令已发送，正在等待设备确认",
@@ -2638,7 +2647,12 @@ class ReducerMonitorWindow(QMainWindow):
         sent = self.can_bus.send_frame(frame)
         if sent:
             self.pending_commands[sequence] = command_name
-            self.pending_command_deadlines[sequence] = time.monotonic() + COMMAND_ACK_TIMEOUT_S
+            ack_timeout = (
+                LONG_COMMAND_ACK_TIMEOUT_S
+                if cmd_type in LONG_ACK_COMMANDS
+                else COMMAND_ACK_TIMEOUT_S
+            )
+            self.pending_command_deadlines[sequence] = time.monotonic() + ack_timeout
             self.command_sequence = (sequence + 1) & 0xFF
         return sent
 
@@ -3066,7 +3080,20 @@ class ReducerMonitorWindow(QMainWindow):
                 checkbox.setEnabled(True)
             self.restore_defaults_btn.setEnabled(True)
             self.send_command(CAN_CMD_GET_CONFIG)
-            self._show_status("connected_device", interface=interface, channel=channel)
+            if (
+                interface == "slcan"
+                and self.can_bus.last_slcan_probe is not None
+                and self.can_bus.last_slcan_probe.warning
+            ):
+                self._show_status(
+                    "slcan_preflight_warning",
+                    channel=channel,
+                    warning=self.can_bus.last_slcan_probe.warning,
+                )
+            else:
+                self._show_status(
+                    "connected_device", interface=interface, channel=channel
+                )
 
             logger.info(
                 "Connected to %s:%s (CAN FD bitrate %s/%s, USB serial %s)",
