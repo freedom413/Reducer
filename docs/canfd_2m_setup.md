@@ -7,7 +7,7 @@ This branch uses CAN FD with bit-rate switching (BRS) end to end:
 - Standard 11-bit IDs: `0x100`, `0x0F0`, `0x0FF`, `0x101`, `0x103`, `0x104`
 - Payload size: 12 bytes for command/status, 64 bytes for batched telemetry,
   24 bytes for health, 64 bytes for config, and 8 classic bytes for diag
-- Frame format: CAN FD with BRS, not classic CAN
+- Frame format: v3 business frames use CAN FD+BRS; diagnostic `0x0FF` is classic CAN
 
 The STM32G431 FDCAN kernel clock is `170 MHz`. Firmware timing is:
 
@@ -56,6 +56,15 @@ configures `S6` and `Y2` through the maintained library implementation.
 Use `python-can>=4.6.1`: SLCAN FD support landed in `4.6.0`, and `4.6.1`
 includes the follow-up SLCAN initialization fix.
 
+Before opening python-can, the host runs a `C / S6 / Y2 / O` preflight. A BEL
+response fails the connection explicitly. Adapters that return no command text
+are allowed with a warning because some compatible firmware acknowledges only
+through serial state. The preflight result is retained for the GUI and
+`can_link_probe.py` diagnostics.
+
+Cangaroo and the Python GUI/probe cannot own the same serial port at the same
+time. Close the Cangaroo measurement before starting either Python program.
+
 CANable 2.0 exposes a USB CDC virtual serial port. Keep the GUI's USB serial
 speed at `2000000` unless bring-up proves the adapter rejects that line-coding
 request; the GUI can fall back to lower speeds for connection testing, but
@@ -65,7 +74,7 @@ maximum configured load, the SLCAN ASCII stream is about 875 frames/s, or roughl
 
 ## ADS1256 Performance
 
-SPI1 runs at `2.65625 Mbit/s`, below the ADS1256 `f_CLKIN / 2` serial clock
+SPI1 runs at `1.328125 Mbit/s`, below the ADS1256 `f_CLKIN / 2` serial clock
 limit for the board's `7.68 MHz` clock. All ADS1256 DRATE values are exposed:
 
 ```text
@@ -76,14 +85,15 @@ limit for the board's `7.68 MHz` clock. All ADS1256 DRATE values are exposed:
 With input multiplexing, effective channel-cycling throughput follows the
 ADS1256 datasheet Table 14. At the `30000 SPS` setting each converter delivers
 about `4374` conversions/s. Firmware processes every acquired conversion and
-packs up to ten telemetry records into one 64-byte FD+BRS frame. At the maximum
-dual-ADC cycling rate of about `8748` records/s, this needs about `875` CAN
-frames/s. A 128-record software queue smooths bursts before the three-slot
-FDCAN hardware TX FIFO. Outgoing records are decimated only if a future source
-configuration exceeds `10000` records/s.
+packs up to 14 raw records or up to 6 physical records into one 64-byte FD+BRS
+frame. At the maximum dual-ADC cycling rate of about `8748` records/s, raw mode
+needs about `625` CAN frames/s. A 128-record software queue smooths bursts
+before the three-slot FDCAN hardware TX FIFO. Firmware does not decimate
+telemetry: every acquired record is queued, and any inability to transmit is
+reported through the CAN TX drop counter.
 
 The MCU sends a 24-byte FD+BRS health frame on `0x103` every second. The GUI
-shows ADC state, effective decimation, CAN TX drops, ADC ring-buffer overflows,
+shows ADC state, actual telemetry rates, CAN TX drops, ADC ring-buffer overflows,
 automatic recoveries, and received telemetry rate.
 
 The MCU also sends an 8-byte classic CAN diagnostic heartbeat on `0x0FF` during
@@ -132,22 +142,34 @@ adapter with FD support; classic PCAN-USB hardware is not sufficient.
 ## Build And Flash
 
 ```powershell
-cmake -S . -B build\Debug -DCMAKE_TOOLCHAIN_FILE="cmake/gcc-arm-none-eabi.cmake" -DCMAKE_BUILD_TYPE=Debug
-cmake --build build\Debug
+.\scripts\build_firmware.ps1 -Configuration Debug
+.\scripts\build_firmware.ps1 -Configuration Release
 ```
 
 Flash `build/Debug/Reducer.elf`.
 
 ## Bring-Up Checklist
 
-1. Flash the firmware and power-cycle the MCU.
-2. Run `python host_pc/python/can_link_probe.py --channel COMx`.
-3. Start the GUI, select `CANable 2.0 SLCAN FD`, and choose the serial port.
-4. Connect; the GUI configures `500K / 2M`, FD, and BRS automatically.
-5. Confirm FD+BRS telemetry on `0x101`.
-6. Send `Calibrate` and confirm the FD+BRS ACK on `0x0F0`.
-7. Increase the sample rate gradually to `30000 SPS` and watch the GUI health
-   panel for TX drops, ADC overflows, and recoveries.
+1. With power removed, verify about 60 ohms between CANH/CANL, common ground,
+   transceiver power and STB/EN, the 8 MHz HSE, both 7.68 MHz ADS1256 clocks,
+   and ADC supplies.
+2. Flash Debug firmware, close Cangaroo, then run
+   `host_pc\python\.venv\Scripts\python.exe host_pc\python\can_link_probe.py --channel COMx`.
+3. Require `0x0FF` classic diag at about 4 Hz, `0x103` FD health at about 1 Hz,
+   GET_CONFIG ACK `0x0F0`, config `0x104`, and stable zero bus-off/passive/TEC/REC.
+4. At 100 SPS Raw, verify all eight GUI channels, then masks `0x0F`, `0xF0`,
+   and `0xFF` to exercise each ADC separately and together.
+5. Verify calibration, filter window, Raw/Physical switching, zero, clear-zero,
+   and configuration ACK behavior.
+6. Zero the sensors, power-cycle, and verify `zero_valid`, offsets, and config
+   sequence restore from Flash.
+7. Flash Release and test `100, 500, 1000, 3750, 7500, 15000, 30000 SPS` for
+   at least 10 seconds per step.
+8. Accept 30 kSPS only in Raw mode: expect about 8748 samples/s within 10%,
+   with zero CAN drops, ADC overflows, and recoveries.
+9. Validate Physical mode at 1000 SPS and CSV recording at 500 SPS or lower.
+10. Disconnect and reconnect CAN while running; diag, health, telemetry, and
+    command ACK must recover within five seconds.
 
 ## References
 
