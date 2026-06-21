@@ -11,10 +11,12 @@ zero storage, moving-average filters, and flexspline conversion parameters.
 Each `loop()` iteration:
 
 1. Handles up to four queued CAN FD+BRS commands.
-2. Sends the one-second health frame when due.
-3. Polls both ADS1256 devices.
-4. Pulls completed conversion records from the ADS1256 ring buffer.
-5. Processes every record immediately: moving average, zero subtraction,
+2. Services delayed Flash config saves and pending config snapshots.
+3. Sends the 250 ms classic CAN diagnostic heartbeat and one-second FD health
+   frame when due.
+4. Polls both ADS1256 devices.
+5. Pulls completed conversion records from the ADS1256 ring buffer.
+6. Processes every record immediately: moving average, zero subtraction,
    statistics, physical conversion, and optional telemetry transmission.
 
 The application does not wait for a complete multi-channel batch. That keeps ADC
@@ -72,58 +74,91 @@ for explicit zero-storage commands.
 
 ## CAN FD Protocol
 
-All business frames use standard 11-bit IDs, CAN FD+BRS, `1M / 2M`, and an XOR
-checksum.
+Business frames use standard 11-bit IDs, CAN FD+BRS, `500K / 2M`, and fixed
+payload lengths. The classic diagnostic heartbeat is intentionally separate
+from the business protocol and is used only for bring-up visibility.
 
 | Direction | ID | Type | Length | Purpose |
 |---|---:|---:|---:|---|
-| PC -> MCU | `0x100` | `0xA0` | 8 | Command |
-| MCU -> PC | `0x101` | `0x53` | 64 | Up to ten telemetry records |
-| MCU -> PC | `0x102` | `0xA1` | 8 | Command ACK |
-| MCU -> PC | `0x103` | `0x52` | 16 | One-second health report |
+| PC -> MCU | `0x100` | `0xA0` | 12 FD+BRS | Command |
+| MCU -> PC | `0x0F0` | `0xA1` | 12 FD+BRS | Command ACK/status |
+| MCU -> PC | `0x101` | `0x54` | 64 FD+BRS | Raw telemetry batch |
+| MCU -> PC | `0x101` | `0x55` | 64 FD+BRS | Physical telemetry batch |
+| MCU -> PC | `0x103` | `0x52` | 24 FD+BRS | One-second health report |
+| MCU -> PC | `0x104` | `0x56` | 64 FD+BRS | Config snapshot |
+| MCU -> PC | `0x0FF` | `0x57` | 8 classic CAN | Link diagnostic heartbeat |
 
 Command frame:
 
 ```text
 byte 0: type = 0xA0
-byte 1: sequence
-byte 2: command
-byte 3: param
-byte 4-5: value uint16 LE
-byte 6: reserved
-byte 7: XOR CRC over bytes 0..6
+byte 1: protocol version = 0x03
+byte 2: sequence
+byte 3: command
+byte 4: param
+byte 5: reserved
+byte 6-9: value uint32 LE
+byte 10-11: reserved
 ```
 
 For `CAN_CMD_SET_SAMPLE_RATE`, `param=0` encodes integer SPS and `param=1`
 encodes tenths of SPS. The latter represents `2.5 SPS` as `value=25`.
 
-Telemetry frame:
+Raw telemetry frame:
 
 ```text
-byte 0: type = 0x53
-byte 1: telemetry record count, 1..10
-byte 2-61: ten 6-byte record slots, unused slots are zero-filled
-byte 62: reserved
-byte 63: XOR CRC over bytes 0..62
+byte 0: type = 0x54
+byte 1: protocol version = 0x03
+byte 2: telemetry mode = raw
+byte 3: sequence
+byte 4: record count, 1..14
+byte 5-6: drop delta uint16 LE
+byte 7: reserved
+byte 8-63: fourteen 4-byte raw records
+```
 
-record byte 0: logical channel 0..7
-record byte 1-2: voltage int16 BE, 0.01 mV units
-record byte 3-4: strain int16 BE, microstrain units
-record byte 5: clipped stress preview int8, 0.1 MPa units
+Physical telemetry frame:
+
+```text
+byte 0: type = 0x55
+byte 1: protocol version = 0x03
+byte 2: telemetry mode = physical
+byte 3: sequence
+byte 4: record count, 1..6
+byte 5-6: drop delta uint16 LE
+byte 7: reserved
+byte 8-61: six 9-byte physical records
+byte 62-63: reserved
 ```
 
 Health frame:
 
 ```text
 byte 0: type = 0x52
-byte 1: protocol version = 0x01
+byte 1: protocol version = 0x03
 byte 2-5: configured sample rate x10, uint32 LE
-byte 6-7: telemetry decimation, uint16 LE
-byte 8-9: CAN TX drop count, uint16 LE
-byte 10-11: ADC ring-buffer overflow count, uint16 LE
-byte 12-13: ADC automatic recovery count, uint16 LE
-byte 14: high nibble active ADC count, bit 0 acquisition running
-byte 15: XOR CRC over bytes 0..14
+byte 6-7: CAN TX drop count, uint16 LE
+byte 8-9: ADC ring-buffer overflow count, uint16 LE
+byte 10-11: ADC automatic recovery count, uint16 LE
+byte 12-13: telemetry samples/s, uint16 LE
+byte 14-15: telemetry frames/s, uint16 LE
+byte 16: active ADC count
+byte 17: telemetry mode
+byte 18: flags, bit 0 acquisition running, bit 1 config dirty, bit 2 zero valid
+byte 19-23: reserved
+```
+
+Diagnostic frame:
+
+```text
+byte 0: type = 0x57
+byte 1: flags, CAN ready/main loop/last RX FD/last RX BRS/bus-off/passive
+byte 2: last 0x100 DLC in bytes
+byte 3: last command reject reason
+byte 4: FDCAN TX error counter
+byte 5: FDCAN RX error counter
+byte 6: diagnostic sequence
+byte 7: XOR CRC over bytes 0..6
 ```
 
 ## Commands

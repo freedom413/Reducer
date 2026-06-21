@@ -41,10 +41,13 @@ static uint16_t ads1256_channel_mask = ADS1256_ALL_CHANNEL_MASK;
 static uint8_t ads1256_pga_gain = 16U;
 static uint32_t ads1256_vref_uv = 2500000U;
 static bool ads1256_started = false;
+static bool ads1256_ring_ready = false;
 static uint8_t ads1256_poll_error_count = 0;
 static uint32_t ads1256_last_recovery_tick = 0;
 static uint16_t ads1256_overflow_count = 0;
 static uint16_t ads1256_recovery_count = 0;
+
+static bool ads1256_gain_to_enum(uint8_t gain, ads1256_pga_t *pga);
 
 static const ads1256_ch_t ads1256_a_channels[ADS1256_CHANNELS_PER_DEVICE] = {
     {.p = ADS1256_AIN0, .n = ADS1256_AIN1},
@@ -110,6 +113,24 @@ static bool ads1256_lookup_rate(uint32_t sps_x10, ads1256_sps_t *rate)
     }
 
     return false;
+}
+
+int adc_ads1256_configure_startup(uint32_t vref_uv, uint8_t pga_gain,
+                                  uint32_t sps_x10, uint16_t channel_mask)
+{
+    ads1256_pga_t pga;
+    if (vref_uv < 1000000U || vref_uv > 5000000U ||
+        !ads1256_gain_to_enum(pga_gain, &pga) ||
+        !ads1256_lookup_rate(sps_x10, NULL) ||
+        (channel_mask & ~ADS1256_ALL_CHANNEL_MASK) != 0U) {
+        return -1;
+    }
+
+    ads1256_vref_uv = vref_uv;
+    ads1256_pga_gain = pga_gain;
+    ads1256_sample_rate_x10 = sps_x10;
+    ads1256_channel_mask = channel_mask;
+    return 0;
 }
 
 static void ads1256_data_push(uint8_t logical_channel, int32_t raw_value)
@@ -237,11 +258,24 @@ int adc_ads1256_restart(void)
     return 0;
 }
 
-void adc_ads1256_start(void)
+void adc_ads1256_prepare(void)
 {
     lwrb_init(&ads1256_data_rb, ads1256_data_buf, ADS1256_DATA_BUFF_SIZE);
+    ads1256_ring_ready = true;
     ads1256_started = false;
     ads1256_poll_error_count = 0;
+    ads1256_last_recovery_tick = HAL_GetTick() - ADS1256_RECOVERY_INTERVAL_MS;
+}
+
+void adc_ads1256_start(void)
+{
+    if (!ads1256_ring_ready) {
+        adc_ads1256_prepare();
+    } else {
+        lwrb_reset(&ads1256_data_rb);
+        ads1256_started = false;
+        ads1256_poll_error_count = 0;
+    }
 
     int ret = adc_ads1256_init();
     if (ret < 0) {
@@ -254,17 +288,14 @@ void adc_ads1256_start(void)
         return;
     }
     ret = adc_ads1256_set_pga_gain(ads1256_pga_gain);
-    if (ret < 0 || adc_ads1256_calibrate() != 0) {
+    if (ret < 0) {
         ads1256_last_recovery_tick = HAL_GetTick();
         return;
     }
 
-    if (ads1256_sample_rate_x10 == 1000U) {
-        ret = adc_ads1256_restart();
-    } else {
-        ret = adc_ads1256_set_sample_rate_x10(ads1256_sample_rate_x10);
-    }
-    if (ret < 0) {
+    ret = adc_ads1256_set_sample_rate_x10(ads1256_sample_rate_x10);
+    if (ret < 0 || adc_ads1256_calibrate() != 0 ||
+        adc_ads1256_restart() != 0) {
         ads1256_last_recovery_tick = HAL_GetTick();
         return;
     }
