@@ -235,6 +235,8 @@ def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
         return None
     if frame.id != CAN_ID_TX_STATUS:
         return None
+    if len(frame.data) not in (8, 12):
+        return None
     if frame.data[0] != CAN_FRAME_TYPE_STATUS:
         return None
     if len(frame.data) == 12 and frame.data[1] == CAN_PROTOCOL_VERSION:
@@ -253,8 +255,6 @@ def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
             value=frame.data[5] | (frame.data[6] << 8),
             detail=frame.data[7],
         )
-    if len(frame.data) != 8:
-        return None
     if crc8_xor(frame.data[:7]) != frame.data[7]:
         return None
     return StatusFrame(
@@ -629,9 +629,29 @@ class PythonCANInterface:
         self.last_error = None
         self.last_slcan_probe = None
 
+        normalized_channel = self._normalize_channel(interface, channel)
+        if interface == "slcan":
+            self.last_slcan_probe = probe_slcan_fd_adapter(
+                normalized_channel, int(tty_baudrate)
+            )
+            if not self.last_slcan_probe.ok:
+                self.last_error = self.last_slcan_probe.error
+                logger.error(
+                    "SLCAN FD preflight failed (%s): %s",
+                    channel,
+                    self.last_error,
+                )
+                return False
+            if self.last_slcan_probe.warning:
+                logger.warning(
+                    "SLCAN FD preflight warning (%s): %s",
+                    channel,
+                    self.last_slcan_probe.warning,
+                )
+
         kwargs = {
             "interface": interface,
-            "channel": self._normalize_channel(interface, channel),
+            "channel": normalized_channel,
         }
         if interface == "socketcan":
             kwargs["fd"] = True

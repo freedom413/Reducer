@@ -38,7 +38,7 @@ Unsubscribed channels are not scanned. A zero mask stops ADC polling.
 When `DRDY` signals a result, the ADS1256 layer switches MUX, issues
 `SYNC`/`WAKEUP`, reads the latched previous result, and pushes
 `{logical_channel, raw_value}` into the ring buffer. SPI1 runs at
-`2.65625 Mbit/s`, below the ADS1256 serial-clock limit for this board.
+`1.328125 Mbit/s`, below the ADS1256 serial-clock limit for this board.
 
 ## Sample Rates And Throughput
 
@@ -53,11 +53,11 @@ The real multiplexed conversion throughput follows ADS1256 datasheet Table 14.
 For example, the `30000 SPS` setting produces about `4374` conversions/s per
 active ADC while cycling channels.
 
-Every acquired conversion is filtered and converted. Firmware packs up to ten
-records into one 64-byte telemetry frame and buffers up to 128 pending records
-before the three-slot FDCAN hardware TX FIFO. At the maximum dual-ADC rate this
-transfers all acquired conversions without telemetry decimation. A safety
-decimation factor applies only above `10000 records/s`.
+Every acquired conversion is filtered and converted. Firmware packs up to 14
+raw records or up to 6 physical records into one 64-byte telemetry frame and
+buffers up to 128 pending records before the three-slot FDCAN hardware TX FIFO.
+Firmware does not decimate telemetry: every acquired record enters the queue,
+and failed queue/transmit attempts increment the drop counter.
 
 ## Filtering, Statistics, And Zero Storage
 
@@ -68,15 +68,17 @@ Large steps are not rejected. At this layer a real load step cannot be
 distinguished reliably from a sensor outlier, so it must reach telemetry.
 Welford running statistics are maintained internally for diagnostics.
 
-The eight zero offsets are persisted in the final STM32 Flash page as a
-versioned 40-byte record with CRC-16 and a magic value. Flash writes happen only
-for explicit zero-storage commands.
+The eight zero offsets and runtime configuration are persisted in the final
+STM32 Flash page as a versioned 64-byte record with CRC32 and a magic value.
+Flash writes happen after explicit zero/configuration changes.
 
 ## CAN FD Protocol
 
 Business frames use standard 11-bit IDs, CAN FD+BRS, `500K / 2M`, and fixed
 payload lengths. The classic diagnostic heartbeat is intentionally separate
 from the business protocol and is used only for bring-up visibility.
+Protocol-v3 FD frames rely on the CAN frame CRC. Application-layer XOR is used
+only by the classic diagnostic frame and accepted legacy frames.
 
 | Direction | ID | Type | Length | Purpose |
 |---|---:|---:|---:|---|
@@ -169,7 +171,17 @@ byte 7: XOR CRC over bytes 0..6
 | `SET_FILTER_SIZE` | `0x02` | Set moving-average window |
 | `ZERO_DATUM` | `0x03` | Capture current zero and save it |
 | `START_CALIB` | `0x04` | Run ADS1256 self-calibration |
-| `SAVE_ZERO` | `0x05` | Save zero offsets |
-| `LOAD_ZERO` | `0x06` | Reload zero offsets |
+| `SAVE_ZERO` | `0x05` | Legacy reserved command; not handled or exposed by the GUI |
+| `LOAD_ZERO` | `0x06` | Legacy reserved command; not handled or exposed by the GUI |
 | `CLEAR_ZERO` | `0x07` | Clear RAM and Flash zero offsets |
 | `SET_CHANNEL_MASK` | `0x08` | Select channels to scan |
+| `SET_TELEMETRY_MODE` | `0x09` | Select Raw or Physical telemetry |
+| `GET_CONFIG` | `0x0A` | Request a configuration snapshot |
+| `SET_VREF_UV` | `0x0B` | Set ADC reference voltage in microvolts |
+| `SET_PGA` | `0x0C` | Set ADS1256 PGA gain and recalibrate |
+| `RESTORE_DEFAULTS` | `0x0D` | Apply, calibrate, restart, and save defaults |
+| `SET_ZERO_OFFSET` | `0x0E` | Set one channel zero offset |
+
+`SAVE_ZERO` and `LOAD_ZERO` are legacy reserved commands. Current zero and
+configuration persistence is performed by the active commands above; the GUI
+does not expose the two reserved command values.
