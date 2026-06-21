@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import struct
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -19,6 +20,11 @@ try:
 except ImportError:  # pragma: no cover - handled at runtime on user machine
     list_ports = None
 
+try:
+    import serial
+except ImportError:  # pragma: no cover - handled at runtime on user machine
+    serial = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +33,7 @@ CAN_ID_TX_TELEMETRY = 0x101
 CAN_ID_TX_STATUS = 0x0F0
 CAN_ID_TX_HEALTH = 0x103
 CAN_ID_TX_CONFIG = 0x104
+CAN_ID_TX_DIAG = 0x0FF
 
 CAN_FRAME_TYPE_TELEMETRY = 0x51
 CAN_FRAME_TYPE_TELEMETRY_BATCH = 0x53
@@ -36,6 +43,7 @@ CAN_FRAME_TYPE_COMMAND = 0xA0
 CAN_FRAME_TYPE_STATUS = 0xA1
 CAN_FRAME_TYPE_HEALTH = 0x52
 CAN_FRAME_TYPE_CONFIG = 0x56
+CAN_FRAME_TYPE_DIAG = 0x57
 CAN_HEALTH_VERSION = 0x01
 CAN_PROTOCOL_VERSION = 0x03
 
@@ -75,7 +83,7 @@ STATUS_NAMES = {
     CAN_STATUS_STORAGE_ERROR: "storage error",
 }
 
-DEFAULT_SLCAN_TTY_BAUDRATE = 115200
+DEFAULT_SLCAN_TTY_BAUDRATE = 2000000
 DEFAULT_SLCAN_OPEN_DELAY = 2.0
 DEFAULT_CAN_SEND_TIMEOUT_S = 0.2
 CAN_FD_DATA_BITRATE = 2000000
@@ -158,6 +166,21 @@ class HealthFrame:
 
 
 @dataclass
+class DiagFrame:
+    can_ready: bool
+    main_loop_alive: bool
+    last_rx_fd: bool
+    last_rx_brs: bool
+    bus_off: bool
+    error_passive: bool
+    last_rx_dlc: int
+    last_reject_reason: int
+    tx_error_count: int
+    rx_error_count: int
+    sequence: int
+
+
+@dataclass
 class ConfigFrame:
     saved: bool
     zero_valid: bool
@@ -169,6 +192,14 @@ class ConfigFrame:
     vref_uv: int
     sequence: int
     zero_offsets: List[int]
+
+
+@dataclass
+class SlcanFdProbeResult:
+    ok: bool
+    commands: List[str]
+    error: str = ""
+    warning: str = ""
 
 
 def crc8_xor(data: bytes) -> int:
@@ -232,6 +263,32 @@ def parse_status_frame(frame: CANFrame) -> Optional[StatusFrame]:
         status=frame.data[3],
         value=frame.data[4] | (frame.data[5] << 8),
         detail=frame.data[6],
+    )
+
+
+def parse_diag_frame(frame: CANFrame) -> Optional[DiagFrame]:
+    if frame.is_extended or frame.is_remote:
+        return None
+    if frame.id != CAN_ID_TX_DIAG or len(frame.data) != 8:
+        return None
+    if frame.data[0] != CAN_FRAME_TYPE_DIAG:
+        return None
+    if crc8_xor(frame.data[:7]) != frame.data[7]:
+        return None
+
+    flags = frame.data[1]
+    return DiagFrame(
+        can_ready=(flags & 0x01) != 0,
+        main_loop_alive=(flags & 0x02) != 0,
+        last_rx_fd=(flags & 0x04) != 0,
+        last_rx_brs=(flags & 0x08) != 0,
+        bus_off=(flags & 0x10) != 0,
+        error_passive=(flags & 0x20) != 0,
+        last_rx_dlc=frame.data[2],
+        last_reject_reason=frame.data[3],
+        tx_error_count=frame.data[4],
+        rx_error_count=frame.data[5],
+        sequence=frame.data[6],
     )
 
 
@@ -472,6 +529,80 @@ class _PythonCanListener(can.Listener if can is not None else object):
                 logger.error("CAN callback error: %s", exc)
 
 
+def _slcan_command_response(port, timeout_s: float) -> bytes:
+    deadline = time.monotonic() + timeout_s
+    response = bytearray()
+    while time.monotonic() < deadline:
+        byte = port.read(1)
+        if not byte:
+            continue
+        response.extend(byte)
+        if byte in (b"\r", b"\a"):
+            break
+    return bytes(response)
+
+
+def _write_slcan_probe_command(port, command: str, timeout_s: float) -> Tuple[bool, str, bool]:
+    port.write(command.encode("ascii") + b"\r")
+    port.flush()
+    response = _slcan_command_response(port, timeout_s)
+    if response == b"\a":
+        return False, f"{command} returned SLCAN error", True
+    if not response:
+        return True, "", False
+    if b"\a" in response:
+        return False, f"{command} returned SLCAN error", True
+    return True, "", True
+
+
+def probe_slcan_fd_adapter(
+    channel: str,
+    tty_baudrate: int = DEFAULT_SLCAN_TTY_BAUDRATE,
+    *,
+    timeout_s: float = 0.2,
+) -> SlcanFdProbeResult:
+    if serial is None:
+        return SlcanFdProbeResult(False, [], "pyserial is not installed")
+
+    commands: List[str] = []
+    silent_commands: List[str] = []
+    port = None
+    try:
+        port = serial.serial_for_url(
+            channel,
+            baudrate=int(tty_baudrate),
+            timeout=timeout_s,
+        )
+        for command in ("C", "S6", "Y2", "O"):
+            commands.append(command)
+            ok, error, acknowledged = _write_slcan_probe_command(
+                port, command, timeout_s
+            )
+            if not ok:
+                return SlcanFdProbeResult(False, commands, error)
+            if not acknowledged:
+                silent_commands.append(command)
+
+        warning = (
+            "silent SLCAN command response for " + ", ".join(silent_commands)
+            if silent_commands else ""
+        )
+        return SlcanFdProbeResult(True, commands, "", warning)
+    except Exception as exc:
+        return SlcanFdProbeResult(False, commands, str(exc))
+    finally:
+        if port is not None:
+            try:
+                port.write(b"C\r")
+                port.flush()
+            except Exception:
+                pass
+            try:
+                port.close()
+            except Exception:
+                pass
+
+
 class PythonCANInterface:
     def __init__(self):
         self.bus = None
@@ -480,6 +611,8 @@ class PythonCANInterface:
         self.channel: Optional[str] = None
         self.bitrate: Optional[Baudrate] = None
         self.tty_baudrate: Optional[int] = None
+        self.last_error: Optional[str] = None
+        self.last_slcan_probe: Optional[SlcanFdProbeResult] = None
         self._rx_callbacks: List[Callable[[CANFrame], None]] = []
 
     def connect(
@@ -493,6 +626,8 @@ class PythonCANInterface:
     ) -> bool:
         if can is None:
             raise RuntimeError("python-can is not installed")
+        self.last_error = None
+        self.last_slcan_probe = None
 
         kwargs = {
             "interface": interface,
@@ -522,6 +657,7 @@ class PythonCANInterface:
             self.tty_baudrate = int(tty_baudrate) if interface == "slcan" else None
             return True
         except Exception as exc:
+            self.last_error = str(exc)
             logger.error("Failed to connect CAN bus (%s/%s): %s", interface, channel, exc)
             self.disconnect()
             return False

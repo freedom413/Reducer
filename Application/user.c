@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include "delay.h"
+#include "main.h"
 #include "can.h"
 #include "fdcan.h"
 #include "ads1256_raw_data_recv.h"
@@ -17,16 +18,25 @@
 #define ADC_CHANNEL_COUNT   ADS1256_LOGICAL_CHANNEL_COUNT
 #define ADC_SAMPLE_BATCH_COUNT 32U
 #define CAN_COMMANDS_PER_LOOP 4
+#define CAN_TX_DRIVER_TEST_ENABLED   1U
+#if CAN_TX_DRIVER_TEST_ENABLED
+#define CAN_TX_DRIVER_TEST_CLASSIC_ID 0x123U
+#define CAN_TX_DRIVER_TEST_PERIOD_MS  100U
+#define CAN_TX_DRIVER_TEST_SEND_FD   0U
+#define CAN_TX_DRIVER_TEST_GPIO_PULSE_ONLY 0U
+#define CAN_TX_DRIVER_TEST_PULSE_PA12_ON_CAN_INIT_FAIL 1U
+#endif
 #define CAN_INTERVAL_TEST_ENABLED    0U
 #if CAN_INTERVAL_TEST_ENABLED
 #define CAN_INTERVAL_TEST_ID         0x123U
-#define CAN_INTERVAL_TEST_PERIOD_MS  100U
+#define CAN_INTERVAL_TEST_PERIOD_MS  1000U
 #endif
 #define CAN_TX_WAIT_TIMEOUT_MS       5U
 #define CAN_TELEMETRY_QUEUE_RECORD_COUNT      128U
 #define CAN_TELEMETRY_FLUSH_PERIOD_MIN_MS     2U
 #define CAN_TELEMETRY_FLUSH_PERIOD_MAX_MS     50U
 #define CAN_HEALTH_PERIOD_MS         1000U
+#define CAN_DIAG_PERIOD_MS           250U
 #define CONFIG_SAVE_DELAY_MS         750U
 
 typedef struct {
@@ -55,12 +65,20 @@ static uint32_t can_telemetry_flush_period_ms =
 static uint16_t can_tx_drop_count = 0U;
 static uint16_t can_tx_drop_reported_count = 0U;
 static uint32_t can_health_last_tx_tick = 0U;
+static uint32_t can_diag_last_tx_tick = 0U;
 static uint16_t can_telemetry_samples_since_health = 0U;
 static uint16_t can_telemetry_frames_since_health = 0U;
+static uint8_t can_diag_sequence = 0U;
+static bool can_main_loop_seen = false;
 static persistent_config_t persistent_config;
 static bool config_dirty = false;
 static bool config_snapshot_pending = false;
 static uint32_t config_save_deadline = 0U;
+#if CAN_TX_DRIVER_TEST_ENABLED
+static uint32_t can_tx_driver_test_last_tx_tick = 0U;
+static uint8_t can_tx_driver_test_sequence = 0U;
+static volatile int can_tx_driver_test_last_result = 0;
+#endif
 #if CAN_INTERVAL_TEST_ENABLED
 static uint32_t can_test_last_tx_tick = 0;
 static uint8_t can_test_sequence = 0;
@@ -94,10 +112,93 @@ static void send_can_interval_test(void)
 }
 #endif
 
+#if CAN_TX_DRIVER_TEST_ENABLED
+#if CAN_TX_DRIVER_TEST_GPIO_PULSE_ONLY || \
+    CAN_TX_DRIVER_TEST_PULSE_PA12_ON_CAN_INIT_FAIL
+static bool can_tx_driver_test_pa12_gpio_ready = false;
+
+static void can_tx_driver_test_init_pa12_gpio(void)
+{
+    if (can_tx_driver_test_pa12_gpio_ready) {
+        return;
+    }
+
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+    gpio.Pin = GPIO_PIN_12;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOA, &gpio);
+    can_tx_driver_test_pa12_gpio_ready = true;
+}
+#endif
+
+static void send_can_tx_driver_test(void)
+{
+    uint32_t now = HAL_GetTick();
+    if ((uint32_t)(now - can_tx_driver_test_last_tx_tick) <
+        CAN_TX_DRIVER_TEST_PERIOD_MS) {
+        return;
+    }
+    can_tx_driver_test_last_tx_tick = now;
+    HAL_GPIO_TogglePin(MCU_LED_GPIO_Port, MCU_LED_Pin);
+
+#if CAN_TX_DRIVER_TEST_GPIO_PULSE_ONLY
+    can_tx_driver_test_init_pa12_gpio();
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_12);
+    return;
+#endif
+
+    if (!can_ready) {
+#if CAN_TX_DRIVER_TEST_PULSE_PA12_ON_CAN_INIT_FAIL
+        can_tx_driver_test_init_pa12_gpio();
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_12);
+#endif
+        return;
+    }
+    (void)can_recover_bus_off();
+
+    const uint8_t frame[8] = {
+        0xAAU,
+        0x55U,
+        can_tx_driver_test_sequence,
+        (uint8_t)~can_tx_driver_test_sequence,
+        (uint8_t)can_tx_driver_test_last_result,
+        0x11U,
+        0x22U,
+        0x33U,
+    };
+
+#if CAN_TX_DRIVER_TEST_SEND_FD
+    int ret = can_fd_data_frame_send(CAN_TX_DRIVER_TEST_CLASSIC_ID,
+                                     frame, sizeof(frame));
+#else
+    int ret = can_classic_data_frame_send(CAN_TX_DRIVER_TEST_CLASSIC_ID,
+                                          frame, sizeof(frame));
+#endif
+    can_tx_driver_test_last_result = ret;
+    if (ret == (int)sizeof(frame)) {
+        can_tx_driver_test_sequence++;
+    }
+}
+#endif
+
 void setup(void)
 {
     delay_init();
     can_ready = (can_init() == 0);
+
+#if CAN_TX_DRIVER_TEST_ENABLED
+#if CAN_TX_DRIVER_TEST_GPIO_PULSE_ONLY
+    can_tx_driver_test_init_pa12_gpio();
+#endif
+    can_tx_driver_test_last_tx_tick =
+        HAL_GetTick() - CAN_TX_DRIVER_TEST_PERIOD_MS;
+    return;
+#endif
 
 #if CAN_INTERVAL_TEST_ENABLED
     can_test_last_tx_tick = HAL_GetTick() - CAN_INTERVAL_TEST_PERIOD_MS;
@@ -110,23 +211,23 @@ void setup(void)
         (void)flash_storage_save_config(&persistent_config);
     }
 
-    adc_ads1256_start();
-    if (adc_ads1256_set_vref_uv(persistent_config.vref_uv) != 0 ||
-        adc_ads1256_set_pga_gain(persistent_config.pga_gain) != 0 ||
-        adc_ads1256_set_sample_rate_x10(persistent_config.sample_rate_x10) != 0 ||
-        adc_ads1256_set_channel_mask(persistent_config.channel_mask) != 0 ||
-        persistent_config.filter_length < FILTER_WINDOW_SIZE_MIN ||
-        persistent_config.filter_length > FILTER_WINDOW_SIZE_MAX ||
-        persistent_config.telemetry_mode > CAN_TELEMETRY_MODE_PHYSICAL) {
+    bool config_valid =
+        persistent_config.filter_length >= FILTER_WINDOW_SIZE_MIN &&
+        persistent_config.filter_length <= FILTER_WINDOW_SIZE_MAX &&
+        persistent_config.telemetry_mode <= CAN_TELEMETRY_MODE_PHYSICAL &&
+        adc_ads1256_configure_startup(persistent_config.vref_uv,
+                                      persistent_config.pga_gain,
+                                      persistent_config.sample_rate_x10,
+                                      persistent_config.channel_mask) == 0;
+    if (!config_valid) {
         flash_storage_config_defaults(&persistent_config);
-        (void)adc_ads1256_set_vref_uv(persistent_config.vref_uv);
-        (void)adc_ads1256_set_pga_gain(persistent_config.pga_gain);
-        (void)adc_ads1256_set_sample_rate_x10(persistent_config.sample_rate_x10);
-        (void)adc_ads1256_set_channel_mask(persistent_config.channel_mask);
+        (void)adc_ads1256_configure_startup(persistent_config.vref_uv,
+                                            persistent_config.pga_gain,
+                                            persistent_config.sample_rate_x10,
+                                            persistent_config.channel_mask);
         (void)flash_storage_save_config(&persistent_config);
     }
-    (void)adc_ads1256_calibrate();
-    (void)adc_ads1256_restart();
+    adc_ads1256_prepare();
     filter_init();
     filter_set_window_size(persistent_config.filter_length);
     can_telemetry_mode = persistent_config.telemetry_mode;
@@ -426,6 +527,35 @@ static void send_can_health(void)
         can_telemetry_samples_since_health = 0U;
         can_telemetry_frames_since_health = 0U;
     }
+}
+
+static void send_can_diag(void)
+{
+    uint32_t now = HAL_GetTick();
+    if (!can_ready ||
+        (uint32_t)(now - can_diag_last_tx_tick) < CAN_DIAG_PERIOD_MS) {
+        return;
+    }
+    can_diag_last_tx_tick = now;
+
+    can_diag_status_t diag = {0};
+    can_diag_get(&diag);
+
+    uint8_t flags = 0U;
+    flags |= can_ready ? 0x01U : 0U;
+    flags |= can_main_loop_seen ? 0x02U : 0U;
+    flags |= diag.last_rx_fd != 0U ? 0x04U : 0U;
+    flags |= diag.last_rx_brs != 0U ? 0x08U : 0U;
+    flags |= diag.bus_off != 0U ? 0x10U : 0U;
+    flags |= diag.error_passive != 0U ? 0x20U : 0U;
+
+    can_tx_diag_frame_t frame;
+    can_build_diag_frame(&frame, flags, diag.last_rx_dlc,
+                         diag.last_reject_reason, diag.tx_error_count,
+                         diag.rx_error_count, can_diag_sequence++);
+    (void)can_classic_data_frame_send(CAN_ID_TX_DIAG,
+                                      (const uint8_t *)&frame,
+                                      sizeof(frame));
 }
 
 static void u32_le_store(uint8_t value_le[4], uint32_t value)
@@ -807,10 +937,20 @@ static void process_can_commands(void)
         }
 
         int dlc_bytes = can_data_len_get(msg.RxHeader.DataLength);
-        if (msg.RxHeader.Identifier != CAN_ID_RX_COMMAND ||
-            msg.RxHeader.FDFormat != FDCAN_FD_CAN ||
-            msg.RxHeader.BitRateSwitch != FDCAN_BRS_ON ||
-            dlc_bytes != (int)sizeof(can_rx_command_frame_t)) {
+        if (msg.RxHeader.Identifier != CAN_ID_RX_COMMAND) {
+            can_diag_record_reject(CAN_DIAG_REJECT_BAD_ID);
+            continue;
+        }
+        if (msg.RxHeader.FDFormat != FDCAN_FD_CAN) {
+            can_diag_record_reject(CAN_DIAG_REJECT_NOT_FD);
+            continue;
+        }
+        if (msg.RxHeader.BitRateSwitch != FDCAN_BRS_ON) {
+            can_diag_record_reject(CAN_DIAG_REJECT_NO_BRS);
+            continue;
+        }
+        if (dlc_bytes != (int)sizeof(can_rx_command_frame_t)) {
+            can_diag_record_reject(CAN_DIAG_REJECT_BAD_DLC);
             continue;
         }
 
@@ -819,12 +959,15 @@ static void process_can_commands(void)
         uint8_t detail = 0;
 
         if (frame->frame_type != CAN_FRAME_TYPE_COMMAND) {
+            can_diag_record_reject(CAN_DIAG_REJECT_BAD_TYPE);
             send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_TYPE,
                             value, frame->frame_type);
         } else if (frame->version != CAN_PROTOCOL_VERSION) {
+            can_diag_record_reject(CAN_DIAG_REJECT_BAD_VERSION);
             send_can_status(frame->sequence, frame->cmd_type, CAN_STATUS_BAD_TYPE,
                             value, frame->version);
         } else {
+            can_diag_record_reject(CAN_DIAG_REJECT_NONE);
             uint32_t applied_value = value;
             uint8_t status = process_can_command(frame->cmd_type, frame->param, value,
                                                  &applied_value, &detail);
@@ -839,16 +982,25 @@ static void process_can_commands(void)
 // ============================================================================
 void loop(void)
 {
-#if CAN_INTERVAL_TEST_ENABLED
-    if (can_ready) {
-        while(1)
-        send_can_interval_test();
-    }
+while (1) {
+
+
+#if CAN_TX_DRIVER_TEST_ENABLED
+    send_can_tx_driver_test();
     return;
 #endif
 
+#if CAN_INTERVAL_TEST_ENABLED
+    (void)can_recover_bus_off();
+    send_can_interval_test();
+    return;
+#endif
+}
+    can_main_loop_seen = true;
+    (void)can_recover_bus_off();
     process_can_commands();
     service_config_save();
+    send_can_diag();
     send_config_snapshot();
     send_can_health();
     flush_can_telemetry();

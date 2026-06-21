@@ -9,10 +9,11 @@
 每次 `loop()`：
 
 1. 最多处理 4 条待处理 CAN FD+BRS 命令。
-2. 到达周期时发送每秒一次的健康帧。
-3. 轮询两片 ADS1256。
-4. 从 ADS1256 环形缓冲区取出已完成的转换记录。
-5. 每条记录到达后立即完成滤波、扣零、统计、物理量换算和可选遥测发送。
+2. 处理延迟 Flash 配置保存和待发送配置快照。
+3. 到达周期时发送 250 ms classic CAN 诊断心跳和每秒一次的 FD 健康帧。
+4. 轮询两片 ADS1256。
+5. 从 ADS1256 环形缓冲区取出已完成的转换记录。
+6. 每条记录到达后立即完成滤波、扣零、统计、物理量换算和可选遥测发送。
 
 应用层不会等待全部通道收齐再处理。这样可以及时轮询 ADC，也可以减少 FDCAN TX FIFO 瞬时突发。
 
@@ -52,56 +53,88 @@
 
 ## CAN FD 协议
 
-所有业务帧均使用标准 11-bit ID、CAN FD+BRS、`1M / 2M` 和 XOR 校验。
+所有业务帧均使用标准 11-bit ID、CAN FD+BRS、`500K / 2M` 和固定长度载荷。classic 诊断心跳只用于联调观测，不作为业务协议回退。
 
 | 方向 | ID | 类型 | 长度 | 用途 |
 |---|---:|---:|---:|---|
-| PC -> MCU | `0x100` | `0xA0` | 8 | 命令 |
-| MCU -> PC | `0x101` | `0x53` | 64 | 最多 10 条遥测记录 |
-| MCU -> PC | `0x102` | `0xA1` | 8 | 命令 ACK |
-| MCU -> PC | `0x103` | `0x52` | 16 | 每秒健康信息 |
+| PC -> MCU | `0x100` | `0xA0` | 12 FD+BRS | 命令 |
+| MCU -> PC | `0x0F0` | `0xA1` | 12 FD+BRS | 命令 ACK/status |
+| MCU -> PC | `0x101` | `0x54` | 64 FD+BRS | Raw 批量遥测 |
+| MCU -> PC | `0x101` | `0x55` | 64 FD+BRS | 物理量批量遥测 |
+| MCU -> PC | `0x103` | `0x52` | 24 FD+BRS | 每秒健康信息 |
+| MCU -> PC | `0x104` | `0x56` | 64 FD+BRS | 配置快照 |
+| MCU -> PC | `0x0FF` | `0x57` | 8 classic CAN | 链路诊断心跳 |
 
 命令帧：
 
 ```text
 byte 0: 类型 0xA0
-byte 1: sequence
-byte 2: command
-byte 3: param
-byte 4-5: value uint16 LE
-byte 6: 保留
-byte 7: bytes 0..6 的 XOR CRC
+byte 1: 协议版本 0x03
+byte 2: sequence
+byte 3: command
+byte 4: param
+byte 5: 保留
+byte 6-9: value uint32 LE
+byte 10-11: 保留
 ```
 
 `SET_SAMPLE_RATE` 使用 `param=0` 表示整数 SPS，使用 `param=1` 表示十分之一 SPS，因此 `2.5 SPS` 编码为 `value=25`。
 
-遥测帧：
+Raw 遥测帧：
 
 ```text
-byte 0: 类型 0x53
-byte 1: 遥测记录数量 1..10
-byte 2-61: 十个 6 字节记录槽，未使用槽填零
-byte 62: 保留
-byte 63: bytes 0..62 的 XOR CRC
+byte 0: 类型 0x54
+byte 1: 协议版本 0x03
+byte 2: 遥测模式 raw
+byte 3: sequence
+byte 4: 记录数量 1..14
+byte 5-6: drop delta uint16 LE
+byte 7: 保留
+byte 8-63: 十四个 4 字节 raw 记录
+```
 
-记录 byte 0: 逻辑通道 0..7
-记录 byte 1-2: 电压 int16 BE，单位 0.01 mV
-记录 byte 3-4: 应变 int16 BE，单位 microstrain
-记录 byte 5: 应力预览 int8，单位 0.1 MPa，溢出时饱和
+物理量遥测帧：
+
+```text
+byte 0: 类型 0x55
+byte 1: 协议版本 0x03
+byte 2: 遥测模式 physical
+byte 3: sequence
+byte 4: 记录数量 1..6
+byte 5-6: drop delta uint16 LE
+byte 7: 保留
+byte 8-61: 六个 9 字节物理量记录
+byte 62-63: 保留
 ```
 
 健康帧：
 
 ```text
 byte 0: 类型 0x52
-byte 1: 协议版本 0x01
+byte 1: 协议版本 0x03
 byte 2-5: 采样率 x10，uint32 LE
-byte 6-7: 遥测抽取倍数，uint16 LE
-byte 8-9: CAN TX 丢弃数，uint16 LE
-byte 10-11: ADC 环形缓冲区溢出数，uint16 LE
-byte 12-13: ADC 自动恢复次数，uint16 LE
-byte 14: 高 4 位为活动 ADC 数量，bit 0 表示采集运行中
-byte 15: bytes 0..14 的 XOR CRC
+byte 6-7: CAN TX 丢弃数，uint16 LE
+byte 8-9: ADC 环形缓冲区溢出数，uint16 LE
+byte 10-11: ADC 自动恢复次数，uint16 LE
+byte 12-13: 遥测样本/秒，uint16 LE
+byte 14-15: 遥测帧/秒，uint16 LE
+byte 16: 活动 ADC 数量
+byte 17: 遥测模式
+byte 18: flags，bit 0 表示采集运行中，bit 1 表示配置待保存，bit 2 表示零点有效
+byte 19-23: 保留
+```
+
+诊断帧：
+
+```text
+byte 0: 类型 0x57
+byte 1: flags，CAN ready/主循环/最近 RX FD/最近 RX BRS/bus-off/passive
+byte 2: 最近 0x100 DLC 字节数
+byte 3: 最近命令拒绝原因
+byte 4: FDCAN TX error counter
+byte 5: FDCAN RX error counter
+byte 6: 诊断序号
+byte 7: bytes 0..6 的 XOR CRC
 ```
 
 ## 命令

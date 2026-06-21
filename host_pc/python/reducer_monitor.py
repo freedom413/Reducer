@@ -38,6 +38,7 @@ pg.setConfigOptions(useOpenGL=False, antialias=False)
 from can_protocol import (
     Baudrate,
     CANFrame,
+    CAN_ID_TX_DIAG,
     CAN_ID_TX_HEALTH,
     CAN_ID_TX_CONFIG,
     CAN_ID_TX_STATUS,
@@ -56,6 +57,7 @@ from can_protocol import (
     list_can_channels,
     parse_health_frame,
     parse_config_frame,
+    parse_diag_frame,
     parse_status_frame,
     parse_telemetry_frames,
 )
@@ -738,6 +740,14 @@ TRANSLATIONS = {
         "stream_summary": "ADC {sample_rate} SPS | scan {scan_rate:.0f} fps | telemetry {telemetry_rate:.0f} samples/s | {mode}",
         "health": "System Health",
         "health_waiting": "Waiting for MCU health frame | RX {rx_rate:.0f} samples/s | protocol errors {bad}",
+        "health_waiting_with_diag": "MCU classic diag OK | main loop {main_loop} | last 0x100 {rx_format} | reject {reject} | TEC {tec} REC {rec} | no FD health yet",
+        "diag_yes": "yes",
+        "diag_no": "no",
+        "diag_rx_none": "none",
+        "diag_rx_format": "{dlc} bytes {format}",
+        "diag_format_fd_brs": "FD+BRS",
+        "diag_format_fd_no_brs": "FD without BRS",
+        "diag_format_classic": "classic CAN",
         "health_summary": "MCU {adc_state} | RX {rx_rate:.0f} samples/s | MCU TX {tx_samples} samples/s in {tx_frames} frames/s | ADC {sample_rate} SPS | {mode} | new drops {drop_delta}, total {tx_drop} | new overflows {overflow_delta}, total {overflow} | recoveries {recovery} | protocol errors {bad}",
         "adc_running": "RUN",
         "adc_stopped": "STOP",
@@ -869,6 +879,14 @@ TRANSLATIONS = {
         "stream_summary": "ADC {sample_rate} SPS | 扫描 {scan_rate:.0f} 帧/秒 | 遥测 {telemetry_rate:.0f} 样本/秒 | {mode}",
         "health": "系统健康状态",
         "health_waiting": "等待 MCU 健康帧 | 接收 {rx_rate:.0f} 样本/秒 | 协议错误 {bad}",
+        "health_waiting_with_diag": "已收到 MCU classic 诊断 | 主循环 {main_loop} | 最近 0x100 {rx_format} | 丢弃 {reject} | TEC {tec} REC {rec} | 尚无 FD 健康帧",
+        "diag_yes": "是",
+        "diag_no": "否",
+        "diag_rx_none": "无",
+        "diag_rx_format": "{dlc} 字节 {format}",
+        "diag_format_fd_brs": "FD+BRS",
+        "diag_format_fd_no_brs": "FD 无 BRS",
+        "diag_format_classic": "classic CAN",
         "health_summary": "MCU {adc_state} | 接收 {rx_rate:.0f} 样本/秒 | MCU 发送 {tx_samples} 样本/秒、{tx_frames} 帧/秒 | ADC {sample_rate} SPS | {mode} | 新增丢弃 {drop_delta}、累计 {tx_drop} | 新增溢出 {overflow_delta}、累计 {overflow} | 恢复 {recovery} | 协议错误 {bad}",
         "adc_running": "运行",
         "adc_stopped": "停止",
@@ -908,6 +926,28 @@ STATUS_TRANSLATIONS = {
     "unsupported command": "不支持的命令",
     "invalid value": "数值无效",
     "storage error": "存储错误",
+}
+
+DIAG_REJECT_REASONS = {
+    0x00: "OK",
+    0x01: "BAD_ID",
+    0x02: "NOT_FD",
+    0x03: "NO_BRS",
+    0x04: "BAD_DLC",
+    0x05: "BAD_TYPE",
+    0x06: "BAD_VERSION",
+    0x07: "RX_OVERFLOW",
+}
+
+DIAG_REJECT_TRANSLATIONS = {
+    "OK": "正常",
+    "BAD_ID": "ID 错误",
+    "NOT_FD": "不是 FD 帧",
+    "NO_BRS": "未开启 BRS",
+    "BAD_DLC": "DLC 错误",
+    "BAD_TYPE": "帧类型错误",
+    "BAD_VERSION": "协议版本错误",
+    "RX_OVERFLOW": "接收队列溢出",
 }
 
 
@@ -1275,6 +1315,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.last_rx_telemetry_count = 0
         self.rx_telemetry_rate_hz = 0.0
         self.latest_health = None
+        self.latest_diag = None
+        self.rx_diag_count = 0
         self.health_tx_drop_delta = 0
         self.health_adc_overflow_delta = 0
         self.health_adc_recovery_delta = 0
@@ -1726,6 +1768,27 @@ class ReducerMonitorWindow(QMainWindow):
         if self.language == "zh":
             return STATUS_TRANSLATIONS.get(reason, reason)
         return reason
+
+    def _display_diag_reject_reason(self, reason: int) -> str:
+        label = DIAG_REJECT_REASONS.get(reason, f"0x{reason:02X}")
+        if self.language == "zh":
+            return DIAG_REJECT_TRANSLATIONS.get(label, label)
+        return label
+
+    def _diag_rx_format_text(self, diag) -> str:
+        if diag.last_rx_dlc == 0 and diag.last_reject_reason == 0:
+            return self._tr("diag_rx_none")
+        if diag.last_rx_fd and diag.last_rx_brs:
+            frame_format = self._tr("diag_format_fd_brs")
+        elif diag.last_rx_fd:
+            frame_format = self._tr("diag_format_fd_no_brs")
+        else:
+            frame_format = self._tr("diag_format_classic")
+        return self._tr(
+            "diag_rx_format",
+            dlc=diag.last_rx_dlc,
+            format=frame_format,
+        )
 
     def _raw_to_mv_scale(self) -> float:
         return (
@@ -2524,6 +2587,8 @@ class ReducerMonitorWindow(QMainWindow):
             self.last_rx_telemetry_count = 0
             self.rx_telemetry_rate_hz = 0.0
             self.latest_health = None
+            self.latest_diag = None
+            self.rx_diag_count = 0
             self.health_tx_drop_delta = 0
             self.health_adc_overflow_delta = 0
             self.health_adc_recovery_delta = 0
@@ -2853,6 +2918,25 @@ class ReducerMonitorWindow(QMainWindow):
 
         health = self.latest_health
         if health is None:
+            diag = self.latest_diag
+            if diag is not None:
+                state = "error" if diag.bus_off or diag.error_passive else "warning"
+                self._set_health_status(
+                    state,
+                    self._tr(
+                        "health_waiting_with_diag",
+                        main_loop=self._tr(
+                            "diag_yes" if diag.main_loop_alive else "diag_no"
+                        ),
+                        rx_format=self._diag_rx_format_text(diag),
+                        reject=self._display_diag_reject_reason(
+                            diag.last_reject_reason
+                        ),
+                        tec=diag.tx_error_count,
+                        rec=diag.rx_error_count,
+                    ),
+                )
+                return
             self._set_health_status(
                 "waiting",
                 self._tr(
@@ -2937,6 +3021,8 @@ class ReducerMonitorWindow(QMainWindow):
                     if interface == "slcan"
                     else self._tr("socketcan_help")
                 )
+                if self.can_bus is not None and self.can_bus.last_error:
+                    interface_help = f"{interface_help}\n{self.can_bus.last_error}"
                 QMessageBox.critical(
                     self,
                     self._tr("error"),
@@ -3067,6 +3153,13 @@ class ReducerMonitorWindow(QMainWindow):
             self._apply_config_snapshot(config)
             return
 
+        diag = parse_diag_frame(frame)
+        if diag is not None:
+            self.latest_diag = diag
+            self.rx_diag_count += 1
+            self._refresh_health_panel(update_rx_rate=False)
+            return
+
         health = parse_health_frame(frame)
         if health is not None:
             previous_health = self.latest_health
@@ -3108,7 +3201,8 @@ class ReducerMonitorWindow(QMainWindow):
         telemetry_frames = parse_telemetry_frames(frame)
         if telemetry_frames is None:
             if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS,
-                            CAN_ID_TX_HEALTH, CAN_ID_TX_CONFIG):
+                            CAN_ID_TX_HEALTH, CAN_ID_TX_CONFIG,
+                            CAN_ID_TX_DIAG):
                 self.rx_bad_protocol_count += 1
                 logger.warning("Rejected malformed protocol frame on CAN ID 0x%03X", frame.id)
             return

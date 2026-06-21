@@ -26,9 +26,11 @@ from can_protocol import (
     CAN_FRAME_TYPE_STATUS,
     CAN_FRAME_TYPE_TELEMETRY,
     CAN_FRAME_TYPE_TELEMETRY_BATCH,
+    CAN_FRAME_TYPE_DIAG,
     CAN_FRAME_TYPE_HEALTH,
     CAN_HEALTH_VERSION,
     CAN_ID_RX_COMMAND,
+    CAN_ID_TX_DIAG,
     CAN_ID_TX_HEALTH,
     CAN_ID_TX_CONFIG,
     CAN_ID_TX_STATUS,
@@ -49,11 +51,13 @@ from can_protocol import (
     build_command_frame,
     crc8_xor,
     list_can_channels,
+    parse_diag_frame,
     parse_status_frame,
     parse_telemetry_frame,
     parse_telemetry_frames,
     parse_health_frame,
     parse_config_frame,
+    probe_slcan_fd_adapter,
 )
 from reducer_monitor import (
     CANReceiver,
@@ -216,6 +220,26 @@ def build_health_v2_payload(
     return bytes(payload)
 
 
+def build_diag_payload(
+    flags: int = 0x3F,
+    last_rx_dlc: int = 12,
+    reject_reason: int = 4,
+    tx_error_count: int = 5,
+    rx_error_count: int = 6,
+    sequence: int = 7,
+) -> bytes:
+    payload = bytes([
+        CAN_FRAME_TYPE_DIAG,
+        flags & 0xFF,
+        last_rx_dlc & 0xFF,
+        reject_reason & 0xFF,
+        tx_error_count & 0xFF,
+        rx_error_count & 0xFF,
+        sequence & 0xFF,
+    ])
+    return payload + bytes([crc8_xor(payload)])
+
+
 class TestProtocolHelpers(unittest.TestCase):
     def test_v3_command_and_status_use_uint32_value(self):
         frame = build_command_frame(
@@ -238,6 +262,54 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(CAN_ID_TX_STATUS, 0x0F0)
         self.assertLess(CAN_ID_TX_STATUS, CAN_ID_RX_COMMAND)
         self.assertLess(CAN_ID_TX_STATUS, CAN_ID_TX_TELEMETRY)
+
+    def test_diag_id_can_preempt_fd_health_config_without_preempting_ack(self):
+        self.assertEqual(CAN_ID_TX_DIAG, 0x0FF)
+        self.assertGreater(CAN_ID_TX_DIAG, CAN_ID_TX_STATUS)
+        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_RX_COMMAND)
+        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_TX_TELEMETRY)
+        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_TX_HEALTH)
+        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_TX_CONFIG)
+
+    def test_legacy_status_ack_id_is_not_accepted(self):
+        payload = bytes([
+            CAN_FRAME_TYPE_STATUS, CAN_PROTOCOL_VERSION, 3, CAN_CMD_GET_CONFIG,
+            CAN_STATUS_OK, 0, 0, 0,
+        ])
+
+        self.assertIsNone(parse_status_frame(CANFrame(id=0x102, data=payload)))
+
+    def test_parse_classic_can_diag_frame(self):
+        parsed = parse_diag_frame(CANFrame(
+            id=CAN_ID_TX_DIAG,
+            data=build_diag_payload(),
+            is_fd=False,
+            bitrate_switch=False,
+        ))
+
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.can_ready)
+        self.assertTrue(parsed.main_loop_alive)
+        self.assertTrue(parsed.last_rx_fd)
+        self.assertTrue(parsed.last_rx_brs)
+        self.assertTrue(parsed.bus_off)
+        self.assertTrue(parsed.error_passive)
+        self.assertEqual(parsed.last_rx_dlc, 12)
+        self.assertEqual(parsed.last_reject_reason, 4)
+        self.assertEqual(parsed.tx_error_count, 5)
+        self.assertEqual(parsed.rx_error_count, 6)
+        self.assertEqual(parsed.sequence, 7)
+
+    def test_parse_diag_frame_rejects_bad_crc(self):
+        payload = bytearray(build_diag_payload())
+        payload[7] ^= 0xFF
+
+        self.assertIsNone(parse_diag_frame(CANFrame(
+            id=CAN_ID_TX_DIAG,
+            data=bytes(payload),
+            is_fd=False,
+            bitrate_switch=False,
+        )))
 
     def test_parse_v3_physical_telemetry_uses_wide_units(self):
         payload = bytearray(64)
@@ -467,7 +539,7 @@ class TestProtocolHelpers(unittest.TestCase):
         with patch("can_protocol.can.Bus", return_value=bus_instance) as mock_bus, patch(
             "can_protocol.can.Notifier",
             return_value=notifier_instance,
-        ):
+        ), patch("can_protocol.serial.serial_for_url") as mock_serial:
             interface = PythonCANInterface()
             connected = interface.connect(
                 "slcan",
@@ -486,6 +558,54 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(kwargs["tty_baudrate"], 460800)
         self.assertEqual(kwargs["sleep_after_open"], 0.25)
         self.assertEqual(interface.tty_baudrate, 460800)
+        self.assertIsNone(interface.last_error)
+        mock_serial.assert_not_called()
+
+    def test_slcan_fd_preflight_rejects_adapter_without_y2(self):
+        serial_port = MagicMock()
+        serial_port.read.side_effect = [b"\r", b"\r", b"\a"]
+
+        with patch(
+            "can_protocol.serial.serial_for_url",
+            return_value=serial_port,
+        ):
+            result = probe_slcan_fd_adapter("COM7", 115200)
+
+        self.assertFalse(result.ok)
+        self.assertIn("Y2", result.error)
+        self.assertEqual(result.commands, ["C", "S6", "Y2"])
+
+    def test_slcan_fd_preflight_allows_silent_command_ack(self):
+        serial_port = MagicMock()
+        serial_port.read.return_value = b""
+
+        with patch(
+            "can_protocol.serial.serial_for_url",
+            return_value=serial_port,
+        ):
+            result = probe_slcan_fd_adapter("COM7", 115200, timeout_s=0)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.error, "")
+        self.assertIn("silent", result.warning)
+        self.assertEqual(result.commands[:4], ["C", "S6", "Y2", "O"])
+
+    def test_slcan_fd_preflight_does_not_transmit_bus_probe_frame(self):
+        serial_port = MagicMock()
+        serial_port.read.side_effect = [b"\r", b"\r", b"\r", b"\r"]
+
+        with patch(
+            "can_protocol.serial.serial_for_url",
+            return_value=serial_port,
+        ):
+            result = probe_slcan_fd_adapter("COM7", 115200)
+
+        writes = [call.args[0] for call in serial_port.write.call_args_list]
+        self.assertTrue(result.ok)
+        self.assertEqual(result.commands, ["C", "S6", "Y2", "O"])
+        self.assertIn(b"S6\r", writes)
+        self.assertIn(b"Y2\r", writes)
+        self.assertFalse(any(write.startswith((b"b", b"B", b"d", b"D")) for write in writes))
 
     def test_upstream_slcan_bus_writes_canable2_fd_commands_and_brs_frame(self):
         import can as python_can
@@ -531,8 +651,12 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertIn(b"b1008A001020304050607\r", serial_writes)
         self.assertIn(b"b101F" + batch_data.hex().upper().encode() + b"\r", serial_writes)
 
-    def test_default_slcan_tty_baudrate_matches_canable2_cdc_compatibility_value(self):
-        self.assertEqual(DEFAULT_SLCAN_TTY_BAUDRATE, 115200)
+    def test_default_slcan_tty_baudrate_covers_worst_case_fd_ascii_load(self):
+        max_fd_frames_per_second = 875
+        slcan_64_byte_fd_brs_chars = len("b101F" + ("00" * 64) + "\r")
+        required_bps = max_fd_frames_per_second * slcan_64_byte_fd_brs_chars * 10
+
+        self.assertGreaterEqual(DEFAULT_SLCAN_TTY_BAUDRATE, required_bps)
 
     def test_python_can_listener_is_callable_by_notifier(self):
         received = []
@@ -687,6 +811,166 @@ class TestFirmwareSource(unittest.TestCase):
 
         self.assertIn("FDCAN_TX_QUEUE_OPERATION", fdcan_source)
         self.assertIn("FDCAN1.TxFifoQueueMode=FDCAN_TX_QUEUE_OPERATION", ioc_source)
+
+    def test_fdcan_keeps_tx_delay_compensation_disabled_at_2m(self):
+        root = Path(__file__).resolve().parents[2]
+        fdcan_source = (root / "Core" / "Src" / "fdcan.c").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("HAL_FDCAN_ConfigTxDelayCompensation", fdcan_source)
+        self.assertNotIn("HAL_FDCAN_EnableTxDelayCompensation", fdcan_source)
+
+    def test_fdcan_gpio_speed_is_not_left_at_low_for_canfd(self):
+        root = Path(__file__).resolve().parents[2]
+        fdcan_source = (root / "Core" / "Src" / "fdcan.c").read_text(
+            encoding="utf-8"
+        )
+        ioc_source = (root / "Reducer.ioc").read_text(encoding="utf-8")
+
+        fdcan_gpio_block = fdcan_source.split("PA11     ------> FDCAN1_RX", 1)[
+            1
+        ].split("HAL_GPIO_Init(GPIOA", 1)[0]
+
+        self.assertNotIn("GPIO_SPEED_FREQ_LOW", fdcan_gpio_block)
+        self.assertRegex(
+            fdcan_gpio_block,
+            r"GPIO_InitStruct\.Speed = GPIO_SPEED_FREQ_(HIGH|VERY_HIGH);",
+        )
+        self.assertIn("PA11.GPIOParameters=GPIO_Speed", ioc_source)
+        self.assertIn("PA11.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH", ioc_source)
+        self.assertIn("PA12.GPIOParameters=GPIO_Speed", ioc_source)
+        self.assertIn("PA12.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH", ioc_source)
+
+    def test_firmware_emits_classic_diag_and_records_reject_reasons(self):
+        root = Path(__file__).resolve().parents[2]
+        can_header = (root / "Application" / "algorithm" / "can_data.h").read_text(
+            encoding="utf-8"
+        )
+        can_source = (root / "BSP" / "can.c").read_text(encoding="utf-8")
+        can_api = (root / "BSP" / "can.h").read_text(encoding="utf-8")
+        user_source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+
+        self.assertIn("#define CAN_ID_TX_DIAG", can_header)
+        self.assertIn("#define CAN_ID_TX_DIAG       0x0FF", can_header)
+        self.assertIn("can_classic_data_frame_send", can_api)
+        self.assertIn("can_classic_data_frame_send(CAN_ID_TX_DIAG", user_source)
+        self.assertIn("CAN_DIAG_REJECT_BAD_DLC", user_source)
+        self.assertIn("can_diag_record_reject", user_source)
+        self.assertIn("HAL_FDCAN_GetProtocolStatus", can_source)
+        self.assertIn("HAL_FDCAN_GetErrorCounters", can_source)
+
+    def test_firmware_recovers_fdcan_bus_off_and_sends_diag_before_fd_frames(self):
+        root = Path(__file__).resolve().parents[2]
+        can_source = (root / "BSP" / "can.c").read_text(encoding="utf-8")
+        can_api = (root / "BSP" / "can.h").read_text(encoding="utf-8")
+        user_source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        loop_body = user_source.split("void loop(void)", 1)[1].split(
+            "flush_can_telemetry();", 1
+        )[0]
+
+        self.assertIn("can_recover_bus_off", can_api)
+        self.assertIn("HAL_FDCAN_AbortTxRequest", can_source)
+        self.assertIn("HAL_FDCAN_Stop", can_source)
+        self.assertIn("HAL_FDCAN_Start", can_source)
+        self.assertIn("FDCAN_TX_BUFFER0 | FDCAN_TX_BUFFER1 | FDCAN_TX_BUFFER2", can_source)
+        self.assertLess(loop_body.index("can_recover_bus_off();"),
+                        loop_body.index("send_can_diag();"))
+        self.assertLess(loop_body.index("send_can_diag();"),
+                        loop_body.index("send_config_snapshot();"))
+
+    def test_can_interval_test_mode_is_not_left_enabled_in_firmware(self):
+        root = Path(__file__).resolve().parents[2]
+        user_source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+
+        self.assertIn("#define CAN_INTERVAL_TEST_ENABLED    0U", user_source)
+        self.assertNotIn("#define CAN_INTERVAL_TEST_ENABLED    1U", user_source)
+
+    def test_can_tx_driver_test_mode_is_classic_send_only(self):
+        root = Path(__file__).resolve().parents[2]
+        user_source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        setup_body = user_source.split("void setup(void)", 1)[1].split(
+            "static void reset_channel_statistics", 1
+        )[0]
+        loop_body = user_source.split("void loop(void)", 1)[1]
+
+        self.assertIn("#define CAN_TX_DRIVER_TEST_ENABLED   1U", user_source)
+        self.assertIn("#define CAN_TX_DRIVER_TEST_CLASSIC_ID 0x123U", user_source)
+        self.assertIn("#define CAN_TX_DRIVER_TEST_SEND_FD   0U", user_source)
+        self.assertIn("can_classic_data_frame_send(CAN_TX_DRIVER_TEST_CLASSIC_ID", user_source)
+        self.assertLess(setup_body.index("can_tx_driver_test_last_tx_tick"),
+                        setup_body.index("flash_storage_register_user_ops();"))
+        self.assertLess(loop_body.index("send_can_tx_driver_test();"),
+                        loop_body.index("process_can_commands();"))
+
+    def test_can_send_path_recovers_bus_off_before_reporting_fifo_full(self):
+        root = Path(__file__).resolve().parents[2]
+        can_source = (root / "BSP" / "can.c").read_text(encoding="utf-8")
+        send_helper = can_source.split(
+            "static int can_data_frame_send_reserved", 1
+        )[1].split("int can_fd_data_frame_send", 1)[0]
+        fifo_full_branch = send_helper.split(
+            "HAL_FDCAN_GetTxFifoFreeLevel", 1
+        )[1].split("HAL_FDCAN_AddMessageToTxFifoQ", 1)[0]
+
+        self.assertIn("can_recover_bus_off()", fifo_full_branch)
+        self.assertLess(
+            fifo_full_branch.index("can_recover_bus_off()"),
+            fifo_full_branch.index("return -3;"),
+        )
+
+    def test_canfd_docs_match_500k_2m_runtime_configuration(self):
+        root = Path(__file__).resolve().parents[2]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        setup_doc = (root / "docs" / "canfd_2m_setup.md").read_text(encoding="utf-8")
+
+        self.assertIn("500K / 2M", readme)
+        self.assertIn("500K / 2M", setup_doc)
+        self.assertIn("S6", setup_doc)
+        self.assertIn("Tx delay compensation is intentionally left disabled", setup_doc)
+        self.assertNotIn("1M / 2M", readme)
+        self.assertNotIn("S8", setup_doc)
+
+    def test_setup_defers_blocking_ads_start_until_can_service_loop(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        setup_body = source.split("void setup(void)", 1)[1].split(
+            "static void reset_channel_statistics", 1
+        )[0]
+        loop_body = source.split("void loop(void)", 1)[1].split(
+            "adc_ads1256_poll();", 1
+        )[0]
+
+        self.assertIn("adc_ads1256_configure_startup(", setup_body)
+        self.assertIn("adc_ads1256_prepare();", setup_body)
+        self.assertNotIn("adc_ads1256_start();", setup_body)
+        self.assertLess(loop_body.index("process_can_commands();"),
+                        loop_body.index("send_can_diag();"))
+        self.assertLess(loop_body.index("send_can_diag();"),
+                        loop_body.index("send_config_snapshot();"))
+        self.assertLess(loop_body.index("send_config_snapshot();"),
+                        source.split("void loop(void)", 1)[1].index("adc_ads1256_poll();"))
+        before_filter = setup_body.split("filter_init();", 1)[0]
+        self.assertNotIn("adc_ads1256_calibrate()", before_filter)
+        self.assertNotIn("adc_ads1256_restart()", before_filter)
+        self.assertNotIn("adc_ads1256_set_vref_uv", before_filter)
+        self.assertNotIn("adc_ads1256_set_pga_gain", before_filter)
+        self.assertNotIn("adc_ads1256_set_sample_rate_x10", before_filter)
+        self.assertNotIn("adc_ads1256_set_channel_mask", before_filter)
+
+    def test_ads1256_port_init_leaves_runtime_config_to_scan_layer(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "BSP" / "ads1256" / "ads1256_port.c").read_text(
+            encoding="utf-8"
+        )
+        config_one = source.split("static int ads1256_config_one", 1)[1].split(
+            "int adc_ads1256_init", 1
+        )[0]
+
+        self.assertIn("ads1256_reset(ads1256)", config_one)
+        self.assertNotIn("ads1256_set_pga", config_one)
+        self.assertNotIn("ads1256_set_sps", config_one)
+        self.assertNotIn("ads1256_calibration", config_one)
 
 
 class TestReducerMonitorWindow(unittest.TestCase):

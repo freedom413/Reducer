@@ -220,3 +220,19 @@ void can_build_health_frame(can_tx_health_frame_t *frame, uint32_t sample_rate_x
         frame->reserved[i] = 0U;
     }
 }
+
+void can_build_diag_frame(can_tx_diag_frame_t *frame, uint8_t flags,
+                          uint8_t last_rx_dlc, uint8_t last_reject_reason,
+                          uint8_t tx_error_count, uint8_t rx_error_count,
+                          uint8_t sequence)
+{
+    frame->frame_type = CAN_FRAME_TYPE_DIAG;
+    frame->flags = flags;
+    frame->last_rx_dlc = last_rx_dlc;
+    frame->last_reject_reason = last_reject_reason;
+    frame->tx_error_count = tx_error_count;
+    frame->rx_error_count = rx_error_count;
+    frame->sequence = sequence;
+    frame->crc8 = can_calc_crc8((const uint8_t *)frame,
+                                sizeof(*frame) - 1U);
+}
