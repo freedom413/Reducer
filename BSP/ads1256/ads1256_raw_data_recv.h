@@ -20,6 +20,9 @@ typedef struct ads1256_data {
 #define ADS1256_DATA_BUFF_RECORD_COUNT  (128U)
 #define ADS1256_DATA_BUFF_SIZE          ((ADS1256_DATA_BUFF_RECORD_COUNT * sizeof(ads1256_data_t)) + 1U)
 
+int adc_ads1256_configure_startup(uint32_t vref_uv, uint8_t pga_gain,
+                                  uint32_t sps_x10, uint16_t channel_mask);
+void adc_ads1256_prepare(void);
 void adc_ads1256_start(void);
 int adc_ads1256_get_data(ads1256_data_t *data , uint32_t max_count);
 void adc_ads1256_poll(void);

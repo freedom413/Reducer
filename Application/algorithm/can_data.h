@@ -11,6 +11,7 @@
 #define CAN_ID_TX_STATUS     0x0F0  // Downlink: STM32 -> PC command status
 #define CAN_ID_TX_HEALTH     0x103  // Downlink: STM32 -> PC health summary
 #define CAN_ID_TX_CONFIG     0x104  // Downlink: STM32 -> PC persistent config
+#define CAN_ID_TX_DIAG       0x0FF  // Downlink: STM32 -> PC classic CAN link diag
 
 // ============================================================================
 // Frame type definitions
@@ -23,6 +24,7 @@
 #define CAN_FRAME_TYPE_STATUS     0xA1
 #define CAN_FRAME_TYPE_HEALTH     0x52
 #define CAN_FRAME_TYPE_CONFIG     0x56
+#define CAN_FRAME_TYPE_DIAG       0x57
 #define CAN_HEALTH_VERSION        0x01
 #define CAN_PROTOCOL_VERSION      0x03
 
@@ -38,6 +40,18 @@
 #define CAN_STATUS_BAD_CMD        0xE3
 #define CAN_STATUS_BAD_VALUE      0xE4
 #define CAN_STATUS_STORAGE_ERROR  0xE5
+
+// ============================================================================
+// CAN link diagnostic reject reasons
+// ============================================================================
+#define CAN_DIAG_REJECT_NONE        0x00
+#define CAN_DIAG_REJECT_BAD_ID      0x01
+#define CAN_DIAG_REJECT_NOT_FD      0x02
+#define CAN_DIAG_REJECT_NO_BRS      0x03
+#define CAN_DIAG_REJECT_BAD_DLC     0x04
+#define CAN_DIAG_REJECT_BAD_TYPE    0x05
+#define CAN_DIAG_REJECT_BAD_VERSION 0x06
+#define CAN_DIAG_REJECT_RX_OVERFLOW 0x07
 
 // ============================================================================
 // Telemetry CAN TX Frame - 8-byte CAN FD frame with bit-rate switching
@@ -218,6 +232,22 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(can_tx_health_frame_t) == 24, "can_tx_health_frame_t must be 24 bytes");
 
 // ============================================================================
+// Classic CAN diagnostic frame (STM32 -> PC) - 8-byte classic CAN frame
+// ============================================================================
+typedef struct __attribute__((packed)) {
+    uint8_t frame_type;
+    uint8_t flags;
+    uint8_t last_rx_dlc;
+    uint8_t last_reject_reason;
+    uint8_t tx_error_count;
+    uint8_t rx_error_count;
+    uint8_t sequence;
+    uint8_t crc8;
+} can_tx_diag_frame_t;
+
+_Static_assert(sizeof(can_tx_diag_frame_t) == 8, "can_tx_diag_frame_t must be 8 bytes");
+
+// ============================================================================
 // Command types for RX
 // ============================================================================
 #define CAN_CMD_SET_SAMPLE_RATE  0x01
@@ -294,6 +324,10 @@ void can_build_health_frame(can_tx_health_frame_t *frame, uint32_t sample_rate_x
                             uint16_t telemetry_frames_per_second,
                             uint8_t active_adc_count, uint8_t telemetry_mode,
                             uint8_t flags);
+void can_build_diag_frame(can_tx_diag_frame_t *frame, uint8_t flags,
+                          uint8_t last_rx_dlc, uint8_t last_reject_reason,
+                          uint8_t tx_error_count, uint8_t rx_error_count,
+                          uint8_t sequence);
 uint16_t can_frame_u16_le_get(const uint8_t value_le[2]);
 uint32_t can_frame_u32_le_get(const uint8_t value_le[4]);
 

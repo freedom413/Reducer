@@ -98,41 +98,7 @@ ADS1256_t ads1256_b;
 
 static int ads1256_config_one(ADS1256_t *ads1256)
 {
-    ads1256_pga_t pga;
-    ads1256_sps_t sps;
-    int ret;
-
-    ret = ads1256_reset(ads1256);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = ads1256_set_pga(ads1256, ADS1256_PGA_16);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256_get_pga(ads1256, &pga);
-    if (ret < 0) {
-        return ret;
-    }
-
-    if (pga != ADS1256_PGA_16) {
-        return -11;
-    }
-
-    ret = ads1256_set_sps(ads1256, ADS1256_SPS_100);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = ads1256_get_sps(ads1256, &sps);
-    if (ret < 0) {
-        return ret;
-    }
-    if (sps != ADS1256_SPS_100) {
-        return -12;
-    }
-
-    return ads1256_calibration(ads1256, ADS1256_CAL_SELF);
+    return ads1256_reset(ads1256);
 }
 
 int adc_ads1256_init(void)
