@@ -62,7 +62,7 @@ void MX_FDCAN1_Init(void)
   }
   /* USER CODE BEGIN FDCAN1_Init 2 */
 
-  /* Configure filter to accept only CAN_ID_RX_COMMAND (0x100) */
+  /* Configure filter to accept only CAN_ID_RX_COMMAND (0x0F1) */
   FDCAN_FilterTypeDef sFilterConfig;
   sFilterConfig.IdType = FDCAN_STANDARD_ID;
   sFilterConfig.FilterIndex = 0;

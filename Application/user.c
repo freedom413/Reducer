@@ -350,7 +350,7 @@ static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
     can_tx_status_frame_t frame;
     can_build_status_frame(&frame, sequence, cmd_type, status, value, detail);
     uint32_t start = HAL_GetTick();
-    while (can_fd_data_frame_send(CAN_ID_TX_STATUS, (const uint8_t *)&frame,
+    while (can_fd_data_frame_send(CAN_ID_TX_CONTROL, (const uint8_t *)&frame,
                                   sizeof(frame)) == -3) {
         if ((uint32_t)(HAL_GetTick() - start) >= CAN_TX_WAIT_TIMEOUT_MS) {
             break;
@@ -515,6 +515,7 @@ static void send_can_health(void)
     flags |= config_dirty ? 0x02U : 0U;
     flags |= (persistent_config.flags & PERSISTENT_CONFIG_FLAG_ZERO_VALID) != 0U ?
              0x04U : 0U;
+    flags |= adc_ads1256_get_channel_mask() != 0U ? 0x08U : 0U;
     can_tx_health_frame_t frame;
     can_build_health_frame(&frame,
                            adc_ads1256_get_sample_rate_x10(),
@@ -720,7 +721,7 @@ static void send_config_snapshot(void)
         u32_le_store(frame.zero_offset_le[channel],
                      (uint32_t)persistent_config.zero_offset[channel]);
     }
-    if (can_fd_data_frame_send(CAN_ID_TX_CONFIG, (const uint8_t *)&frame,
+    if (can_fd_data_frame_send(CAN_ID_TX_CONTROL, (const uint8_t *)&frame,
                                sizeof(frame)) == (int)sizeof(frame)) {
         config_snapshot_pending = false;
     }

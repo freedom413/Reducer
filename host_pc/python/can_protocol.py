@@ -28,12 +28,14 @@ except ImportError:  # pragma: no cover - handled at runtime on user machine
 logger = logging.getLogger(__name__)
 
 
-CAN_ID_RX_COMMAND = 0x100
-CAN_ID_TX_TELEMETRY = 0x101
-CAN_ID_TX_STATUS = 0x0F0
-CAN_ID_TX_HEALTH = 0x103
-CAN_ID_TX_CONFIG = 0x104
+CAN_ID_TX_CONTROL = 0x0F0
+CAN_ID_RX_COMMAND = 0x0F1
+CAN_ID_TX_HEALTH = 0x0F2
 CAN_ID_TX_DIAG = 0x0FF
+CAN_ID_TX_TELEMETRY = 0x110
+
+CAN_ID_TX_STATUS = CAN_ID_TX_CONTROL
+CAN_ID_TX_CONFIG = CAN_ID_TX_CONTROL
 
 CAN_FRAME_TYPE_TELEMETRY = 0x51
 CAN_FRAME_TYPE_TELEMETRY_BATCH = 0x53
@@ -163,6 +165,7 @@ class HealthFrame:
     telemetry_frames_per_second: int = 0
     config_dirty: bool = False
     zero_valid: bool = False
+    channel_mask_nonzero: bool = False
 
 
 @dataclass
@@ -454,6 +457,7 @@ def parse_health_frame(frame: CANFrame) -> Optional[HealthFrame]:
             telemetry_frames_per_second=telemetry_frames_per_second,
             config_dirty=(flags & 0x02) != 0,
             zero_valid=(flags & 0x04) != 0,
+            channel_mask_nonzero=(flags & 0x08) != 0,
         )
 
     if len(frame.data) != 16:

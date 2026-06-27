@@ -4,7 +4,7 @@ This branch uses CAN FD with bit-rate switching (BRS) end to end:
 
 - Arbitration phase: `500000` bit/s
 - Data phase: `2000000` bit/s
-- Standard 11-bit IDs: `0x100`, `0x0F0`, `0x0FF`, `0x101`, `0x103`, `0x104`
+- Standard 11-bit IDs: `0x0F0`, `0x0F1`, `0x0F2`, `0x0FF`, `0x110`
 - Payload size: 12 bytes for command/status, 64 bytes for batched telemetry,
   24 bytes for health, 64 bytes for config, and 8 classic bytes for diag
 - Frame format: v3 business frames use CAN FD+BRS; diagnostic `0x0FF` is classic CAN
@@ -46,7 +46,7 @@ opening the bus. The meaningful configuration is close, nominal rate `S6`
 (`500K`), data rate `Y2` (`2M`), and open.
 
 Application frames use the CANable 2.0 `b` command for standard-ID CAN FD+BRS
-frames, for example `b1008...` for the `0x100` command frame. Select
+frames, for example `b0F18...` for the `0x0F1` command frame. Select
 `CANable 2.0 SLCAN FD` and the correct `COMx` or `/dev/ttyACMx` port in the GUI.
 
 Standard SLCAN adapters do not provide these CANable 2.0 FD extensions.
@@ -92,13 +92,13 @@ before the three-slot FDCAN hardware TX FIFO. Firmware does not decimate
 telemetry: every acquired record is queued, and any inability to transmit is
 reported through the CAN TX drop counter.
 
-The MCU sends a 24-byte FD+BRS health frame on `0x103` every second. The GUI
+The MCU sends a 24-byte FD+BRS health frame on `0x0F2` every second. The GUI
 shows ADC state, actual telemetry rates, CAN TX drops, ADC ring-buffer overflows,
 automatic recoveries, and received telemetry rate.
 
 The MCU also sends an 8-byte classic CAN diagnostic heartbeat on `0x0FF` during
 bring-up. It is not a business-protocol fallback; it only reports whether the
-main loop is alive, what kind of `0x100` frame was last seen, why a command was
+main loop is alive, what kind of `0x0F1` frame was last seen, why a command was
 rejected, and the current FDCAN error counters.
 
 ## Linux SocketCAN
@@ -155,8 +155,8 @@ Flash `build/Debug/Reducer.elf`.
    and ADC supplies.
 2. Flash Debug firmware, close Cangaroo, then run
    `host_pc\python\.venv\Scripts\python.exe host_pc\python\can_link_probe.py --channel COMx`.
-3. Require `0x0FF` classic diag at about 4 Hz, `0x103` FD health at about 1 Hz,
-   GET_CONFIG ACK `0x0F0`, config `0x104`, and stable zero bus-off/passive/TEC/REC.
+3. Require `0x0FF` classic diag at about 4 Hz, `0x0F2` FD health at about 1 Hz,
+   GET_CONFIG ACK/config on `0x0F0`, and stable zero bus-off/passive/TEC/REC.
 4. At 100 SPS Raw, verify all eight GUI channels, then masks `0x0F`, `0xF0`,
    and `0xFF` to exercise each ADC separately and together.
 5. Verify calibration, filter window, Raw/Physical switching, zero, clear-zero,

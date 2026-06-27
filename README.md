@@ -52,12 +52,12 @@ host_pc/python/
 
 | 方向 | CAN ID | 类型 | 说明 |
 |---|---:|---:|---|
-| PC -> STM32 | `0x100` | `0xA0` | 12 字节命令帧 |
 | STM32 -> PC | `0x0F0` | `0xA1` | 12 字节命令 ACK/status |
-| STM32 -> PC | `0x101` | `0x54/0x55` | 64 字节批量遥测 |
-| STM32 -> PC | `0x103` | `0x52` | 24 字节健康帧 |
-| STM32 -> PC | `0x104` | `0x56` | 64 字节配置快照 |
+| STM32 -> PC | `0x0F0` | `0x56` | 64 字节配置快照 |
+| PC -> STM32 | `0x0F1` | `0xA0` | 12 字节命令帧 |
+| STM32 -> PC | `0x0F2` | `0x52` | 24 字节健康帧 |
 | STM32 -> PC | `0x0FF` | `0x57` | 8 字节 classic CAN 诊断心跳 |
+| STM32 -> PC | `0x110` | `0x54/0x55` | 64 字节批量遥测 |
 
 详细字段和运行逻辑见 [docs/user_application_flow_zh.md](docs/user_application_flow_zh.md)。
 
@@ -92,7 +92,7 @@ Cangaroo 与 Python GUI/`can_link_probe.py` 不能同时占用同一个 COM 口�
 1. 烧录 `build/Debug/Reducer.elf`，检查 CANH、CANL、共地和两端 `120 ohm` 终端电阻。
 2. 先运行 `host_pc/python/can_link_probe.py --channel COMx`，确认 classic 诊断、FD health、ACK 和 config 都能收到。
 3. 启动 GUI，选择 CANable 2.0 SLCAN FD 和正确串口后连接。
-4. 确认 `0x101` 遥测持续到达，`0x103` 健康信息每秒刷新。
+4. 确认 `0x110` 遥测持续到达，`0x0F2` 健康信息每秒刷新。
 5. 点击校准并确认收到 `0x0F0` ACK。
 6. 从 `100 SPS` 逐步提高到 `30000 SPS`，观察实际遥测速率、TX 丢弃和 ADC 溢出。
 7. 执行归零并重启 MCU，确认 Flash 中的零点能够恢复。
