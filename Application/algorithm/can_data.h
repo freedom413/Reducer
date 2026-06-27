@@ -6,12 +6,11 @@
 // ============================================================================
 // CAN ID definitions
 // ============================================================================
-#define CAN_ID_RX_COMMAND    0x100  // Uplink: PC -> STM32
-#define CAN_ID_TX_TELEMETRY  0x101  // Downlink: STM32 -> PC telemetry
-#define CAN_ID_TX_STATUS     0x0F0  // Downlink: STM32 -> PC command status
-#define CAN_ID_TX_HEALTH     0x103  // Downlink: STM32 -> PC health summary
-#define CAN_ID_TX_CONFIG     0x104  // Downlink: STM32 -> PC persistent config
-#define CAN_ID_TX_DIAG       0x0FF  // Downlink: STM32 -> PC classic CAN link diag
+#define CAN_ID_TX_CONTROL    0x0F0  // STM32 -> PC ACK/status and config snapshot
+#define CAN_ID_RX_COMMAND    0x0F1  // PC -> STM32 command
+#define CAN_ID_TX_HEALTH     0x0F2  // STM32 -> PC health summary
+#define CAN_ID_TX_DIAG       0x0FF  // STM32 -> PC classic CAN link diag
+#define CAN_ID_TX_TELEMETRY  0x110  // STM32 -> PC telemetry
 
 // ============================================================================
 // Frame type definitions

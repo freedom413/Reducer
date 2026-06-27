@@ -15,6 +15,11 @@ import time
 from can_protocol import (
     Baudrate,
     CAN_FD_DATA_BITRATE,
+    CAN_ID_RX_COMMAND,
+    CAN_ID_TX_CONTROL,
+    CAN_ID_TX_DIAG,
+    CAN_ID_TX_HEALTH,
+    CAN_ID_TX_TELEMETRY,
     DEFAULT_SLCAN_TTY_BAUDRATE,
     PythonCANInterface,
     build_command_frame,
@@ -22,6 +27,7 @@ from can_protocol import (
     parse_diag_frame,
     parse_health_frame,
     parse_status_frame,
+    parse_telemetry_frames,
 )
 
 
@@ -84,6 +90,7 @@ def run_probe(args: argparse.Namespace) -> int:
         "health": None,
         "status": None,
         "config": None,
+        "telemetry_frames": 0,
         "frames": 0,
     }
     lock = threading.Lock()
@@ -113,6 +120,12 @@ def run_probe(args: argparse.Namespace) -> int:
             config = parse_config_frame(frame)
             if config is not None:
                 state["config"] = config
+                changed.set()
+                return
+
+            telemetry = parse_telemetry_frames(frame)
+            if telemetry is not None:
+                state["telemetry_frames"] += 1
                 changed.set()
 
     bus = PythonCANInterface()
@@ -148,7 +161,10 @@ def run_probe(args: argparse.Namespace) -> int:
         if not bus.send_frame(command):
             print("RESULT: failed to send GET_CONFIG command")
             return 1
-        print(f"Sent GET_CONFIG seq={sequence}")
+        print(
+            f"Sent GET_CONFIG on 0x{CAN_ID_RX_COMMAND:03X} seq={sequence}; "
+            f"expect control responses on 0x{CAN_ID_TX_CONTROL:03X}"
+        )
 
         deadline = time.monotonic() + args.timeout
         _wait_until(
@@ -157,7 +173,13 @@ def run_probe(args: argparse.Namespace) -> int:
                 state["diag"] is not None and
                 state["health"] is not None and
                 state["status"] is not None and
-                state["config"] is not None
+                state["config"] is not None and
+                (
+                    state["health"] is None or
+                    not state["health"].adc_running or
+                    not state["health"].channel_mask_nonzero or
+                    state["telemetry_frames"] > 0
+                )
             ),
         )
 
@@ -166,8 +188,8 @@ def run_probe(args: argparse.Namespace) -> int:
         status = state["status"]
         config = state["config"]
         print("Frames observed:", state["frames"])
-        print("Classic diag:", _diag_summary(diag))
-        print("FD health:", _health_summary(health))
+        print(f"Classic diag 0x{CAN_ID_TX_DIAG:03X}:", _diag_summary(diag))
+        print(f"FD health 0x{CAN_ID_TX_HEALTH:03X}:", _health_summary(health))
         if status is not None:
             print(
                 "ACK:",
@@ -185,6 +207,10 @@ def run_probe(args: argparse.Namespace) -> int:
             )
         else:
             print("Config: none")
+        print(
+            f"Telemetry 0x{CAN_ID_TX_TELEMETRY:03X}:",
+            f"{state['telemetry_frames']} frame(s)",
+        )
 
         if diag is None and health is None:
             print(
@@ -202,6 +228,17 @@ def run_probe(args: argparse.Namespace) -> int:
             print(
                 "RESULT: FD health is present, but GET_CONFIG ACK/config is "
                 "missing; check PC command format and MCU command handling."
+            )
+            return 2
+        if (
+            health is not None and
+            health.adc_running and
+            health.channel_mask_nonzero and
+            state["telemetry_frames"] == 0
+        ):
+            print(
+                "RESULT: acquisition is running with enabled channels, but "
+                "no telemetry was observed."
             )
             return 2
 

@@ -38,10 +38,9 @@ pg.setConfigOptions(useOpenGL=False, antialias=False)
 from can_protocol import (
     Baudrate,
     CANFrame,
+    CAN_ID_TX_CONTROL,
     CAN_ID_TX_DIAG,
     CAN_ID_TX_HEALTH,
-    CAN_ID_TX_CONFIG,
-    CAN_ID_TX_STATUS,
     CAN_ID_TX_TELEMETRY,
     CAN_STATUS_OK,
     CAN_FD_DATA_BITRATE,
@@ -97,6 +96,8 @@ WAVEFORM_BUFFER_SIZE = 5000
 PLOT_VISIBLE_SAMPLES = 300
 PLOT_MIN_Y_RANGE_MV = 0.05
 DEFAULT_PLOT_REFRESH_HZ = 60
+CAN_RECEIVER_TELEMETRY_QUEUE_LIMIT = 1024
+PHYSICAL_MODE_WARNING_THRESHOLD_SPS = 1000.0
 COMMAND_ACK_TIMEOUT_S = 2.0
 LONG_COMMAND_ACK_TIMEOUT_S = 15.0
 LONG_ACK_COMMANDS = frozenset((
@@ -744,10 +745,13 @@ TRANSLATIONS = {
         "filter_size_failed": "Failed to send filter size command",
         "sample_rate_failed": "Failed to send sample rate command",
         "telemetry_mode_failed": "Failed to send telemetry mode command",
+        "warning": "Warning",
+        "physical_mode_high_rate_warning": "Physical mode above 1000 SPS can overload the host display. Continue?",
+        "physical_mode_30000_warning": "Physical mode at 30000 SPS can overload the host display. Raw mode is recommended. Continue?",
         "stream_summary": "ADC {sample_rate} SPS | scan {scan_rate:.0f} fps | telemetry {telemetry_rate:.0f} samples/s | {mode}",
         "health": "System Health",
         "health_waiting": "Waiting for MCU health frame | RX {rx_rate:.0f} samples/s | protocol errors {bad}",
-        "health_waiting_with_diag": "MCU classic diag OK | main loop {main_loop} | last 0x100 {rx_format} | reject {reject} | TEC {tec} REC {rec} | no FD health yet",
+        "health_waiting_with_diag": "MCU classic diag OK | main loop {main_loop} | last 0x0F1 {rx_format} | reject {reject} | TEC {tec} REC {rec} | no FD health yet",
         "diag_yes": "yes",
         "diag_no": "no",
         "diag_rx_none": "none",
@@ -757,6 +761,7 @@ TRANSLATIONS = {
         "diag_format_classic": "classic CAN",
         "health_summary": "MCU {adc_state} | RX {rx_rate:.0f} samples/s | MCU TX {tx_samples} samples/s in {tx_frames} frames/s | ADC {sample_rate} SPS | {mode} | new drops {drop_delta}, total {tx_drop} | new overflows {overflow_delta}, total {overflow} | recoveries {recovery} | protocol errors {bad}",
         "adc_running": "RUN",
+        "adc_idle": "RUN / NO CHANNELS",
         "adc_stopped": "STOP",
         "save_zero_sent": "Save Zero command sent, waiting for device ACK",
         "save_zero_failed": "Failed to save zero offset",
@@ -885,10 +890,13 @@ TRANSLATIONS = {
         "filter_size_failed": "滤波长度命令发送失败",
         "sample_rate_failed": "采样率命令发送失败",
         "telemetry_mode_failed": "遥测模式命令发送失败",
+        "warning": "警告",
+        "physical_mode_high_rate_warning": "物理量模式超过 1000 SPS 时可能导致上位机显示过载。是否继续？",
+        "physical_mode_30000_warning": "物理量模式在 30000 SPS 时可能导致上位机显示过载，建议使用 Raw 模式。是否继续？",
         "stream_summary": "ADC {sample_rate} SPS | 扫描 {scan_rate:.0f} 帧/秒 | 遥测 {telemetry_rate:.0f} 样本/秒 | {mode}",
         "health": "系统健康状态",
         "health_waiting": "等待 MCU 健康帧 | 接收 {rx_rate:.0f} 样本/秒 | 协议错误 {bad}",
-        "health_waiting_with_diag": "已收到 MCU classic 诊断 | 主循环 {main_loop} | 最近 0x100 {rx_format} | 丢弃 {reject} | TEC {tec} REC {rec} | 尚无 FD 健康帧",
+        "health_waiting_with_diag": "已收到 MCU classic 诊断 | 主循环 {main_loop} | 最近 0x0F1 {rx_format} | 丢弃 {reject} | TEC {tec} REC {rec} | 尚无 FD 健康帧",
         "diag_yes": "是",
         "diag_no": "否",
         "diag_rx_none": "无",
@@ -898,6 +906,7 @@ TRANSLATIONS = {
         "diag_format_classic": "classic CAN",
         "health_summary": "MCU {adc_state} | 接收 {rx_rate:.0f} 样本/秒 | MCU 发送 {tx_samples} 样本/秒、{tx_frames} 帧/秒 | ADC {sample_rate} SPS | {mode} | 新增丢弃 {drop_delta}、累计 {tx_drop} | 新增溢出 {overflow_delta}、累计 {overflow} | 恢复 {recovery} | 协议错误 {bad}",
         "adc_running": "运行",
+        "adc_idle": "运行 / 未启用通道",
         "adc_stopped": "停止",
         "save_zero_sent": "保存零点命令已发送，正在等待设备确认",
         "save_zero_failed": "保存零点失败",
@@ -991,13 +1000,18 @@ class CANReceiver(QThread):
     frame_received = pyqtSignal(object)
     frames_available = pyqtSignal()
 
-    def __init__(self, can_bus: PythonCANInterface):
+    def __init__(
+        self,
+        can_bus: PythonCANInterface,
+        telemetry_queue_limit: int = CAN_RECEIVER_TELEMETRY_QUEUE_LIMIT,
+    ):
         super().__init__()
         self.can_bus = can_bus
         self.running = True
         self._queue_lock = Lock()
         self._control_frames = deque()
-        self._telemetry_frames = deque()
+        self._telemetry_frames = deque(maxlen=max(1, telemetry_queue_limit))
+        self._display_drop_count = 0
         self._control_drain_signal_pending = False
         self._callback = self._queue_frame
         self.can_bus.register_rx_callback(self._callback)
@@ -1010,6 +1024,8 @@ class CANReceiver(QThread):
         should_emit = False
         with self._queue_lock:
             if frame.id == CAN_ID_TX_TELEMETRY:
+                if len(self._telemetry_frames) == self._telemetry_frames.maxlen:
+                    self._display_drop_count += 1
                 self._telemetry_frames.append(frame)
             else:
                 self._control_frames.append(frame)
@@ -1035,6 +1051,12 @@ class CANReceiver(QThread):
                 for _ in range(min(telemetry_limit, len(self._telemetry_frames))):
                     telemetry_frames.append(self._telemetry_frames.popleft())
         return control_frames, telemetry_frames
+
+    def take_display_drop_count(self) -> int:
+        with self._queue_lock:
+            count = self._display_drop_count
+            self._display_drop_count = 0
+        return count
 
     def stop(self):
         self.running = False
@@ -2692,6 +2714,16 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         sample_rate = float(sample_rate)
+        if not self._confirm_high_rate_physical_mode(
+            sample_rate, self.telemetry_mode
+        ):
+            with QSignalBlocker(self.sample_rate_combo):
+                current_index = self.sample_rate_combo.findData(
+                    self.sample_rate_sps
+                )
+                if current_index >= 0:
+                    self.sample_rate_combo.setCurrentIndex(current_index)
+            return
 
         if sample_rate.is_integer():
             sample_rate_param = 0
@@ -2719,11 +2751,44 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         mode = int(mode)
+        if not self._confirm_high_rate_physical_mode(
+            self.sample_rate_sps, mode
+        ):
+            with QSignalBlocker(self.telemetry_mode_combo):
+                current_index = self.telemetry_mode_combo.findData(
+                    self.telemetry_mode
+                )
+                if current_index >= 0:
+                    self.telemetry_mode_combo.setCurrentIndex(current_index)
+            return
         if self.send_command(CAN_CMD_SET_TELEMETRY_MODE, param=0, value=mode):
             logger.info("Telemetry mode set to %s", mode)
         else:
             self._show_status("telemetry_mode_failed")
             logger.warning("Failed to send telemetry mode command")
+
+    def _confirm_high_rate_physical_mode(
+        self, sample_rate: float, mode: int
+    ) -> bool:
+        if (
+            mode != TELEMETRY_MODE_PHYSICAL or
+            sample_rate <= PHYSICAL_MODE_WARNING_THRESHOLD_SPS
+        ):
+            return True
+
+        message_key = (
+            "physical_mode_30000_warning"
+            if sample_rate >= 30000.0
+            else "physical_mode_high_rate_warning"
+        )
+        answer = QMessageBox.warning(
+            self,
+            self._tr("warning"),
+            self._tr(message_key),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def on_clear_zero_clicked(self):
         """Handle Clear Zero button click - clears offsets from Flash"""
@@ -2967,16 +3032,26 @@ class ReducerMonitorWindow(QMainWindow):
             self.health_adc_recovery_delta,
             self.rx_bad_protocol_count,
         )
-        state = "ok" if health.adc_running and not any(counters) else "warning"
+        state = (
+            "ok"
+            if health.adc_running and health.channel_mask_nonzero and
+            not any(counters)
+            else "warning"
+        )
         if not health.adc_running:
             state = "error"
+        adc_state_key = (
+            "adc_stopped"
+            if not health.adc_running
+            else "adc_idle"
+            if not health.channel_mask_nonzero
+            else "adc_running"
+        )
         self._set_health_status(
             state,
             self._tr(
                 "health_summary",
-                adc_state=self._tr(
-                    "adc_running" if health.adc_running else "adc_stopped"
-                ),
+                adc_state=self._tr(adc_state_key),
                 rx_rate=self.rx_telemetry_rate_hz,
                 sample_rate=self._format_sample_rate(health.sample_rate_sps),
                 mode=self._telemetry_mode_text(health.telemetry_mode),
@@ -3159,6 +3234,7 @@ class ReducerMonitorWindow(QMainWindow):
         if self.can_receiver is None:
             return
 
+        self.display_drop_count += self.can_receiver.take_display_drop_count()
         control_frames, telemetry_frames = self.can_receiver.take_pending_frames(
             telemetry_limit
         )
@@ -3227,9 +3303,8 @@ class ReducerMonitorWindow(QMainWindow):
 
         telemetry_frames = parse_telemetry_frames(frame)
         if telemetry_frames is None:
-            if frame.id in (CAN_ID_TX_TELEMETRY, CAN_ID_TX_STATUS,
-                            CAN_ID_TX_HEALTH, CAN_ID_TX_CONFIG,
-                            CAN_ID_TX_DIAG):
+            if frame.id in (CAN_ID_TX_CONTROL, CAN_ID_TX_HEALTH,
+                            CAN_ID_TX_DIAG, CAN_ID_TX_TELEMETRY):
                 self.rx_bad_protocol_count += 1
                 logger.warning("Rejected malformed protocol frame on CAN ID 0x%03X", frame.id)
             return
