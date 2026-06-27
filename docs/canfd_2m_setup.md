@@ -72,6 +72,23 @@ request; the GUI can fall back to lower speeds for connection testing, but
 maximum configured load, the SLCAN ASCII stream is about 875 frames/s, or roughly
 1.17 Mbit/s before any host-side margin.
 
+## candleLight Binary USB CAN FD
+
+Use the CANable 2.0 web updater to flash candleLight CAN FD firmware, then
+verify 64-byte FD+BRS transmit and receive at `500K / 2M` in Cangaroo. Close
+Cangaroo before opening the device from Python.
+
+Install the host dependency and bind the device to WinUSB on Windows:
+
+```powershell
+host_pc\python\.venv\Scripts\python.exe -m pip install "python-can-candle>=1.2.4,<2"
+```
+
+Select `candleLight/gs_usb CAN FD (binary USB)` in the GUI. Device discovery
+shows channels as `serial-number:channel`; entering `0` selects channel zero
+on the first matching device. The host configures nominal `500K`, data `2M`,
+CAN FD, and BRS through the `python-can-candle` backend.
+
 ## ADS1256 Performance
 
 SPI1 runs at `1.328125 Mbit/s`, below the ADS1256 `f_CLKIN / 2` serial clock
@@ -124,20 +141,7 @@ For a terminal smoke test:
 candump can0
 ```
 
-Telemetry should appear as CAN FD+BRS frames on ID `101`.
-
-## Other Windows Adapters
-
-The GUI also exposes CAN FD backends supported by `python-can`:
-
-| Adapter family | GUI interface | Default channel |
-|---|---|---|
-| PEAK PCAN-USB FD | `PCAN FD` | `PCAN_USBBUS1` |
-| HMS/IXXAT CAN FD | `IXXAT FD` | `0` |
-| Vector CAN FD | `Vector FD` | `0` |
-
-Install the vendor driver before starting the GUI. For PCAN, use a PCAN
-adapter with FD support; classic PCAN-USB hardware is not sufficient.
+Telemetry should appear as CAN FD+BRS frames on ID `110`.
 
 ## Build And Flash
 

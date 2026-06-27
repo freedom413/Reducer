@@ -632,6 +632,10 @@ class PythonCANInterface:
             raise RuntimeError("python-can is not installed")
         self.last_error = None
         self.last_slcan_probe = None
+        if interface not in ("slcan", "candle", "socketcan"):
+            self.last_error = f"Unsupported CAN interface: {interface}"
+            logger.error(self.last_error)
+            return False
 
         normalized_channel = self._normalize_channel(interface, channel)
         if interface == "slcan":
@@ -663,13 +667,11 @@ class PythonCANInterface:
             kwargs["timing"] = self._can_fd_timing(bitrate)
             kwargs["tty_baudrate"] = int(tty_baudrate)
             kwargs["sleep_after_open"] = sleep_after_open
-        elif interface == "pcan":
-            kwargs["fd"] = True
-            kwargs["timing"] = self._can_fd_timing(bitrate)
-        else:
+        elif interface == "candle":
             kwargs["bitrate"] = bitrate.bps
             kwargs["data_bitrate"] = CAN_FD_DATA_BITRATE
             kwargs["fd"] = True
+            kwargs["ignore_config"] = True
 
         try:
             self.bus = can.Bus(**kwargs)
@@ -737,7 +739,7 @@ class PythonCANInterface:
 
     @staticmethod
     def _normalize_channel(interface: str, channel: str):
-        if interface in ("ixxat", "vector") and str(channel).isdigit():
+        if interface == "candle" and str(channel).isdigit():
             return int(channel)
         return channel
 
@@ -755,22 +757,18 @@ class PythonCANInterface:
 def available_interfaces() -> List[Tuple[str, str]]:
     return [
         ("slcan", "CANable 2.0 SLCAN FD (serial USB-CAN)"),
+        ("candle", "candleLight/gs_usb CAN FD (binary USB)"),
         ("socketcan", "SocketCAN FD (Linux canX/vcanX)"),
-        ("pcan", "PCAN FD (Windows PCAN-Basic)"),
-        ("ixxat", "IXXAT FD (Windows VCI)"),
-        ("vector", "Vector FD (Windows XL Driver)"),
     ]
 
 
 def list_can_channels(interface: str) -> List[Tuple[str, str]]:
     if interface == "slcan":
         return _list_slcan_channels()
+    if interface == "candle":
+        return _list_candle_channels()
     if interface == "socketcan":
         return _list_socketcan_channels()
-    if interface == "pcan":
-        return [("PCAN_USBBUS1", "PCAN USB channel 1")]
-    if interface in ("ixxat", "vector"):
-        return [("0", "CAN channel 0")]
     return []
 
 
@@ -799,6 +797,26 @@ def _list_slcan_channels() -> List[Tuple[str, str]]:
         result.append((device, label))
 
     return result or [(fallback_port, fallback_port)]
+
+
+def _list_candle_channels() -> List[Tuple[str, str]]:
+    if can is None:
+        return []
+
+    try:
+        configs = can.detect_available_configs("candle")
+    except Exception as exc:
+        logger.warning("Failed to discover candleLight devices: %s", exc)
+        return []
+
+    channels = []
+    for config in configs:
+        channel = config.get("channel")
+        if channel is None:
+            continue
+        channel = str(channel)
+        channels.append((channel, f"candleLight {channel}"))
+    return channels
 
 
 def _list_socketcan_channels() -> List[Tuple[str, str]]:

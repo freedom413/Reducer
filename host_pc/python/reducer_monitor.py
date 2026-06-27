@@ -2,7 +2,7 @@
 reducer_monitor.py - Reducer Flexspline State Monitoring GUI
 
 A PyQt6-based real-time monitoring application for the Reducer Flexspline
-State Detection System. Uses CANable 2.0 SLCAN FD and python-can adapters.
+State Detection System using SLCAN, candleLight, or SocketCAN FD.
 """
 
 import csv
@@ -731,6 +731,7 @@ TRANSLATIONS = {
         "failed_import_csv": "Failed to import CSV: {error}",
         "please_select_channel": "Please select a CAN channel or serial port",
         "slcan_help": "Check the COM port and CANable 2.0 SLCAN FD firmware.",
+        "candle_help": "Check candleLight CAN FD firmware and the WinUSB/libusb driver.",
         "socketcan_help": "If using socketcan, make sure the interface is already up.",
         "failed_connect_target": "Failed to connect to {interface}:{channel}\n{help}",
         "connection_failed": "Connection failed: {error}",
@@ -876,6 +877,7 @@ TRANSLATIONS = {
         "failed_import_csv": "导入 CSV 失败：{error}",
         "please_select_channel": "请选择 CAN 通道或串口",
         "slcan_help": "请检查串口名称和 CANable 2.0 SLCAN FD 固件。",
+        "candle_help": "请检查 candleLight CAN FD 固件和 WinUSB/libusb 驱动。",
         "socketcan_help": "使用 socketcan 时，请确认接口已经启用。",
         "failed_connect_target": "连接 {interface}:{channel} 失败\n{help}",
         "connection_failed": "连接失败：{error}",
@@ -1883,12 +1885,21 @@ class ReducerMonitorWindow(QMainWindow):
         avg_lbl.setText(f"{self._tr('avg')}: {avg:.3f} mV")
 
     def _on_interface_changed(self, _index: int):
-        self._refresh_channels()
+        self._update_transport_controls()
+        self._refresh_channels(preserve_selection=False)
 
-    def _refresh_channels(self):
+    def _update_transport_controls(self):
+        is_slcan = self.interface_combo.currentData() == "slcan"
+        self.slcan_speed_label.setVisible(is_slcan)
+        self.slcan_speed_combo.setVisible(is_slcan)
+        self.slcan_speed_combo.setEnabled(
+            is_slcan and self.interface_combo.isEnabled()
+        )
+
+    def _refresh_channels(self, preserve_selection: bool = True):
         """Refresh the list of available CAN channels"""
         interface = self.interface_combo.currentData()
-        selected_channel = self._selected_channel()
+        selected_channel = self._selected_channel() if preserve_selection else ""
         self.channel_combo.clear()
         for channel, desc in list_can_channels(interface):
             label = channel if not desc or desc == channel else f"{channel} - {desc}"
@@ -1896,9 +1907,7 @@ class ReducerMonitorWindow(QMainWindow):
         if self.channel_combo.count() == 0:
             fallback_channel = {
                 "slcan": "COM1",
-                "pcan": "PCAN_USBBUS1",
-                "ixxat": "0",
-                "vector": "0",
+                "candle": "0",
             }.get(interface, "can0")
             self.channel_combo.addItem(fallback_channel, fallback_channel)
 
@@ -1912,7 +1921,9 @@ class ReducerMonitorWindow(QMainWindow):
     def _set_connection_controls_enabled(self, enabled: bool):
         self.interface_combo.setEnabled(enabled)
         self.channel_combo.setEnabled(enabled)
-        self.slcan_speed_combo.setEnabled(enabled)
+        self.slcan_speed_combo.setEnabled(
+            enabled and self.interface_combo.currentData() == "slcan"
+        )
         self.refresh_btn.setEnabled(enabled)
 
     @staticmethod
@@ -3105,11 +3116,12 @@ class ReducerMonitorWindow(QMainWindow):
                     connected = True
                     break
             if not connected:
-                interface_help = (
-                    self._tr("slcan_help")
-                    if interface == "slcan"
-                    else self._tr("socketcan_help")
-                )
+                help_key = {
+                    "slcan": "slcan_help",
+                    "candle": "candle_help",
+                    "socketcan": "socketcan_help",
+                }.get(interface, "socketcan_help")
+                interface_help = self._tr(help_key)
                 if self.can_bus is not None and self.can_bus.last_error:
                     interface_help = f"{interface_help}\n{self.can_bus.last_error}"
                 QMessageBox.critical(
@@ -3170,14 +3182,23 @@ class ReducerMonitorWindow(QMainWindow):
                     "connected_device", interface=interface, channel=channel
                 )
 
-            logger.info(
-                "Connected to %s:%s (CAN FD bitrate %s/%s, USB serial %s)",
-                interface,
-                channel,
-                baudrate.bps,
-                CAN_FD_DATA_BITRATE,
-                tty_baudrate if interface == "slcan" else "n/a",
-            )
+            if interface == "slcan":
+                logger.info(
+                    "Connected to %s:%s (CAN FD bitrate %s/%s, USB serial %s)",
+                    interface,
+                    channel,
+                    baudrate.bps,
+                    CAN_FD_DATA_BITRATE,
+                    tty_baudrate,
+                )
+            else:
+                logger.info(
+                    "Connected to %s:%s (CAN FD bitrate %s/%s)",
+                    interface,
+                    channel,
+                    baudrate.bps,
+                    CAN_FD_DATA_BITRATE,
+                )
 
         except Exception as e:
             QMessageBox.critical(

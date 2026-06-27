@@ -551,11 +551,13 @@ class TestProtocolHelpers(unittest.TestCase):
             CANFrame(id=CAN_ID_TX_STATUS, data=status, is_remote=True)
         ))
 
-    def test_available_interfaces_prioritizes_slcan(self):
+    def test_available_interfaces_only_exposes_supported_transports(self):
         interfaces = available_interfaces()
 
-        self.assertGreaterEqual(len(interfaces), 1)
-        self.assertEqual(interfaces[0][0], "slcan")
+        self.assertEqual(
+            [interface for interface, _label in interfaces],
+            ["slcan", "candle", "socketcan"],
+        )
 
     def test_list_slcan_channels_uses_serial_ports(self):
         fake_port = MagicMock()
@@ -568,6 +570,36 @@ class TestProtocolHelpers(unittest.TestCase):
             channels = list_can_channels("slcan")
 
         self.assertEqual(channels, [("COM9", "USB-CAN Adapter (VID:PID=1D50:606F)")])
+
+    def test_list_candle_channels_uses_python_can_discovery(self):
+        configs = [
+            {"interface": "candle", "channel": "ABC123:0"},
+            {"interface": "candle", "channel": "ABC123:1"},
+        ]
+
+        with patch(
+            "can_protocol.can.detect_available_configs",
+            return_value=configs,
+        ) as detect:
+            channels = list_can_channels("candle")
+
+        detect.assert_called_once_with("candle")
+        self.assertEqual(
+            channels,
+            [
+                ("ABC123:0", "candleLight ABC123:0"),
+                ("ABC123:1", "candleLight ABC123:1"),
+            ],
+        )
+
+    def test_list_candle_channels_returns_empty_when_discovery_fails(self):
+        with patch(
+            "can_protocol.can.detect_available_configs",
+            side_effect=RuntimeError("USB backend unavailable"),
+        ):
+            channels = list_can_channels("candle")
+
+        self.assertEqual(channels, [])
 
     def test_python_can_interface_connect_slcan_passes_canable2_fd_settings(self):
         bus_instance = MagicMock()
@@ -604,6 +636,75 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertIsNone(interface.last_error)
         self.assertIs(interface.last_slcan_probe, probe_result)
         mock_probe.assert_called_once_with("COM7", 460800)
+
+    def test_python_can_interface_connect_candle_passes_binary_fd_settings(self):
+        bus_instance = MagicMock()
+        notifier_instance = MagicMock()
+
+        with patch(
+            "can_protocol.can.Bus", return_value=bus_instance
+        ) as mock_bus, patch(
+            "can_protocol.can.Notifier", return_value=notifier_instance
+        ), patch("can_protocol.probe_slcan_fd_adapter") as mock_probe:
+            interface = PythonCANInterface()
+            connected = interface.connect(
+                "candle",
+                "ABC123:1",
+                Baudrate.BAUD_500K,
+                tty_baudrate=115200,
+            )
+
+        self.assertTrue(connected)
+        self.assertEqual(
+            mock_bus.call_args.kwargs,
+            {
+                "interface": "candle",
+                "channel": "ABC123:1",
+                "bitrate": 500000,
+                "data_bitrate": CAN_FD_DATA_BITRATE,
+                "fd": True,
+                "ignore_config": True,
+            },
+        )
+        self.assertIsNone(interface.tty_baudrate)
+        self.assertIsNone(interface.last_slcan_probe)
+        mock_probe.assert_not_called()
+
+    def test_python_can_interface_rejects_unsupported_transport(self):
+        with patch("can_protocol.can.Bus") as mock_bus:
+            interface = PythonCANInterface()
+            connected = interface.connect(
+                "unsupported", "channel", Baudrate.BAUD_500K
+            )
+
+        self.assertFalse(connected)
+        self.assertIn("Unsupported CAN interface", interface.last_error)
+        mock_bus.assert_not_called()
+
+    def test_python_can_interface_connect_socketcan_enables_fd(self):
+        with patch("can_protocol.can.Bus", return_value=MagicMock()) as mock_bus, patch(
+            "can_protocol.can.Notifier", return_value=MagicMock()
+        ):
+            connected = PythonCANInterface().connect(
+                "socketcan", "can0", Baudrate.BAUD_500K
+            )
+
+        self.assertTrue(connected)
+        self.assertEqual(
+            mock_bus.call_args.kwargs,
+            {"interface": "socketcan", "channel": "can0", "fd": True},
+        )
+
+    def test_python_can_interface_normalizes_numeric_candle_channel(self):
+        with patch("can_protocol.can.Bus", return_value=MagicMock()) as mock_bus, patch(
+            "can_protocol.can.Notifier", return_value=MagicMock()
+        ):
+            connected = PythonCANInterface().connect(
+                "candle", "0", Baudrate.BAUD_500K
+            )
+
+        self.assertTrue(connected)
+        self.assertEqual(mock_bus.call_args.kwargs["channel"], 0)
 
     def test_python_can_interface_aborts_when_slcan_preflight_returns_bel(self):
         probe_result = SlcanFdProbeResult(
@@ -762,6 +863,24 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertTrue(received[0].is_fd)
         self.assertTrue(received[0].bitrate_switch)
 
+    def test_python_can_listener_preserves_64_byte_fd_brs_frame(self):
+        received = []
+        listener = _PythonCanListener([received.append])
+        msg = MagicMock()
+        msg.arbitration_id = CAN_ID_TX_TELEMETRY
+        msg.data = bytes(range(64))
+        msg.is_extended_id = False
+        msg.is_remote_frame = False
+        msg.is_fd = True
+        msg.bitrate_switch = True
+        msg.timestamp = 1.25
+
+        listener(msg)
+
+        self.assertEqual(received[0].data, bytes(range(64)))
+        self.assertTrue(received[0].is_fd)
+        self.assertTrue(received[0].bitrate_switch)
+
     def test_python_can_send_uses_bounded_timeout(self):
         bus_instance = MagicMock()
         message = MagicMock()
@@ -775,6 +894,27 @@ class TestProtocolHelpers(unittest.TestCase):
         bus_instance.send.assert_called_once_with(
             message, timeout=DEFAULT_CAN_SEND_TIMEOUT_S
         )
+
+    def test_python_can_send_preserves_64_byte_fd_brs_frame(self):
+        bus_instance = MagicMock()
+        interface = PythonCANInterface()
+        interface.bus = bus_instance
+        payload = bytes(range(64))
+
+        with patch("can_protocol.can.Message") as message_type:
+            sent = interface.send_frame(
+                CANFrame(
+                    id=CAN_ID_TX_TELEMETRY,
+                    data=payload,
+                    is_fd=True,
+                    bitrate_switch=True,
+                )
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(message_type.call_args.kwargs["data"], payload)
+        self.assertTrue(message_type.call_args.kwargs["is_fd"])
+        self.assertTrue(message_type.call_args.kwargs["bitrate_switch"])
 
 
 class TestChannelData(unittest.TestCase):
@@ -1949,6 +2089,52 @@ class TestReducerMonitorWindow(unittest.TestCase):
             self.window.slcan_speed_combo.currentData(),
             DEFAULT_SLCAN_TTY_BAUDRATE,
         )
+
+    def test_slcan_serial_speed_controls_only_show_for_slcan(self):
+        slcan_index = self.window.interface_combo.findData("slcan")
+        candle_index = self.window.interface_combo.findData("candle")
+        socketcan_index = self.window.interface_combo.findData("socketcan")
+
+        self.assertGreaterEqual(candle_index, 0)
+        self.window.interface_combo.setCurrentIndex(candle_index)
+        self.assertTrue(self.window.slcan_speed_label.isHidden())
+        self.assertTrue(self.window.slcan_speed_combo.isHidden())
+        self.assertFalse(self.window.slcan_speed_combo.isEnabled())
+
+        self.window.interface_combo.setCurrentIndex(socketcan_index)
+        self.assertTrue(self.window.slcan_speed_label.isHidden())
+        self.assertTrue(self.window.slcan_speed_combo.isHidden())
+
+        self.window.interface_combo.setCurrentIndex(slcan_index)
+        self.assertFalse(self.window.slcan_speed_label.isHidden())
+        self.assertFalse(self.window.slcan_speed_combo.isHidden())
+        self.assertTrue(self.window.slcan_speed_combo.isEnabled())
+
+    def test_candle_channel_falls_back_to_zero(self):
+        candle_index = self.window.interface_combo.findData("candle")
+
+        with patch("reducer_monitor.list_can_channels", return_value=[]):
+            self.window.interface_combo.setCurrentIndex(candle_index)
+
+        self.assertEqual(self.window.channel_combo.currentData(), "0")
+        self.assertEqual(self.window._selected_channel(), "0")
+
+    def test_candle_connection_failure_shows_binary_usb_help(self):
+        self._switch_to_english()
+        candle_index = self.window.interface_combo.findData("candle")
+        self.window.interface_combo.setCurrentIndex(candle_index)
+        fake_bus = MagicMock()
+        fake_bus.connect.return_value = False
+        fake_bus.last_error = "backend missing"
+
+        with patch(
+            "reducer_monitor.PythonCANInterface", return_value=fake_bus
+        ), patch("reducer_monitor.QMessageBox.critical") as critical:
+            self.window.connect()
+
+        message = critical.call_args.args[2]
+        self.assertIn("WinUSB/libusb", message)
+        self.assertIn("backend missing", message)
 
     def test_command_fails_when_disconnected(self):
         self.window.is_connected = False

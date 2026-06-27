@@ -7,8 +7,8 @@ STM32G431 + 双 ADS1256 的 8 通道柔轮状态采集系统。固件负责采�
 - 仲裁段：`500 kbit/s`
 - 数据段：`2 Mbit/s`
 - 速率摘要：`500K / 2M`
-- 推荐适配器：CANable 2.0 官方 SLCAN FD 固件
-- CANable 2.0 使用 USB CDC 虚拟串口，主机设置的串口波特率不会限制 USB 吞吐。
+- 支持接口：SLCAN FD、candleLight/gs_usb 二进制 USB CAN FD、Linux SocketCAN FD
+- 高采样率优先使用 candleLight 二进制 USB；SLCAN 保留为串口兼容接口。
 - 配置说明：[docs/canfd_2m_setup.md](docs/canfd_2m_setup.md)
 
 ## 当前能力
@@ -19,7 +19,7 @@ STM32G431 + 双 ADS1256 的 8 通道柔轮状态采集系统。固件负责采�
 - Raw 帧最多打包 14 条记录，Physical 帧最多打包 6 条记录；当前不做遥测抽取，全部采样记录进入发送队列。
 - MCU 每秒发送健康帧，上报采样率、实际样本/帧速率、CAN TX 丢弃、ADC 缓冲区溢出、自动恢复次数和运行状态。
 - Flash 配置使用 64 字节记录和 CRC32，保存零点、通道、PGA、采样率、滤波窗口和遥测模式。
-- 上位机使用官方 `python-can` SLCAN FD 扩展，支持 CANable 2.0 的 `S6`、`Y2` 和 FD+BRS `b` 帧。
+- 上位机统一使用 `python-can`，并通过 `python-can-candle` 支持 candleLight/gs_usb 类二进制 USB CAN FD。
 - GUI 支持最多 8 张动态图表、指标叠加、通道订阅、设备健康、ACK、CSV 记录和离线 CSV 回放。
 
 ## 目录结构
@@ -84,14 +84,15 @@ host_pc\python\.venv\Scripts\python.exe -m unittest host_pc.python.test_gui
 host_pc\python\.venv\Scripts\python.exe host_pc\python\reducer_monitor.py
 ```
 
-GUI 中选择 `CANable 2.0 SLCAN FD` 和对应 `COMx`。CAN 波特率固定为 `500K / 2M FD+BRS`。
-Cangaroo 与 Python GUI/`can_link_probe.py` 不能同时占用同一个 COM 口；运行 Python 工具前必须关闭 Cangaroo 的测量连接。
+GUI 只提供 `SLCAN FD`、`candleLight/gs_usb CAN FD` 和 `SocketCAN FD`。
+candleLight 在 Windows 下使用 WinUSB，自动发现通道格式为 `序列号:通道`，也可输入 `0` 选择首个设备的通道零。CAN 波特率固定为 `500K / 2M FD+BRS`。
+Cangaroo 与 Python GUI/`can_link_probe.py` 不能同时占用同一个适配器；运行 Python 工具前必须关闭 Cangaroo 的测量连接。
 
 ## 联调顺序
 
 1. 烧录 `build/Debug/Reducer.elf`，检查 CANH、CANL、共地和两端 `120 ohm` 终端电阻。
-2. 先运行 `host_pc/python/can_link_probe.py --channel COMx`，确认 classic 诊断、FD health、ACK 和 config 都能收到。
-3. 启动 GUI，选择 CANable 2.0 SLCAN FD 和正确串口后连接。
+2. 先运行 `host_pc/python/can_link_probe.py --interface candle --channel 0`；使用 SLCAN 时改为 `--interface slcan --channel COMx`。
+3. 启动 GUI，选择对应的 candle、SLCAN 或 SocketCAN 通道后连接。
 4. 确认 `0x110` 遥测持续到达，`0x0F2` 健康信息每秒刷新。
 5. 点击校准并确认收到 `0x0F0` ACK。
 6. 从 `100 SPS` 逐步提高到 `30000 SPS`，观察实际遥测速率、TX 丢弃和 ADC 溢出。

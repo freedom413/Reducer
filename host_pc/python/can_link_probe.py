@@ -22,6 +22,7 @@ from can_protocol import (
     CAN_ID_TX_TELEMETRY,
     DEFAULT_SLCAN_TTY_BAUDRATE,
     PythonCANInterface,
+    available_interfaces,
     build_command_frame,
     parse_config_frame,
     parse_diag_frame,
@@ -254,7 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--interface",
         default="slcan",
-        help="python-can interface, default: slcan",
+        choices=[name for name, _label in available_interfaces()],
+        help="CAN transport, default: slcan",
     )
     parser.add_argument(
         "--timeout",
