@@ -101,6 +101,7 @@ int flash_storage_load_config(persistent_config_t *config)
 int flash_storage_save_config(persistent_config_t *config)
 {
     persistent_config_t latest;
+    persistent_config_t verified;
     uint32_t address;
     int ret;
 
@@ -139,7 +140,12 @@ int flash_storage_save_config(persistent_config_t *config)
         }
     }
     flash_ops->lock();
-    return config_valid(config) ? 0 : -3;
+    flash_ops->read(address, &verified, sizeof(verified));
+    if (!config_valid(&verified) ||
+        memcmp(&verified, config, sizeof(verified)) != 0) {
+        return -3;
+    }
+    return 0;
 }
 
 int flash_storage_save_zero(const int32_t *offset)

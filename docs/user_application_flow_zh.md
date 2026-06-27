@@ -47,9 +47,9 @@
 
 `filter_apply()` 执行滑动平均并扣除零点偏移，滤波窗口可设置为 `2..64`。
 
-应用层不会剔除突变值。真实负载阶跃和异常值在这一层无法可靠区分，因此突变必须进入遥测。Welford 运行统计仍保留在 MCU 内部，供诊断使用。
+应用层不会剔除突变值。真实负载阶跃和异常值在这一层无法可靠区分，因此突变必须进入遥测。运行时电压统计由上位机 GUI 维护，MCU 当前未维护 Welford 统计量。
 
-8 个通道的零点偏移和运行配置存储在 STM32 最后一页 Flash 中。每条为 64 字节记录，使用 CRC32、版本和 magic 校验。显式零点或配置变更后才会写入 Flash。
+8 个通道的零点偏移和运行配置存储在 STM32 最后一页 Flash 中。每条为 64 字节记录，使用 CRC32、版本和 magic 校验。显式零点或配置变更后才会写入 Flash；每次写入后都会回读记录、校验 CRC，并逐字节比较后才报告成功。当前仍为单页追加日志；如需更强的掉电安全保证，后续应升级为双页 journal。
 
 ## CAN FD 协议
 
@@ -57,13 +57,13 @@
 
 | 方向 | ID | 类型 | 长度 | 用途 |
 |---|---:|---:|---:|---|
-| PC -> MCU | `0x100` | `0xA0` | 12 FD+BRS | 命令 |
 | MCU -> PC | `0x0F0` | `0xA1` | 12 FD+BRS | 命令 ACK/status |
-| MCU -> PC | `0x101` | `0x54` | 64 FD+BRS | Raw 批量遥测 |
-| MCU -> PC | `0x101` | `0x55` | 64 FD+BRS | 物理量批量遥测 |
-| MCU -> PC | `0x103` | `0x52` | 24 FD+BRS | 每秒健康信息 |
-| MCU -> PC | `0x104` | `0x56` | 64 FD+BRS | 配置快照 |
+| MCU -> PC | `0x0F0` | `0x56` | 64 FD+BRS | 配置快照 |
+| PC -> MCU | `0x0F1` | `0xA0` | 12 FD+BRS | 命令 |
+| MCU -> PC | `0x0F2` | `0x52` | 24 FD+BRS | 每秒健康信息 |
 | MCU -> PC | `0x0FF` | `0x57` | 8 classic CAN | 链路诊断心跳 |
+| MCU -> PC | `0x110` | `0x54` | 64 FD+BRS | Raw 批量遥测 |
+| MCU -> PC | `0x110` | `0x55` | 64 FD+BRS | 物理量批量遥测 |
 
 命令帧：
 
@@ -120,7 +120,7 @@ byte 12-13: 遥测样本/秒，uint16 LE
 byte 14-15: 遥测帧/秒，uint16 LE
 byte 16: 活动 ADC 数量
 byte 17: 遥测模式
-byte 18: flags，bit 0 表示采集运行中，bit 1 表示配置待保存，bit 2 表示零点有效
+byte 18: flags，bit 0 表示 ADC 硬件运行中，bit 1 表示配置待保存，bit 2 表示零点有效，bit 3 表示通道掩码非零
 byte 19-23: 保留
 ```
 
@@ -129,7 +129,7 @@ byte 19-23: 保留
 ```text
 byte 0: 类型 0x57
 byte 1: flags，CAN ready/主循环/最近 RX FD/最近 RX BRS/bus-off/passive
-byte 2: 最近 0x100 DLC 字节数
+byte 2: 最近 0x0F1 DLC 字节数
 byte 3: 最近命令拒绝原因
 byte 4: FDCAN TX error counter
 byte 5: FDCAN RX error counter

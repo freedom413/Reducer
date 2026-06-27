@@ -30,6 +30,7 @@ from can_protocol import (
     CAN_FRAME_TYPE_HEALTH,
     CAN_HEALTH_VERSION,
     CAN_ID_RX_COMMAND,
+    CAN_ID_TX_CONTROL,
     CAN_ID_TX_DIAG,
     CAN_ID_TX_HEALTH,
     CAN_ID_TX_CONFIG,
@@ -207,6 +208,7 @@ def build_health_v2_payload(
     active_adc_count: int = 2,
     mode: int = TELEMETRY_MODE_RAW,
     running: bool = True,
+    channel_mask_nonzero: bool = True,
 ) -> bytes:
     payload = bytearray(24)
     payload[0] = CAN_FRAME_TYPE_HEALTH
@@ -219,7 +221,7 @@ def build_health_v2_payload(
     payload[14:16] = telemetry_frames_per_second.to_bytes(2, "little")
     payload[16] = active_adc_count
     payload[17] = mode
-    payload[18] = 1 if running else 0
+    payload[18] = (1 if running else 0) | (0x08 if channel_mask_nonzero else 0)
     return bytes(payload)
 
 
@@ -261,18 +263,30 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.value, 2_498_500)
 
-    def test_status_ack_id_has_higher_priority_than_command_and_telemetry(self):
-        self.assertEqual(CAN_ID_TX_STATUS, 0x0F0)
-        self.assertLess(CAN_ID_TX_STATUS, CAN_ID_RX_COMMAND)
-        self.assertLess(CAN_ID_TX_STATUS, CAN_ID_TX_TELEMETRY)
-
-    def test_diag_id_can_preempt_fd_health_config_without_preempting_ack(self):
+    def test_protocol_uses_final_priority_ordered_can_ids(self):
+        self.assertEqual(CAN_ID_TX_CONTROL, 0x0F0)
+        self.assertEqual(CAN_ID_TX_STATUS, CAN_ID_TX_CONTROL)
+        self.assertEqual(CAN_ID_TX_CONFIG, CAN_ID_TX_CONTROL)
+        self.assertEqual(CAN_ID_RX_COMMAND, 0x0F1)
+        self.assertEqual(CAN_ID_TX_HEALTH, 0x0F2)
         self.assertEqual(CAN_ID_TX_DIAG, 0x0FF)
-        self.assertGreater(CAN_ID_TX_DIAG, CAN_ID_TX_STATUS)
-        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_RX_COMMAND)
-        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_TX_TELEMETRY)
-        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_TX_HEALTH)
-        self.assertLess(CAN_ID_TX_DIAG, CAN_ID_TX_CONFIG)
+        self.assertEqual(CAN_ID_TX_TELEMETRY, 0x110)
+        self.assertEqual(
+            [
+                CAN_ID_TX_CONTROL,
+                CAN_ID_RX_COMMAND,
+                CAN_ID_TX_HEALTH,
+                CAN_ID_TX_DIAG,
+                CAN_ID_TX_TELEMETRY,
+            ],
+            sorted({
+                CAN_ID_TX_CONTROL,
+                CAN_ID_RX_COMMAND,
+                CAN_ID_TX_HEALTH,
+                CAN_ID_TX_DIAG,
+                CAN_ID_TX_TELEMETRY,
+            }),
+        )
 
     def test_legacy_status_ack_id_is_not_accepted(self):
         payload = bytes([
@@ -497,7 +511,17 @@ class TestProtocolHelpers(unittest.TestCase):
         self.assertEqual(parsed.telemetry_mode, TELEMETRY_MODE_RAW)
         self.assertEqual(parsed.telemetry_samples_per_second, 8748)
         self.assertEqual(parsed.telemetry_frames_per_second, 625)
+        self.assertTrue(parsed.channel_mask_nonzero)
+
+    def test_health_distinguishes_running_adc_with_zero_channel_mask(self):
+        parsed = parse_health_frame(CANFrame(
+            id=CAN_ID_TX_HEALTH,
+            data=build_health_v2_payload(running=True, channel_mask_nonzero=False),
+        ))
+
+        self.assertIsNotNone(parsed)
         self.assertTrue(parsed.adc_running)
+        self.assertFalse(parsed.channel_mask_nonzero)
 
     def test_parse_rejects_bad_crc(self):
         payload = bytearray(build_telemetry_payload(channel=0, voltage_001mv=100, strain_ue=50, stress_01mpa=5))
@@ -687,7 +711,7 @@ class TestProtocolHelpers(unittest.TestCase):
             )
             bus.send(
                 python_can.Message(
-                    arbitration_id=0x100,
+                    arbitration_id=CAN_ID_RX_COMMAND,
                     data=bytes([0xA0, 1, 2, 3, 4, 5, 6, 7]),
                     is_extended_id=False,
                     is_fd=True,
@@ -697,7 +721,7 @@ class TestProtocolHelpers(unittest.TestCase):
             batch_data = bytes(range(64))
             bus.send(
                 python_can.Message(
-                    arbitration_id=0x101,
+                    arbitration_id=CAN_ID_TX_TELEMETRY,
                     data=batch_data,
                     is_extended_id=False,
                     is_fd=True,
@@ -708,12 +732,12 @@ class TestProtocolHelpers(unittest.TestCase):
 
         serial_writes = [call.args[0] for call in serial_port.write.call_args_list]
         self.assertEqual(serial_writes[:4], [b"C\r", b"S6\r", b"Y2\r", b"O\r"])
-        self.assertIn(b"b1008A001020304050607\r", serial_writes)
-        self.assertIn(b"b101F" + batch_data.hex().upper().encode() + b"\r", serial_writes)
+        self.assertIn(b"b0F18A001020304050607\r", serial_writes)
+        self.assertIn(b"b110F" + batch_data.hex().upper().encode() + b"\r", serial_writes)
 
     def test_default_slcan_tty_baudrate_covers_worst_case_fd_ascii_load(self):
         max_fd_frames_per_second = 875
-        slcan_64_byte_fd_brs_chars = len("b101F" + ("00" * 64) + "\r")
+        slcan_64_byte_fd_brs_chars = len("b110F" + ("00" * 64) + "\r")
         required_bps = max_fd_frames_per_second * slcan_64_byte_fd_brs_chars * 10
 
         self.assertGreaterEqual(DEFAULT_SLCAN_TTY_BAUDRATE, required_bps)
@@ -836,8 +860,39 @@ class TestCANReceiver(unittest.TestCase):
         self.assertEqual(telemetry_frames, [])
         receiver.stop()
 
+    def test_drops_oldest_telemetry_when_first_stage_queue_is_full(self):
+        can_bus = MagicMock()
+        receiver = CANReceiver(can_bus, telemetry_queue_limit=2)
+        callback = can_bus.register_rx_callback.call_args.args[0]
+        frames = [
+            CANFrame(id=CAN_ID_TX_TELEMETRY, data=build_raw_v2_payload([(0, value)]))
+            for value in (1, 2, 3)
+        ]
+
+        for frame in frames:
+            callback(frame)
+
+        _, telemetry_frames = receiver.take_pending_frames()
+        self.assertEqual(telemetry_frames, frames[1:])
+        self.assertEqual(receiver.take_display_drop_count(), 1)
+        self.assertEqual(receiver.take_display_drop_count(), 0)
+        receiver.stop()
+
 
 class TestFirmwareSource(unittest.TestCase):
+    def test_flash_save_reads_back_and_validates_programmed_record(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "Application" / "algorithm" / "flash_storage.c").read_text(
+            encoding="utf-8"
+        )
+        save_body = source.split("int flash_storage_save_config", 1)[1].split(
+            "int flash_storage_save_zero", 1
+        )[0]
+
+        self.assertIn("flash_ops->read(address, &verified, sizeof(verified));", save_body)
+        self.assertIn("config_valid(&verified)", save_body)
+        self.assertIn("memcmp(&verified, config, sizeof(verified))", save_body)
+
     def test_channel_mask_command_requests_persistent_save(self):
         user_c = Path(__file__).resolve().parents[2] / "Application" / "user.c"
         source = user_c.read_text(encoding="utf-8")
@@ -1755,6 +1810,20 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertEqual(int.from_bytes(sent_frame.data[6:10], "little"), TELEMETRY_MODE_PHYSICAL)
         self.assertEqual(self.window.telemetry_mode, TELEMETRY_MODE_RAW)
 
+    @patch.object(reducer_monitor_module.QMessageBox, "warning")
+    def test_high_rate_physical_mode_requires_confirmation(self, warning):
+        warning.return_value = reducer_monitor_module.QMessageBox.StandardButton.No
+        self.window.sample_rate_sps = 30000
+        self.window.can_bus.send_frame.reset_mock()
+
+        self.window.telemetry_mode_combo.setCurrentIndex(
+            self.window.telemetry_mode_combo.findData(TELEMETRY_MODE_PHYSICAL)
+        )
+
+        warning.assert_called_once()
+        self.assertIn("Raw", warning.call_args.args[2])
+        self.window.can_bus.send_frame.assert_not_called()
+
     def test_all_ads1256_sample_rates_are_available(self):
         self.assertEqual(
             SUPPORTED_SAMPLE_RATES,
@@ -1827,6 +1896,28 @@ class TestReducerMonitorWindow(unittest.TestCase):
             self.window.health_icon_label.pixmap().toImage()
             .pixelColor(7, 7).name(),
             "#35b66a",
+        )
+
+    def test_running_adc_with_zero_channel_mask_is_reported_as_idle(self):
+        self._switch_to_english()
+        self.window.on_can_frame_received(
+            CANFrame(
+                id=CAN_ID_TX_HEALTH,
+                data=build_health_v2_payload(
+                    tx_drop=0,
+                    overflow=0,
+                    recovery=0,
+                    running=True,
+                    channel_mask_nonzero=False,
+                ),
+            )
+        )
+
+        self.assertIn("NO CHANNELS", self.window.health_summary_label.text())
+        self.assertEqual(
+            self.window.health_icon_label.pixmap().toImage()
+            .pixelColor(7, 7).name(),
+            "#ed8b2c",
         )
 
     def test_high_sample_rate_is_available_over_canable2_usb_cdc(self):

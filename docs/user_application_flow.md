@@ -66,11 +66,16 @@ The filter window is configurable from `2..64`.
 
 Large steps are not rejected. At this layer a real load step cannot be
 distinguished reliably from a sensor outlier, so it must reach telemetry.
-Welford running statistics are maintained internally for diagnostics.
+Runtime voltage statistics are maintained by the host GUI. The MCU does not
+currently maintain a Welford statistics accumulator.
 
 The eight zero offsets and runtime configuration are persisted in the final
 STM32 Flash page as a versioned 64-byte record with CRC32 and a magic value.
-Flash writes happen after explicit zero/configuration changes.
+Flash writes happen after explicit zero/configuration changes. Each programmed
+record is read back, CRC-validated, and compared byte-for-byte before the save
+is reported as successful. The append log still uses one Flash page; a
+dual-page journal is the planned follow-up if stronger power-loss guarantees
+are required.
 
 ## CAN FD Protocol
 
@@ -82,13 +87,13 @@ only by the classic diagnostic frame and accepted legacy frames.
 
 | Direction | ID | Type | Length | Purpose |
 |---|---:|---:|---:|---|
-| PC -> MCU | `0x100` | `0xA0` | 12 FD+BRS | Command |
 | MCU -> PC | `0x0F0` | `0xA1` | 12 FD+BRS | Command ACK/status |
-| MCU -> PC | `0x101` | `0x54` | 64 FD+BRS | Raw telemetry batch |
-| MCU -> PC | `0x101` | `0x55` | 64 FD+BRS | Physical telemetry batch |
-| MCU -> PC | `0x103` | `0x52` | 24 FD+BRS | One-second health report |
-| MCU -> PC | `0x104` | `0x56` | 64 FD+BRS | Config snapshot |
+| MCU -> PC | `0x0F0` | `0x56` | 64 FD+BRS | Config snapshot |
+| PC -> MCU | `0x0F1` | `0xA0` | 12 FD+BRS | Command |
+| MCU -> PC | `0x0F2` | `0x52` | 24 FD+BRS | One-second health report |
 | MCU -> PC | `0x0FF` | `0x57` | 8 classic CAN | Link diagnostic heartbeat |
+| MCU -> PC | `0x110` | `0x54` | 64 FD+BRS | Raw telemetry batch |
+| MCU -> PC | `0x110` | `0x55` | 64 FD+BRS | Physical telemetry batch |
 
 Command frame:
 
@@ -146,7 +151,8 @@ byte 12-13: telemetry samples/s, uint16 LE
 byte 14-15: telemetry frames/s, uint16 LE
 byte 16: active ADC count
 byte 17: telemetry mode
-byte 18: flags, bit 0 acquisition running, bit 1 config dirty, bit 2 zero valid
+byte 18: flags, bit 0 ADC hardware running, bit 1 config dirty, bit 2 zero valid,
+         bit 3 channel mask is nonzero
 byte 19-23: reserved
 ```
 
@@ -155,7 +161,7 @@ Diagnostic frame:
 ```text
 byte 0: type = 0x57
 byte 1: flags, CAN ready/main loop/last RX FD/last RX BRS/bus-off/passive
-byte 2: last 0x100 DLC in bytes
+byte 2: last 0x0F1 DLC in bytes
 byte 3: last command reject reason
 byte 4: FDCAN TX error counter
 byte 5: FDCAN RX error counter
