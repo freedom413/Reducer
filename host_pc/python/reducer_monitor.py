@@ -16,7 +16,8 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from threading import Lock
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread, current_thread
 
 import numpy as np
 
@@ -76,6 +77,9 @@ CAN_CMD_SET_VREF_UV = 0x0B
 CAN_CMD_SET_PGA = 0x0C
 CAN_CMD_RESTORE_DEFAULTS = 0x0D
 CAN_CMD_SET_ZERO_OFFSET = 0x0E
+CAN_CMD_HOST_KEEPALIVE = 0x0F
+CAN_HOST_SESSION_PARAM_REFRESH = 0x00
+CAN_HOST_SESSION_PARAM_STOP = 0x01
 
 # Number of channels
 NUM_CHANNELS = 8
@@ -94,11 +98,35 @@ MV_TO_MICROSTRAIN_SCALE = 1000.0 / (BRIDGE_EXCITATION_V * GAUGE_FACTOR)
 # Waveform buffer size
 WAVEFORM_BUFFER_SIZE = 5000
 PLOT_VISIBLE_SAMPLES = 300
+DEFAULT_PLOT_WINDOW_SECONDS = 1.5
+MIN_PLOT_WINDOW_SECONDS = 0.2
+MAX_PLOT_WINDOW_SECONDS = 5.0
 PLOT_MIN_Y_RANGE_MV = 0.05
 DEFAULT_PLOT_REFRESH_HZ = 60
+TELEMETRY_DRAIN_PERIOD_MS = 5
 CAN_RECEIVER_TELEMETRY_QUEUE_LIMIT = 1024
+CAN_RECEIVER_CONTROL_QUEUE_LIMIT = 256
+# A v2 raw CAN FD frame contains at most 14 records, so 32 frames stay
+# below the per-turn 512-record budget.
+TELEMETRY_DRAIN_FRAME_LIMIT = 32
+TELEMETRY_DRAIN_RECORD_LIMIT = 512
+TELEMETRY_DRAIN_BUDGET_MS = 3.0
+# The render path samples at most four 14-record frames so a plot frame does
+# not spend its full 16.7 ms budget ingesting telemetry.
+PLOT_FRAME_TELEMETRY_DRAIN_FRAME_LIMIT = 4
+PLOT_FRAME_TELEMETRY_DRAIN_RECORD_LIMIT = 56
+PLOT_FRAME_TELEMETRY_DRAIN_BUDGET_MS = 0.75
+CSV_LOG_QUEUE_LIMIT = 16384
+CSV_LOG_BATCH_ROWS = 512
+CSV_LOG_FLUSH_INTERVAL_S = 0.5
+# Curves and vertical auto-ranging both track the 60 Hz render cadence. The
+# latter only updates the Y range when its hysteresis threshold is crossed.
+PLOT_AUTOSCALE_PERIOD_MS = 17
+PLOT_Y_RANGE_EDGE_MARGIN = 0.15
+PLOT_Y_RANGE_SHRINK_RATIO = 0.60
 PHYSICAL_MODE_WARNING_THRESHOLD_SPS = 1000.0
 COMMAND_ACK_TIMEOUT_S = 2.0
+HOST_KEEPALIVE_PERIOD_MS = 1000
 LONG_COMMAND_ACK_TIMEOUT_S = 15.0
 LONG_ACK_COMMANDS = frozenset((
     CAN_CMD_START_CALIB,
@@ -167,6 +195,7 @@ class WaveformRingBuffer:
         self.values = np.zeros(self.capacity, dtype=np.float64)
         self.start = 0
         self.count = 0
+        self.total_samples = 0
 
     def append(self, value: float) -> None:
         index = (self.start + self.count) % self.capacity
@@ -176,6 +205,7 @@ class WaveformRingBuffer:
         else:
             self.values[index] = value
             self.count += 1
+        self.total_samples += 1
 
     def extend(self, values) -> None:
         array = np.asarray(values, dtype=np.float64)
@@ -185,6 +215,7 @@ class WaveformRingBuffer:
             self.values[:] = array[-self.capacity:]
             self.start = 0
             self.count = self.capacity
+            self.total_samples += int(array.size)
             return
         for value in array:
             self.append(float(value))
@@ -192,20 +223,34 @@ class WaveformRingBuffer:
     def clear(self) -> None:
         self.start = 0
         self.count = 0
+        self.total_samples = 0
 
     def to_array(self, last: Optional[int] = None) -> np.ndarray:
         if self.count == 0:
             return np.array([], dtype=np.float64)
-        if self.start + self.count <= self.capacity:
-            data = self.values[self.start:self.start + self.count]
-        else:
-            data = np.concatenate((
-                self.values[self.start:],
-                self.values[:(self.start + self.count) % self.capacity],
-            ))
-        if last is not None and data.size > last:
-            data = data[-last:]
-        return data.copy()
+        count = self.count if last is None else min(self.count, max(0, int(last)))
+        if count == 0:
+            return np.array([], dtype=np.float64)
+
+        return self.slice_samples(self.total_samples - count, self.total_samples)
+
+    def slice_samples(self, first_sample: int, last_sample: int) -> np.ndarray:
+        """Return a copied absolute sample range without materializing history."""
+        if self.count == 0:
+            return np.array([], dtype=np.float64)
+
+        retained_first = self.total_samples - self.count
+        first_sample = max(retained_first, int(first_sample))
+        last_sample = min(self.total_samples, int(last_sample))
+        if last_sample <= first_sample:
+            return np.array([], dtype=np.float64)
+
+        count = last_sample - first_sample
+        start = (self.start + first_sample - retained_first) % self.capacity
+        end = start + count
+        if end <= self.capacity:
+            return self.values[start:end].copy()
+        return np.concatenate((self.values[start:], self.values[:end % self.capacity]))
 
     def __len__(self) -> int:
         return self.count
@@ -317,11 +362,15 @@ def plot_grid_columns(count: int) -> int:
     return 2 if count <= 4 else 4
 
 
-def configure_curve_performance(curve) -> None:
+def configure_curve_performance(curve, *, assume_finite: bool = False) -> None:
     if hasattr(curve, "setClipToView"):
         curve.setClipToView(True)
     if hasattr(curve, "setDownsampling"):
         curve.setDownsampling(auto=True, method="peak")
+    if assume_finite and hasattr(curve, "setSkipFiniteCheck"):
+        # Protocol decoding produces finite numeric values; avoiding this scan
+        # removes a full extra pass over every high-rate display buffer.
+        curve.setSkipFiniteCheck(True)
 
 
 PYQTGRAPH_MENU_TRANSLATIONS_ZH = {
@@ -548,6 +597,33 @@ def install_pyqtgraph_export_dialog_localizer() -> None:
     original_update_item_list = export_dialog_class.updateItemList
     original_update_format_list = export_dialog_class.updateFormatList
     original_export_format_changed = export_dialog_class.exportFormatChanged
+    original_export_clicked = export_dialog_class.exportClicked
+    try:
+        from pyqtgraph.exporters import SVGExporter
+        from pyqtgraph.exporters.Exporter import Exporter
+    except Exception:
+        SVGExporter = None
+        Exporter = None
+
+    def find_svg_export_prepare_callback(item):
+        candidates = [item]
+        scene_getter = getattr(item, "scene", None)
+        if callable(scene_getter):
+            candidates.append(scene_getter())
+        parent_getter = getattr(item, "parentItem", None)
+        if callable(parent_getter):
+            candidates.append(parent_getter())
+        for candidate in candidates:
+            callback = getattr(candidate, "_reducer_prepare_svg_export", None)
+            if callable(callback):
+                return callback
+        return None
+
+    def restore_svg_export(exporter):
+        restore = getattr(exporter, "_reducer_svg_export_restore", None)
+        if restore is not None:
+            exporter._reducer_svg_export_restore = None
+            restore()
 
     def dialog_language(dialog) -> str:
         if hasattr(dialog.scene, "property"):
@@ -576,10 +652,53 @@ def install_pyqtgraph_export_dialog_localizer() -> None:
         localize_export_dialog(self, dialog_language(self))
         return result
 
+    def reducer_export_clicked(self):
+        exporter = self.currentExporter
+        if SVGExporter is None or not isinstance(exporter, SVGExporter):
+            return original_export_clicked(self)
+
+        callback = find_svg_export_prepare_callback(exporter.item)
+        if callback is None:
+            return original_export_clicked(self)
+
+        restore = callback()
+        if restore is None:
+            return original_export_clicked(self)
+        exporter._reducer_svg_export_restore = restore
+        try:
+            result = original_export_clicked(self)
+        except Exception:
+            restore_svg_export(exporter)
+            raise
+
+        file_dialog = getattr(exporter, "fileDialog", None)
+        if file_dialog is None:
+            restore_svg_export(exporter)
+        else:
+            file_dialog.rejected.connect(
+                lambda: restore_svg_export(exporter)
+            )
+        return result
+
+    if Exporter is not None and not getattr(
+        Exporter, "_reducer_svg_restore_installed", False
+    ):
+        original_file_save_finished = Exporter.fileSaveFinished
+
+        def restored_file_save_finished(self, file_name):
+            try:
+                return original_file_save_finished(self, file_name)
+            finally:
+                restore_svg_export(self)
+
+        Exporter.fileSaveFinished = restored_file_save_finished
+        Exporter._reducer_svg_restore_installed = True
+
     export_dialog_class.show = localized_show
     export_dialog_class.updateItemList = localized_update_item_list
     export_dialog_class.updateFormatList = localized_update_format_list
     export_dialog_class.exportFormatChanged = localized_export_format_changed
+    export_dialog_class.exportClicked = reducer_export_clicked
     export_dialog_class._reducer_localizer_installed = True
 
 
@@ -662,6 +781,8 @@ TRANSLATIONS = {
         "data_panel": "Data Panel",
         "auto_scale": "Auto Scale",
         "auto_scale_tooltip": "Automatically fit each plot to recent samples. Uncheck to keep a fixed scale.",
+        "plot_window": "Window:",
+        "plot_window_tooltip": "Visible time span for live auto-follow. Increase it to make the waveform move left more slowly without delaying samples.",
         "clear_plots": "Clear Plots",
         "clear_plots_tooltip": "Clear waveform history without changing MCU settings or current values",
         "import_csv": "Import CSV",
@@ -748,9 +869,9 @@ TRANSLATIONS = {
         "warning": "Warning",
         "physical_mode_high_rate_warning": "Physical mode above 1000 SPS can overload the host display. Continue?",
         "physical_mode_30000_warning": "Physical mode at 30000 SPS can overload the host display. Raw mode is recommended. Continue?",
-        "stream_summary": "ADC {sample_rate} SPS | scan {scan_rate:.0f} fps | telemetry {telemetry_rate:.0f} samples/s | {mode}",
+        "stream_summary": "ADC {sample_rate} SPS | scan {scan_rate:.0f} fps | telemetry {telemetry_rate:.0f} samples/s | host display drops {display_drops} | control drops {control_drops} | {mode}",
         "health": "System Health",
-        "health_waiting": "Waiting for MCU health frame | RX {rx_rate:.0f} samples/s | protocol errors {bad}",
+        "health_waiting": "Waiting for MCU health frame | RX {rx_rate:.0f} samples/s | host display drops {display_drops} | protocol errors {bad}",
         "health_waiting_with_diag": "MCU classic diag OK | main loop {main_loop} | last 0x0F1 {rx_format} | reject {reject} | TEC {tec} REC {rec} | no FD health yet",
         "diag_yes": "yes",
         "diag_no": "no",
@@ -759,7 +880,7 @@ TRANSLATIONS = {
         "diag_format_fd_brs": "FD+BRS",
         "diag_format_fd_no_brs": "FD without BRS",
         "diag_format_classic": "classic CAN",
-        "health_summary": "MCU {adc_state} | RX {rx_rate:.0f} samples/s | MCU TX {tx_samples} samples/s in {tx_frames} frames/s | ADC {sample_rate} SPS | {mode} | new drops {drop_delta}, total {tx_drop} | new overflows {overflow_delta}, total {overflow} | recoveries {recovery} | protocol errors {bad}",
+        "health_summary": "MCU {adc_state} | RX {rx_rate:.0f} samples/s | MCU TX {tx_samples} samples/s in {tx_frames} frames/s | ADC {sample_rate} SPS | {mode} | host display drops {display_drops} | new drops {drop_delta}, session {tx_drop} | new overflows {overflow_delta}, session {overflow} | recoveries {recovery} | protocol errors {bad}",
         "adc_running": "RUN",
         "adc_idle": "RUN / NO CHANNELS",
         "adc_stopped": "STOP",
@@ -778,6 +899,7 @@ TRANSLATIONS = {
         "logging_to": "Logging to {filename}",
         "logging_stopped": "Logging stopped",
         "failed_start_logging": "Failed to start logging: {error}",
+        "logging_write_failed": "Logging stopped after a write failure: {error}",
         "command_acknowledged": "{command} acknowledged (value={value})",
         "command_rejected": "{command} rejected: {reason}",
         "command_timeout": "{command} timed out waiting for ACK",
@@ -822,6 +944,8 @@ TRANSLATIONS = {
         "data_panel": "数据面板",
         "auto_scale": "自动缩放",
         "auto_scale_tooltip": "自动适配各通道近期采样范围。取消勾选后保持固定范围。",
+        "plot_window": "显示窗口：",
+        "plot_window_tooltip": "实时跟随时显示的时间跨度。增大可让波形向左移动得更慢，但不会延迟采样数据。",
         "clear_plots": "清空曲线",
         "clear_plots_tooltip": "清空波形历史，不改变 MCU 设置和当前数值",
         "import_csv": "导入 CSV",
@@ -893,9 +1017,9 @@ TRANSLATIONS = {
         "warning": "警告",
         "physical_mode_high_rate_warning": "物理量模式超过 1000 SPS 时可能导致上位机显示过载。是否继续？",
         "physical_mode_30000_warning": "物理量模式在 30000 SPS 时可能导致上位机显示过载，建议使用 Raw 模式。是否继续？",
-        "stream_summary": "ADC {sample_rate} SPS | 扫描 {scan_rate:.0f} 帧/秒 | 遥测 {telemetry_rate:.0f} 样本/秒 | {mode}",
+        "stream_summary": "ADC {sample_rate} SPS | 扫描 {scan_rate:.0f} 帧/秒 | 遥测 {telemetry_rate:.0f} 样本/秒 | 上位机显示丢失 {display_drops} | 控制帧丢失 {control_drops} | {mode}",
         "health": "系统健康状态",
-        "health_waiting": "等待 MCU 健康帧 | 接收 {rx_rate:.0f} 样本/秒 | 协议错误 {bad}",
+        "health_waiting": "等待 MCU 健康帧 | 接收 {rx_rate:.0f} 样本/秒 | 上位机显示丢失 {display_drops} | 协议错误 {bad}",
         "health_waiting_with_diag": "已收到 MCU classic 诊断 | 主循环 {main_loop} | 最近 0x0F1 {rx_format} | 丢弃 {reject} | TEC {tec} REC {rec} | 尚无 FD 健康帧",
         "diag_yes": "是",
         "diag_no": "否",
@@ -904,7 +1028,7 @@ TRANSLATIONS = {
         "diag_format_fd_brs": "FD+BRS",
         "diag_format_fd_no_brs": "FD 无 BRS",
         "diag_format_classic": "classic CAN",
-        "health_summary": "MCU {adc_state} | 接收 {rx_rate:.0f} 样本/秒 | MCU 发送 {tx_samples} 样本/秒、{tx_frames} 帧/秒 | ADC {sample_rate} SPS | {mode} | 新增丢弃 {drop_delta}、累计 {tx_drop} | 新增溢出 {overflow_delta}、累计 {overflow} | 恢复 {recovery} | 协议错误 {bad}",
+        "health_summary": "MCU {adc_state} | 接收 {rx_rate:.0f} 样本/秒 | MCU 发送 {tx_samples} 样本/秒、{tx_frames} 帧/秒 | ADC {sample_rate} SPS | {mode} | 上位机显示丢失 {display_drops} | 新增丢弃 {drop_delta}、本次连接 {tx_drop} | 新增溢出 {overflow_delta}、本次连接 {overflow} | 恢复 {recovery} | 协议错误 {bad}",
         "adc_running": "运行",
         "adc_idle": "运行 / 未启用通道",
         "adc_stopped": "停止",
@@ -917,6 +1041,7 @@ TRANSLATIONS = {
         "logging_to": "正在记录到 {filename}",
         "logging_stopped": "记录已停止",
         "failed_start_logging": "开始记录失败：{error}",
+        "logging_write_failed": "写入失败，记录已停止：{error}",
         "command_acknowledged": "{command} 已确认（值={value}）",
         "command_rejected": "{command} 被拒绝：{reason}",
         "command_timeout": "{command} 等待确认超时",
@@ -994,6 +1119,243 @@ class ChannelData:
     last_timestamp: float = 0.0
 
 
+class CsvLogger:
+    """Owns CSV resources and writes bounded batches off the GUI thread."""
+
+    _STOP_SENTINEL = object()
+    HEADER = [
+        "timestamp", "channel", "voltage_mv", "strain_ue", "stress_mpa",
+        "raw_value", "telemetry_mode", "config_sequence", "samples",
+    ]
+
+    def __init__(
+        self,
+        queue_limit: int = CSV_LOG_QUEUE_LIMIT,
+        batch_rows: int = CSV_LOG_BATCH_ROWS,
+        flush_interval_s: float = CSV_LOG_FLUSH_INTERVAL_S,
+    ):
+        self.file = None
+        self.writer = None
+        self.pending_rows = []
+        self.active = False
+        self.last_error: Optional[str] = None
+        self._queue_limit = max(1, int(queue_limit))
+        self._batch_rows = max(1, int(batch_rows))
+        self._flush_interval_s = max(0.01, float(flush_interval_s))
+        self._state_lock = Lock()
+        self._row_queue: Optional[Queue] = None
+        self._stop_event: Optional[Event] = None
+        self._worker: Optional[Thread] = None
+        self._pending_async_error: Optional[str] = None
+
+    def _close_file(self) -> None:
+        if self.file is not None:
+            try:
+                self.file.close()
+            except Exception:
+                logger.exception("Failed to close CSV log")
+        self.file = None
+        self.writer = None
+
+    def _fail(self, exc: Exception) -> str:
+        error = str(exc)
+        self.last_error = error
+        self.active = False
+        self.pending_rows.clear()
+        self._close_file()
+        return error
+
+    @staticmethod
+    def _discard_queued_rows(row_queue: Queue) -> None:
+        while True:
+            try:
+                row_queue.get_nowait()
+            except Empty:
+                return
+
+    @classmethod
+    def _wake_writer(cls, row_queue: Optional[Queue]) -> None:
+        if row_queue is None:
+            return
+        try:
+            row_queue.put_nowait(cls._STOP_SENTINEL)
+        except Full:
+            # A full queue already wakes the worker; it will see stop_event
+            # after draining the pending rows.
+            pass
+
+    def _record_async_failure(self, exc: Exception) -> None:
+        error = str(exc)
+        with self._state_lock:
+            if self._pending_async_error is not None:
+                return
+            self.last_error = error
+            self.active = False
+            self.pending_rows.clear()
+            self._pending_async_error = error
+            row_queue = self._row_queue
+            stop_event = self._stop_event
+        if row_queue is not None:
+            self._discard_queued_rows(row_queue)
+        if stop_event is not None:
+            stop_event.set()
+        self._wake_writer(row_queue)
+
+    def _consume_async_error(self) -> Optional[str]:
+        with self._state_lock:
+            error = self._pending_async_error
+            self._pending_async_error = None
+        return error
+
+    def _writer_loop(
+        self,
+        file_handle,
+        writer,
+        row_queue: Queue,
+        stop_event: Event,
+    ) -> None:
+        rows = []
+        next_flush = time.monotonic() + self._flush_interval_s
+        try:
+            while True:
+                timeout = max(0.0, next_flush - time.monotonic())
+                try:
+                    row = row_queue.get(timeout=timeout)
+                    if row is self._STOP_SENTINEL:
+                        stop_event.set()
+                    else:
+                        rows.append(row)
+                except Empty:
+                    pass
+
+                while len(rows) < self._batch_rows:
+                    try:
+                        row = row_queue.get_nowait()
+                    except Empty:
+                        break
+                    if row is self._STOP_SENTINEL:
+                        stop_event.set()
+                        break
+                    rows.append(row)
+
+                now = time.monotonic()
+                should_flush = (
+                    len(rows) >= self._batch_rows or
+                    now >= next_flush or
+                    (stop_event.is_set() and row_queue.empty())
+                )
+                if rows and should_flush:
+                    writer.writerows(rows)
+                    rows.clear()
+                    file_handle.flush()
+                    next_flush = time.monotonic() + self._flush_interval_s
+
+                if stop_event.is_set() and row_queue.empty() and not rows:
+                    break
+        except Exception as exc:
+            logger.exception("Failed to write CSV log rows")
+            self._record_async_failure(exc)
+        finally:
+            try:
+                file_handle.close()
+            except Exception:
+                logger.exception("Failed to close CSV log")
+            with self._state_lock:
+                if self.file is file_handle:
+                    self.file = None
+                    self.writer = None
+
+    def start(self, filename: str) -> None:
+        self.stop()
+        self._close_file()
+        self.pending_rows.clear()
+        self.last_error = None
+        self._pending_async_error = None
+        self.active = False
+        try:
+            self.file = open(filename, "w", newline="")
+            self.writer = csv.writer(self.file)
+            self.writer.writerow(self.HEADER)
+            self.file.flush()
+        except Exception as exc:
+            self._fail(exc)
+            raise
+        row_queue = Queue(maxsize=self._queue_limit)
+        stop_event = Event()
+        worker = Thread(
+            target=self._writer_loop,
+            args=(self.file, self.writer, row_queue, stop_event),
+            daemon=True,
+            name="ReducerCsvWriter",
+        )
+        with self._state_lock:
+            self._row_queue = row_queue
+            self._stop_event = stop_event
+            self._worker = worker
+            self.active = True
+        worker.start()
+
+    def append(self, row) -> None:
+        with self._state_lock:
+            if not self.active or self.writer is None:
+                return
+            row_queue = self._row_queue
+        if row_queue is None:
+            self.pending_rows.append(row)
+            return
+        try:
+            row_queue.put_nowait(row)
+        except Full:
+            self._record_async_failure(
+                OSError("CSV logging queue is full; logging stopped")
+            )
+
+    def flush(self) -> Optional[str]:
+        error = self._consume_async_error()
+        if error is not None:
+            return error
+        with self._state_lock:
+            async_active = self._worker is not None
+        if async_active:
+            return None
+        if self.writer is None or not self.pending_rows:
+            return None
+        try:
+            self.writer.writerows(self.pending_rows)
+            if self.file is not None:
+                self.file.flush()
+            self.pending_rows.clear()
+            return None
+        except Exception as exc:
+            logger.exception("Failed to flush pending CSV rows")
+            return self._fail(exc)
+
+    def stop(self) -> Optional[str]:
+        with self._state_lock:
+            worker = self._worker
+            stop_event = self._stop_event
+            row_queue = self._row_queue
+            self.active = False
+        if worker is not None:
+            if stop_event is not None:
+                stop_event.set()
+            self._wake_writer(row_queue)
+            if worker is not current_thread():
+                worker.join()
+            with self._state_lock:
+                self._worker = None
+                self._stop_event = None
+                self._row_queue = None
+            self.pending_rows.clear()
+            return self._consume_async_error() or self.last_error
+
+        error = self.flush()
+        self.active = False
+        self.pending_rows.clear()
+        self._close_file()
+        return error
+
+
 class CANReceiver(QThread):
     """Background thread for forwarding python-can frames to the UI thread"""
 
@@ -1004,14 +1366,16 @@ class CANReceiver(QThread):
         self,
         can_bus: PythonCANInterface,
         telemetry_queue_limit: int = CAN_RECEIVER_TELEMETRY_QUEUE_LIMIT,
+        control_queue_limit: int = CAN_RECEIVER_CONTROL_QUEUE_LIMIT,
     ):
         super().__init__()
         self.can_bus = can_bus
         self.running = True
         self._queue_lock = Lock()
-        self._control_frames = deque()
+        self._control_frames = deque(maxlen=max(1, control_queue_limit))
         self._telemetry_frames = deque(maxlen=max(1, telemetry_queue_limit))
         self._display_drop_count = 0
+        self._control_drop_count = 0
         self._control_drain_signal_pending = False
         self._callback = self._queue_frame
         self.can_bus.register_rx_callback(self._callback)
@@ -1028,6 +1392,8 @@ class CANReceiver(QThread):
                     self._display_drop_count += 1
                 self._telemetry_frames.append(frame)
             else:
+                if len(self._control_frames) == self._control_frames.maxlen:
+                    self._control_drop_count += 1
                 self._control_frames.append(frame)
                 if not self._control_drain_signal_pending:
                     self._control_drain_signal_pending = True
@@ -1056,6 +1422,12 @@ class CANReceiver(QThread):
         with self._queue_lock:
             count = self._display_drop_count
             self._display_drop_count = 0
+        return count
+
+    def take_control_drop_count(self) -> int:
+        with self._queue_lock:
+            count = self._control_drop_count
+            self._control_drop_count = 0
         return count
 
     def stop(self):
@@ -1305,6 +1677,34 @@ class ReducerMonitorWindow(QMainWindow):
     # Signal for updating UI from CAN receiver thread
     data_updated = pyqtSignal(int, dict)
 
+    @property
+    def csv_writer(self):
+        return self.csv_logger.writer
+
+    @csv_writer.setter
+    def csv_writer(self, value):
+        self.csv_logger.writer = value
+
+    @property
+    def csv_file(self):
+        return self.csv_logger.file
+
+    @csv_file.setter
+    def csv_file(self, value):
+        self.csv_logger.file = value
+
+    @property
+    def logging_enabled(self) -> bool:
+        return self.csv_logger.active
+
+    @logging_enabled.setter
+    def logging_enabled(self, value: bool):
+        self.csv_logger.active = bool(value)
+
+    @property
+    def csv_pending_rows(self):
+        return self.csv_logger.pending_rows
+
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
@@ -1315,6 +1715,7 @@ class ReducerMonitorWindow(QMainWindow):
         self.command_sequence = 0
         self.pending_commands: Dict[int, str] = {}
         self.pending_command_deadlines: Dict[int, float] = {}
+        self.quiet_command_sequences = set()
 
         # Channel data
         self.channel_data: List[ChannelData] = [ChannelData() for _ in range(NUM_CHANNELS)]
@@ -1331,12 +1732,11 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
 
         # CSV logging
-        self.csv_writer: Optional[csv.writer] = None
-        self.csv_file: Optional[object] = None
-        self.logging_enabled = False
+        self.csv_logger = CsvLogger()
         self.offline_waveform_windows: List[OfflineWaveformWindow] = []
         self.view_paused = False
         self.paused_waveform_snapshot: Optional[Dict[str, List[np.ndarray]]] = None
+        self.paused_waveform_sample_counts: Optional[Dict[str, List[int]]] = None
 
         # UI state
         self.is_connected = False
@@ -1351,6 +1751,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.health_tx_drop_delta = 0
         self.health_adc_overflow_delta = 0
         self.health_adc_recovery_delta = 0
+        self.session_tx_drop_base: Optional[int] = None
+        self.session_adc_overflow_base: Optional[int] = None
         self.telemetry_mode = TELEMETRY_MODE_RAW
         self.vref_uv = 2_500_000
         self.pga_gain = 16
@@ -1363,14 +1765,17 @@ class ReducerMonitorWindow(QMainWindow):
         }
         self.pending_telemetry_batches = deque(maxlen=2048)
         self.display_drop_count = 0
-        self.csv_pending_rows = []
+        self.control_drop_count = 0
         self.maximized_plot_channel: Optional[int] = None
         self.maximized_plot_panel: Optional[QWidget] = None
         self.last_sent_channel_mask: Optional[int] = None
         self.language = "zh"
         self.theme = DEFAULT_THEME
         self.sample_rate_sps = 100.0
+        self.plot_window_seconds = DEFAULT_PLOT_WINDOW_SECONDS
         self._status_message = None
+        self._relative_x_data_cache = {}
+        self._svg_exporting_plots = set()
 
         # Setup UI
         self.init_ui()
@@ -1382,8 +1787,14 @@ class ReducerMonitorWindow(QMainWindow):
 
         # Update timer for waveform plot
         self.update_timer = QTimer()
+        self.update_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.update_timer.timeout.connect(self.update_plots)
         self._set_plot_refresh_rate(DEFAULT_PLOT_REFRESH_HZ)
+
+        self.telemetry_drain_timer = QTimer()
+        self.telemetry_drain_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.telemetry_drain_timer.timeout.connect(self._service_telemetry_input)
+        self.telemetry_drain_timer.start(TELEMETRY_DRAIN_PERIOD_MS)
 
         self.command_timeout_timer = QTimer()
         self.command_timeout_timer.timeout.connect(self._check_command_timeouts)
@@ -1392,6 +1803,9 @@ class ReducerMonitorWindow(QMainWindow):
         self.health_timer = QTimer()
         self.health_timer.timeout.connect(self._refresh_health_panel)
         self.health_timer.start(1000)
+
+        self.keepalive_timer = QTimer()
+        self.keepalive_timer.timeout.connect(self._send_host_keepalive)
 
     def init_ui(self):
         """Initialize the user interface"""
@@ -1507,6 +1921,19 @@ class ReducerMonitorWindow(QMainWindow):
         self.auto_scale_checkbox.toggled.connect(self._on_auto_scale_toggled)
         controls.addWidget(self.auto_scale_checkbox)
 
+        self.plot_window_label = QLabel()
+        controls.addWidget(self.plot_window_label)
+        self.plot_window_spin = QDoubleSpinBox()
+        self.plot_window_spin.setRange(
+            MIN_PLOT_WINDOW_SECONDS, MAX_PLOT_WINDOW_SECONDS
+        )
+        self.plot_window_spin.setDecimals(1)
+        self.plot_window_spin.setSingleStep(0.5)
+        self.plot_window_spin.setSuffix(" s")
+        self.plot_window_spin.setValue(self.plot_window_seconds)
+        self.plot_window_spin.valueChanged.connect(self._on_plot_window_changed)
+        controls.addWidget(self.plot_window_spin)
+
         self.clear_plots_btn = QPushButton()
         self.clear_plots_btn.clicked.connect(self._clear_plots)
         controls.addWidget(self.clear_plots_btn)
@@ -1528,7 +1955,9 @@ class ReducerMonitorWindow(QMainWindow):
         controls.addWidget(self.export_selection_btn)
 
         self.add_plot_btn = QPushButton()
-        self.add_plot_btn.clicked.connect(self._add_waveform_plot)
+        self.add_plot_btn.clicked.connect(
+            lambda _checked=False: self._add_waveform_plot()
+        )
         controls.addWidget(self.add_plot_btn)
 
         self.log_btn = QPushButton()
@@ -1572,6 +2001,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_hover_items = []
         self.plot_remove_buttons = []
         self.plot_channels = []
+        self.plot_render_data = []
+        self.plot_auto_scale_due = []
 
         for channel in range(min(DEFAULT_VISIBLE_PLOTS, NUM_CHANNELS)):
             self._add_waveform_plot(channel)
@@ -1719,6 +2150,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.tabs.setTabText(1, self._tr("data_panel"))
         self.auto_scale_checkbox.setText(self._tr("auto_scale"))
         self.auto_scale_checkbox.setToolTip(self._tr("auto_scale_tooltip"))
+        self.plot_window_label.setText(self._tr("plot_window"))
+        self.plot_window_spin.setToolTip(self._tr("plot_window_tooltip"))
         self.clear_plots_btn.setText(self._tr("clear_plots"))
         self.clear_plots_btn.setToolTip(self._tr("clear_plots_tooltip"))
         self.import_csv_btn.setText(self._tr("import_csv"))
@@ -1934,6 +2367,27 @@ class ReducerMonitorWindow(QMainWindow):
             self._ads1256_cycling_rate(sample_rate) * self._active_adc_count()
         )
 
+    def _estimated_channel_rate(self, channel: int) -> float:
+        adc_mask = ADC_CHANNEL_MASKS[0 if channel < 4 else 1]
+        enabled_channels = (self.acquisition_channel_mask & adc_mask).bit_count()
+        if enabled_channels == 0 or not (
+            self.acquisition_channel_mask & (1 << channel)
+        ):
+            return 0.0
+        return self._ads1256_cycling_rate(self.sample_rate_sps) / enabled_channels
+
+    def _plot_visible_sample_count(self, channel: int) -> int:
+        channel_rate = self._estimated_channel_rate(channel)
+        if channel_rate <= 0.0:
+            return PLOT_VISIBLE_SAMPLES
+        return max(
+            32,
+            min(
+                WAVEFORM_BUFFER_SIZE,
+                int(round(channel_rate * self.plot_window_seconds)),
+            ),
+        )
+
     def _telemetry_mode_text(self, mode: Optional[int] = None) -> str:
         selected = self.telemetry_mode if mode is None else mode
         return (
@@ -1954,6 +2408,8 @@ class ReducerMonitorWindow(QMainWindow):
                     self._active_adc_count()
                 ),
                 telemetry_rate=self._estimated_telemetry_rate(self.sample_rate_sps),
+                display_drops=self.display_drop_count,
+                control_drops=self.control_drop_count,
                 mode=self._telemetry_mode_text(),
             )
         )
@@ -2054,12 +2510,16 @@ class ReducerMonitorWindow(QMainWindow):
             lambda scene_pos, selected_plot=plot:
                 self._on_plot_mouse_moved(selected_plot, scene_pos)
         )
+        plot.getViewBox().sigXRangeChanged.connect(
+            lambda *_args, selected_plot=plot:
+                self._on_plot_x_range_changed(selected_plot)
+        )
         metric_curves = {}
         for metric, config in PLOT_METRICS.items():
             curve = plot.plot(
                 pen=pg.mkPen(color=metric_colors[metric], width=1.5)
             )
-            configure_curve_performance(curve)
+            configure_curve_performance(curve, assume_finite=True)
             curve.setVisible(metric == "voltage")
             metric_curves[metric] = curve
         panel_layout.addWidget(plot)
@@ -2076,6 +2536,9 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_hover_items.append(hover_items)
         self.plot_remove_buttons.append(remove_button)
         self.plot_channels.append(channel)
+        self.plot_render_data.append(None)
+        self.plot_auto_scale_due.append(0.0)
+        self._install_plot_svg_export_hook(plot)
 
         channel_combo.currentIndexChanged.connect(
             lambda _index, selected_plot=plot:
@@ -2092,7 +2555,7 @@ class ReducerMonitorWindow(QMainWindow):
         self._update_plot_presentation(plot_index)
         self._refresh_plot_data(plot_index)
         if self.auto_scale_checkbox.isChecked():
-            self._update_plot_range(plot_index)
+            self._update_plot_range(plot_index, force_y_range=True)
 
         self._refresh_waveform_layout()
         self._update_plot_controls()
@@ -2119,6 +2582,8 @@ class ReducerMonitorWindow(QMainWindow):
         self.plot_hover_items.pop(plot_index)
         self.plot_remove_buttons.pop(plot_index)
         self.plot_channels.pop(plot_index)
+        self.plot_render_data.pop(plot_index)
+        self.plot_auto_scale_due.pop(plot_index)
         panel.deleteLater()
 
         self._refresh_waveform_layout()
@@ -2137,7 +2602,7 @@ class ReducerMonitorWindow(QMainWindow):
         hide_plot_hover_items(self.plot_hover_items[plot_index])
         self._refresh_plot_data(plot_index)
         if self.auto_scale_checkbox.isChecked():
-            self._update_plot_range(plot_index)
+            self._update_plot_range(plot_index, force_y_range=True)
         self._update_plot_presentation(plot_index)
         if self.maximized_plot_panel is self.plot_panels[plot_index]:
             self.maximized_plot_channel = int(channel)
@@ -2162,7 +2627,7 @@ class ReducerMonitorWindow(QMainWindow):
         self._refresh_plot_data(plot_index)
         self._update_plot_presentation(plot_index)
         if self.auto_scale_checkbox.isChecked():
-            self._update_plot_range(plot_index)
+            self._update_plot_range(plot_index, force_y_range=True)
 
     def _selected_plot_metrics(self, plot_index: int) -> List[str]:
         return [
@@ -2200,6 +2665,120 @@ class ReducerMonitorWindow(QMainWindow):
     def _set_plot_metric_color(self, plot_index: int, metric: str, color: str):
         self._set_metric_color(metric, color)
 
+    def _uses_relative_live_x(self, plot_index: int) -> bool:
+        return self.auto_scale_checkbox.isChecked() and not self.view_paused
+
+    def _set_plot_x_axis_values_visible(
+        self, plot_index: int, visible: bool
+    ) -> None:
+        axis = self.plot_widgets[plot_index].getAxis("bottom")
+        if axis.style.get("showValues", True) != visible:
+            axis.setStyle(showValues=visible)
+
+    def _relative_x_values(
+        self, visible_samples: int, count: int
+    ) -> np.ndarray:
+        visible_samples = max(2, int(visible_samples))
+        values = self._relative_x_data_cache.get(visible_samples)
+        if values is None:
+            values = np.arange(visible_samples, dtype=np.float64)
+            self._relative_x_data_cache[visible_samples] = values
+        return values[:min(int(count), visible_samples)]
+
+    def _set_relative_live_x_range(
+        self, plot_index: int, visible_samples: int
+    ) -> None:
+        plot = self.plot_widgets[plot_index]
+        last_sample = max(1, int(visible_samples) - 1)
+        x_range, _ = plot.viewRange()
+        if (
+            abs(x_range[0]) > 0.5 or
+            abs(x_range[1] - last_sample) > 0.5
+        ):
+            plot.setXRange(0, last_sample, padding=0.0)
+
+    def _set_plot_absolute_recent_x_range(self, plot_index: int) -> None:
+        channel = self.plot_channels[plot_index]
+        selected_metrics = self._selected_plot_metrics(plot_index)
+        if selected_metrics:
+            sample_count = max(
+                self._plot_metric_count(metric, channel)
+                for metric in selected_metrics
+            )
+        else:
+            sample_count = 0
+        visible_samples = self._plot_visible_sample_count(channel)
+        first_sample = max(0, sample_count - visible_samples)
+        last_sample = max(first_sample + 1, sample_count - 1)
+        self.plot_widgets[plot_index].setXRange(
+            first_sample, last_sample, padding=0.01
+        )
+
+    def _install_plot_svg_export_hook(self, plot: pg.PlotWidget) -> None:
+        def prepare_svg_export(selected_plot=plot):
+            return self._prepare_plot_svg_export(selected_plot)
+
+        plot_item = plot.getPlotItem()
+        plot_item._reducer_prepare_svg_export = prepare_svg_export
+        plot_item.vb._reducer_prepare_svg_export = prepare_svg_export
+        plot.scene()._reducer_prepare_svg_export = prepare_svg_export
+
+    def _prepare_plot_svg_export(self, plot: pg.PlotWidget):
+        if plot not in self.plot_widgets:
+            return None
+
+        plot_index = self.plot_widgets.index(plot)
+        render_data = self.plot_render_data[plot_index]
+        if render_data is None:
+            render_data = self._refresh_plot_data(plot_index)
+        if not render_data["relative_x"]:
+            return None
+
+        plot_key = id(plot)
+        if plot_key in self._svg_exporting_plots:
+            return None
+
+        bottom_axis = plot.getAxis("bottom")
+        previous_show_values = bottom_axis.style.get("showValues", True)
+        self._svg_exporting_plots.add(plot_key)
+        bottom_axis.setStyle(showValues=True)
+        for metric, values in render_data["series"].items():
+            curve = self.plot_metric_curves[plot_index][metric]
+            first_sample = render_data["first_samples"][metric]
+            if values.size:
+                curve.setData(
+                    np.arange(first_sample, first_sample + values.size), values
+                )
+            else:
+                curve.setData([], [])
+
+        sample_count = max(render_data["total_samples"].values(), default=0)
+        visible_samples = render_data["visible_samples"]
+        first_sample = max(0, sample_count - visible_samples)
+        last_sample = max(first_sample + 1, sample_count - 1)
+        plot.setXRange(first_sample, last_sample, padding=0.01)
+        restored = False
+
+        def restore() -> None:
+            nonlocal restored
+            if restored:
+                return
+            restored = True
+            self._svg_exporting_plots.discard(plot_key)
+            if plot not in self.plot_widgets:
+                return
+            restored_index = self.plot_widgets.index(plot)
+            self._set_plot_x_axis_values_visible(
+                restored_index,
+                previous_show_values if not self._uses_relative_live_x(restored_index)
+                else False,
+            )
+            refreshed_data = self._refresh_plot_data(restored_index)
+            if refreshed_data["auto_scale"]:
+                self._update_plot_range(restored_index, refreshed_data)
+
+        return restore
+
     def _on_plot_mouse_moved(self, plot: pg.PlotWidget, scene_pos):
         if plot not in self.plot_widgets:
             return
@@ -2211,46 +2790,65 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         mouse = plot.getPlotItem().vb.mapSceneToView(scene_pos)
-        sample = int(round(mouse.x()))
+        display_sample = int(round(mouse.x()))
         x_range, y_range = plot.viewRange()
         x_tolerance = max(1.0, (x_range[1] - x_range[0]) * 12.0 / max(plot.width(), 1))
         y_tolerance = max(0.05, (y_range[1] - y_range[0]) * 0.08)
-        if abs(mouse.x() - sample) > x_tolerance:
+        if abs(mouse.x() - display_sample) > x_tolerance:
             hide_plot_hover_items(hover_items)
             return
 
         channel = self.plot_channels[plot_index]
+        render_data = self.plot_render_data[plot_index]
+        if (
+            render_data is None or
+            render_data["channel"] != channel or
+            render_data["selected_metrics"] != tuple(
+                self._selected_plot_metrics(plot_index)
+            )
+        ):
+            hide_plot_hover_items(hover_items)
+            return
+
         nearest = None
-        for metric in self._selected_plot_metrics(plot_index):
-            total = self._plot_metric_count(metric, channel)
-            visible = self._plot_metric_values(metric, channel, PLOT_VISIBLE_SAMPLES)
-            first_sample = max(0, total - len(visible))
-            local_sample = sample - first_sample
+        for metric in render_data["selected_metrics"]:
+            visible = render_data["series"].get(metric)
+            if visible is None:
+                continue
+            first_sample = render_data["first_samples"][metric]
+            if render_data["relative_x"]:
+                local_sample = display_sample
+                absolute_sample = first_sample + local_sample
+            else:
+                local_sample = display_sample - first_sample
+                absolute_sample = display_sample
             if not 0 <= local_sample < len(visible):
                 continue
             value = float(visible[local_sample])
             distance = abs(mouse.y() - value)
             if nearest is None or distance < nearest[0]:
-                nearest = (distance, metric, value)
+                nearest = (distance, metric, value, absolute_sample)
 
         if nearest is None or nearest[0] > y_tolerance:
             hide_plot_hover_items(hover_items)
             return
 
-        _, metric, value = nearest
+        _, metric, value, absolute_sample = nearest
         config = PLOT_METRICS[metric]
         color = self.global_metric_colors[metric]
-        hover_items["line"].setPos(sample)
-        hover_items["marker"].setData([sample], [value], brush=pg.mkBrush(color))
+        hover_items["line"].setPos(display_sample)
+        hover_items["marker"].setData(
+            [display_sample], [value], brush=pg.mkBrush(color)
+        )
         hover_items["label"].setText(
             f"{self._tr(config['axis_key'])}\n"
-            f"{self._tr('sample')}: {sample}\n"
+            f"{self._tr('sample')}: {absolute_sample}\n"
             f"{value:.3f} {config['units']}"
         )
         hover_items["label"].setAnchor(
-            (1, 1) if sample > sum(x_range) / 2.0 else (0, 1)
+            (1, 1) if display_sample > sum(x_range) / 2.0 else (0, 1)
         )
-        hover_items["label"].setPos(sample, value)
+        hover_items["label"].setPos(display_sample, value)
         for item in hover_items.values():
             item.show()
 
@@ -2260,20 +2858,144 @@ class ReducerMonitorWindow(QMainWindow):
             hide_plot_hover_items(self.plot_hover_items[plot_index])
         return super().eventFilter(watched, event)
 
-    def _refresh_plot_data(self, plot_index: int):
+    def _plot_metric_retained_first(self, metric: str, channel: int) -> int:
+        total_samples = self._plot_metric_count(metric, channel)
+        if self.view_paused and self.paused_waveform_snapshot is not None:
+            return max(
+                0,
+                total_samples - self.paused_waveform_snapshot[metric][channel].size,
+            )
+        return total_samples - len(self.waveform_metric_buffers[metric][channel])
+
+    def _plot_metric_window(
+        self,
+        metric: str,
+        channel: int,
+        first_sample: int,
+        last_sample: int,
+    ) -> tuple[int, np.ndarray]:
+        """Return only the requested absolute sample range for one metric."""
+        total_samples = self._plot_metric_count(metric, channel)
+        first_sample = max(
+            self._plot_metric_retained_first(metric, channel), int(first_sample)
+        )
+        last_sample = min(total_samples, int(last_sample))
+        if last_sample <= first_sample:
+            return first_sample, np.array([], dtype=np.float64)
+
+        if self.view_paused and self.paused_waveform_snapshot is not None:
+            values = self.paused_waveform_snapshot[metric][channel]
+            retained_first = self._plot_metric_retained_first(metric, channel)
+            return (
+                first_sample,
+                values[
+                    first_sample - retained_first:last_sample - retained_first
+                ],
+            )
+
+        return (
+            first_sample,
+            self.waveform_metric_buffers[metric][channel].slice_samples(
+                first_sample, last_sample
+            ),
+        )
+
+    def _refresh_plot_data(
+        self,
+        plot_index: int,
+        value_cache: Optional[dict] = None,
+        x_data_cache: Optional[dict] = None,
+    ) -> dict:
+        """Refresh one card while sharing visible samples and X arrays per frame."""
         channel = self.plot_channels[plot_index]
+        selected_metrics = tuple(self._selected_plot_metrics(plot_index))
+        auto_scale = self.auto_scale_checkbox.isChecked()
+        relative_x = self._uses_relative_live_x(plot_index)
+        self._set_plot_x_axis_values_visible(plot_index, not relative_x)
+        visible_samples = (
+            self._plot_visible_sample_count(channel) if auto_scale else None
+        )
+        x_range = None
+        if not auto_scale:
+            x_range, _ = self.plot_widgets[plot_index].viewRange()
+            view_width = max(1.0, x_range[1] - x_range[0])
+            manual_margin = max(32, int(np.ceil(view_width * 0.25)))
+
+        if value_cache is None:
+            value_cache = {}
+        if x_data_cache is None:
+            x_data_cache = {}
+
+        series = {}
+        first_samples = {}
+        total_samples = {}
         for metric, curve in self.plot_metric_curves[plot_index].items():
-            values = self._plot_metric_values(metric, channel, PLOT_VISIBLE_SAMPLES)
+            if metric not in selected_metrics:
+                continue
+
+            metric_total = self._plot_metric_count(metric, channel)
+            total_samples[metric] = metric_total
+            if auto_scale:
+                requested_first = max(0, metric_total - visible_samples)
+                requested_last = metric_total
+            else:
+                requested_first = max(
+                    self._plot_metric_retained_first(metric, channel),
+                    int(np.floor(x_range[0])) - manual_margin,
+                )
+                requested_first = min(metric_total, requested_first)
+                requested_last = min(
+                    metric_total,
+                    int(np.ceil(x_range[1])) + manual_margin + 1,
+                )
+                requested_last = max(requested_first, requested_last)
+
+            cache_key = (
+                metric,
+                channel,
+                requested_first,
+                requested_last,
+                self.view_paused,
+            )
+            try:
+                first_sample, values = value_cache[cache_key]
+            except KeyError:
+                first_sample, values = self._plot_metric_window(
+                    metric, channel, requested_first, requested_last
+                )
+                value_cache[cache_key] = (first_sample, values)
+
+            series[metric] = values
+            first_samples[metric] = first_sample
             if values.size:
-                first_sample = max(
-                    0, self._plot_metric_count(metric, channel) - values.size
-                )
-                curve.setData(
-                    np.arange(first_sample, first_sample + values.size),
-                    values,
-                )
+                if relative_x:
+                    x_values = self._relative_x_values(
+                        visible_samples, values.size
+                    )
+                else:
+                    x_key = (first_sample, values.size)
+                    x_values = x_data_cache.get(x_key)
+                    if x_values is None:
+                        x_values = np.arange(
+                            first_sample, first_sample + values.size
+                        )
+                        x_data_cache[x_key] = x_values
+                curve.setData(x_values, values)
             else:
                 curve.setData([], [])
+
+        render_data = {
+            "channel": channel,
+            "selected_metrics": selected_metrics,
+            "series": series,
+            "first_samples": first_samples,
+            "total_samples": total_samples,
+            "visible_samples": visible_samples,
+            "auto_scale": auto_scale,
+            "relative_x": relative_x,
+        }
+        self.plot_render_data[plot_index] = render_data
+        return render_data
 
     def _update_plot_presentation(self, plot_index: int):
         channel = self.plot_channels[plot_index]
@@ -2372,13 +3094,41 @@ class ReducerMonitorWindow(QMainWindow):
         self._refresh_waveform_layout()
 
     def _on_auto_scale_toggled(self, enabled: bool):
-        if enabled:
-            self.plot_dirty = [True for _ in range(NUM_CHANNELS)]
+        self.plot_window_label.setEnabled(enabled)
+        self.plot_window_spin.setEnabled(enabled)
+        for plot_index in range(len(self.plot_widgets)):
+            if not enabled:
+                self._set_plot_absolute_recent_x_range(plot_index)
+            self._refresh_plot_data(plot_index)
+            if enabled:
+                self._update_plot_range(plot_index, force_y_range=True)
+
+    def _on_plot_window_changed(self, seconds: float):
+        self.plot_window_seconds = float(seconds)
+        if not self.auto_scale_checkbox.isChecked():
+            return
+        for plot_index in range(len(self.plot_widgets)):
+            self._refresh_plot_data(plot_index)
+            self._update_plot_range(plot_index, force_y_range=True)
+
+    def _on_plot_x_range_changed(self, plot: pg.PlotWidget):
+        if self.auto_scale_checkbox.isChecked() or plot not in self.plot_widgets:
+            return
+        self._refresh_plot_data(self.plot_widgets.index(plot))
 
     def _capture_waveform_snapshot(self) -> Dict[str, List[np.ndarray]]:
         return {
             metric: [
                 self.waveform_metric_buffers[metric][channel].to_array()
+                for channel in range(NUM_CHANNELS)
+            ]
+            for metric in PLOT_METRICS
+        }
+
+    def _capture_waveform_sample_counts(self) -> Dict[str, List[int]]:
+        return {
+            metric: [
+                self.waveform_metric_buffers[metric][channel].total_samples
                 for channel in range(NUM_CHANNELS)
             ]
             for metric in PLOT_METRICS
@@ -2395,9 +3145,9 @@ class ReducerMonitorWindow(QMainWindow):
         return self.waveform_metric_buffers[metric][channel].to_array(last)
 
     def _plot_metric_count(self, metric: str, channel: int) -> int:
-        if self.view_paused and self.paused_waveform_snapshot is not None:
-            return int(self.paused_waveform_snapshot[metric][channel].size)
-        return len(self.waveform_metric_buffers[metric][channel])
+        if self.view_paused and self.paused_waveform_sample_counts is not None:
+            return self.paused_waveform_sample_counts[metric][channel]
+        return self.waveform_metric_buffers[metric][channel].total_samples
 
     def _set_view_paused(self, paused: bool):
         paused = bool(paused)
@@ -2408,13 +3158,19 @@ class ReducerMonitorWindow(QMainWindow):
         self.view_paused = paused
         if paused:
             self.paused_waveform_snapshot = self._capture_waveform_snapshot()
+            self.paused_waveform_sample_counts = (
+                self._capture_waveform_sample_counts()
+            )
             for plot_index in range(len(self.plot_widgets)):
+                self._set_plot_absolute_recent_x_range(plot_index)
                 self._refresh_plot_data(plot_index)
                 if self.auto_scale_checkbox.isChecked():
-                    self._update_plot_range(plot_index)
+                    self._update_plot_range(plot_index, force_y_range=True)
         else:
             self.paused_waveform_snapshot = None
+            self.paused_waveform_sample_counts = None
             self.plot_dirty = [True for _ in range(NUM_CHANNELS)]
+            self.plot_auto_scale_due = [0.0 for _ in self.plot_widgets]
 
         self._update_pause_controls()
 
@@ -2497,14 +3253,22 @@ class ReducerMonitorWindow(QMainWindow):
                 stress = self.paused_waveform_snapshot["stress"][channel]
                 if voltage.size == 0:
                     continue
-                bounded_last = min(last_sample, voltage.size - 1)
-                for sample_index in range(first_sample, bounded_last + 1):
+                total_samples = (
+                    self.paused_waveform_sample_counts["voltage"][channel]
+                    if self.paused_waveform_sample_counts is not None
+                    else int(voltage.size)
+                )
+                first_retained_sample = max(0, total_samples - int(voltage.size))
+                bounded_first = max(first_sample, first_retained_sample)
+                bounded_last = min(last_sample, total_samples - 1)
+                for sample_index in range(bounded_first, bounded_last + 1):
+                    local_index = sample_index - first_retained_sample
                     writer.writerow([
                         "",
                         channel,
-                        float(voltage[sample_index]),
-                        float(strain[sample_index]) if sample_index < strain.size else "",
-                        float(stress[sample_index]) if sample_index < stress.size else "",
+                        float(voltage[local_index]),
+                        float(strain[local_index]) if local_index < strain.size else "",
+                        float(stress[local_index]) if local_index < stress.size else "",
                         "",
                         self.telemetry_mode,
                         self.config_sequence,
@@ -2522,14 +3286,18 @@ class ReducerMonitorWindow(QMainWindow):
             )
             self.plot_dirty = [False for _ in range(NUM_CHANNELS)]
             self.pending_telemetry_batches.clear()
-            self.csv_pending_rows.clear()
             self.paused_waveform_snapshot = (
                 self._capture_waveform_snapshot() if self.view_paused else None
+            )
+            self.paused_waveform_sample_counts = (
+                self._capture_waveform_sample_counts() if self.view_paused else None
             )
 
         for curves in self.plot_metric_curves:
             for curve in curves.values():
                 curve.setData([], [])
+        self.plot_render_data = [None for _ in self.plot_widgets]
+        self.plot_auto_scale_due = [0.0 for _ in self.plot_widgets]
         for hover_items in self.plot_hover_items:
             hide_plot_hover_items(hover_items)
 
@@ -2623,10 +3391,14 @@ class ReducerMonitorWindow(QMainWindow):
             self.health_tx_drop_delta = 0
             self.health_adc_overflow_delta = 0
             self.health_adc_recovery_delta = 0
+            self.session_tx_drop_base = None
+            self.session_adc_overflow_base = None
+            self.control_drop_count = 0
+            self.display_drop_count = 0
             self.pending_telemetry_batches.clear()
-            self.csv_pending_rows.clear()
             self.view_paused = False
             self.paused_waveform_snapshot = None
+            self.paused_waveform_sample_counts = None
 
         if hasattr(self, 'data_table'):
             for row in range(NUM_CHANNELS):
@@ -2640,6 +3412,8 @@ class ReducerMonitorWindow(QMainWindow):
             for curves in self.plot_metric_curves:
                 for curve in curves.values():
                     curve.setData([], [])
+            self.plot_render_data = [None for _ in self.plot_widgets]
+            self.plot_auto_scale_due = [0.0 for _ in self.plot_widgets]
         self._update_pause_controls()
         self._refresh_health_panel(update_rx_rate=False)
 
@@ -2650,7 +3424,9 @@ class ReducerMonitorWindow(QMainWindow):
         else:
             self.connect()
 
-    def send_command(self, cmd_type: int, param: int = 0, value: int = 0) -> bool:
+    def send_command(
+        self, cmd_type: int, param: int = 0, value: int = 0, *, quiet: bool = False
+    ) -> bool:
         """Send command to embedded device"""
         if not self.can_bus or not self.is_connected:
             return False
@@ -2675,8 +3451,24 @@ class ReducerMonitorWindow(QMainWindow):
                 else COMMAND_ACK_TIMEOUT_S
             )
             self.pending_command_deadlines[sequence] = time.monotonic() + ack_timeout
+            if quiet:
+                self.quiet_command_sequences.add(sequence)
             self.command_sequence = (sequence + 1) & 0xFF
         return sent
+
+    def _send_host_keepalive(self) -> None:
+        if not self.is_connected:
+            return
+        if any(
+            sequence in self.pending_commands
+            for sequence in self.quiet_command_sequences
+        ):
+            return
+        self.send_command(
+            CAN_CMD_HOST_KEEPALIVE,
+            param=CAN_HOST_SESSION_PARAM_REFRESH,
+            quiet=True,
+        )
 
     def on_zero_clicked(self):
         """Handle Zero Sensor button click - saves zero offset to Flash"""
@@ -3021,6 +3813,7 @@ class ReducerMonitorWindow(QMainWindow):
                 self._tr(
                     "health_waiting",
                     rx_rate=self.rx_telemetry_rate_hz,
+                    display_drops=self.display_drop_count,
                     bad=self.rx_bad_protocol_count,
                 ),
             )
@@ -3031,6 +3824,7 @@ class ReducerMonitorWindow(QMainWindow):
             self.health_adc_overflow_delta,
             self.health_adc_recovery_delta,
             self.rx_bad_protocol_count,
+            self.display_drop_count,
         )
         state = (
             "ok"
@@ -3047,6 +3841,12 @@ class ReducerMonitorWindow(QMainWindow):
             if not health.channel_mask_nonzero
             else "adc_running"
         )
+        session_tx_drop = max(
+            0, health.tx_drop_count - (self.session_tx_drop_base or 0)
+        )
+        session_overflow = max(
+            0, health.adc_overflow_count - (self.session_adc_overflow_base or 0)
+        )
         self._set_health_status(
             state,
             self._tr(
@@ -3055,12 +3855,13 @@ class ReducerMonitorWindow(QMainWindow):
                 rx_rate=self.rx_telemetry_rate_hz,
                 sample_rate=self._format_sample_rate(health.sample_rate_sps),
                 mode=self._telemetry_mode_text(health.telemetry_mode),
+                display_drops=self.display_drop_count,
                 tx_samples=health.telemetry_samples_per_second,
                 tx_frames=health.telemetry_frames_per_second,
                 drop_delta=self.health_tx_drop_delta,
-                tx_drop=health.tx_drop_count,
+                tx_drop=session_tx_drop,
                 overflow_delta=self.health_adc_overflow_delta,
-                overflow=health.adc_overflow_count,
+                overflow=session_overflow,
                 recovery=health.adc_recovery_count,
                 bad=self.rx_bad_protocol_count,
             ),
@@ -3134,9 +3935,11 @@ class ReducerMonitorWindow(QMainWindow):
             self._reset_measurements()
             self.pending_commands.clear()
             self.pending_command_deadlines.clear()
+            self.quiet_command_sequences.clear()
             self.command_sequence = 0
 
             self.is_connected = True
+            self.keepalive_timer.start(HOST_KEEPALIVE_PERIOD_MS)
             self._set_connection_controls_enabled(False)
             self.connect_btn.setText(self._tr("disconnect"))
             self.log_btn.setEnabled(True)
@@ -3190,6 +3993,16 @@ class ReducerMonitorWindow(QMainWindow):
 
     def disconnect(self):
         """Disconnect from the CAN adapter"""
+        self.keepalive_timer.stop()
+        if self.can_bus is not None and self.is_connected:
+            self.can_bus.send_frame(
+                build_command_frame(
+                    self.command_sequence,
+                    CAN_CMD_HOST_KEEPALIVE,
+                    CAN_HOST_SESSION_PARAM_STOP,
+                    0,
+                )
+            )
         if self.logging_enabled:
             self.stop_logging()
 
@@ -3207,6 +4020,7 @@ class ReducerMonitorWindow(QMainWindow):
         self._set_connection_controls_enabled(True)
         self.pending_commands.clear()
         self.pending_command_deadlines.clear()
+        self.quiet_command_sequences.clear()
         self._reset_measurements()
         self.connect_btn.setText(self._tr("connect"))
         self.log_btn.setEnabled(False)
@@ -3230,18 +4044,38 @@ class ReducerMonitorWindow(QMainWindow):
     def _drain_can_receiver_control_frames(self):
         self._drain_can_receiver_frames(telemetry_limit=0)
 
-    def _drain_can_receiver_frames(self, telemetry_limit: Optional[int] = None):
+    def _drain_can_receiver_frames(
+        self, telemetry_limit: Optional[int] = TELEMETRY_DRAIN_FRAME_LIMIT
+    ):
         if self.can_receiver is None:
             return
 
-        self.display_drop_count += self.can_receiver.take_display_drop_count()
+        display_drops = self.can_receiver.take_display_drop_count()
+        self.display_drop_count += display_drops
+        control_drops = self.can_receiver.take_control_drop_count()
+        self.control_drop_count += control_drops
         control_frames, telemetry_frames = self.can_receiver.take_pending_frames(
             telemetry_limit
         )
+        if control_drops or display_drops:
+            self._update_stream_summary()
         for frame in control_frames:
             self.on_can_frame_received(frame)
         for frame in telemetry_frames:
             self.on_can_frame_received(frame)
+
+    def _service_telemetry_input(
+        self,
+        frame_limit: int = TELEMETRY_DRAIN_FRAME_LIMIT,
+        record_limit: int = TELEMETRY_DRAIN_RECORD_LIMIT,
+        time_budget_ms: Optional[float] = TELEMETRY_DRAIN_BUDGET_MS,
+    ):
+        self._drain_can_receiver_frames(frame_limit)
+        with self.lock:
+            self._drain_pending_telemetry(
+                record_limit=record_limit,
+                time_budget_ms=time_budget_ms,
+            )
 
     def on_can_frame_received(self, frame: CANFrame):
         """Handle received CAN frames from the adapter"""
@@ -3266,10 +4100,16 @@ class ReducerMonitorWindow(QMainWindow):
         health = parse_health_frame(frame)
         if health is not None:
             previous_health = self.latest_health
-            if previous_health is None:
+            mcu_restarted = previous_health is not None and (
+                health.tx_drop_count < previous_health.tx_drop_count or
+                health.adc_overflow_count < previous_health.adc_overflow_count
+            )
+            if previous_health is None or mcu_restarted:
                 self.health_tx_drop_delta = 0
                 self.health_adc_overflow_delta = 0
                 self.health_adc_recovery_delta = 0
+                self.session_tx_drop_base = health.tx_drop_count
+                self.session_adc_overflow_base = health.adc_overflow_count
             else:
                 self.health_tx_drop_delta = max(
                     0, health.tx_drop_count - previous_health.tx_drop_count
@@ -3381,14 +4221,43 @@ class ReducerMonitorWindow(QMainWindow):
         }
         self.on_data_updated(channel, payload)
 
-    def _drain_pending_telemetry(self) -> set[int]:
+    def _drain_pending_telemetry(
+        self,
+        record_limit: int = TELEMETRY_DRAIN_RECORD_LIMIT,
+        time_budget_ms: Optional[float] = TELEMETRY_DRAIN_BUDGET_MS,
+    ) -> set[int]:
+        """Ingest a bounded amount of telemetry so the Qt event loop stays live."""
         dirty_channels = set()
+        record_limit = max(1, int(record_limit))
+        deadline = (
+            None if time_budget_ms is None else
+            time.monotonic() + max(0.0, float(time_budget_ms)) / 1000.0
+        )
+        processed_records = 0
         while self.pending_telemetry_batches:
-            telemetry_frames, timestamp = self.pending_telemetry_batches.popleft()
-            raw_frames = [
-                telemetry for telemetry in telemetry_frames
-                if telemetry.raw_value is not None and telemetry.channel < NUM_CHANNELS
-            ]
+            telemetry_frames, timestamp = self.pending_telemetry_batches[0]
+            batch_size = len(telemetry_frames)
+            if (
+                processed_records and
+                (processed_records + batch_size > record_limit or
+                 (deadline is not None and time.monotonic() >= deadline))
+            ):
+                break
+
+            self.pending_telemetry_batches.popleft()
+            processed_records += batch_size
+            raw_frames = []
+            physical_frames = []
+            for telemetry in telemetry_frames:
+                if telemetry.channel >= NUM_CHANNELS:
+                    self.rx_bad_protocol_count += 1
+                    logger.warning("Invalid channel: %s", telemetry.channel)
+                    continue
+                if telemetry.raw_value is not None:
+                    raw_frames.append(telemetry)
+                else:
+                    physical_frames.append(telemetry)
+
             if raw_frames:
                 voltage, strain, stress = self._physical_values_from_raw(
                     [telemetry.raw_value for telemetry in raw_frames]
@@ -3407,16 +4276,9 @@ class ReducerMonitorWindow(QMainWindow):
                         telemetry.raw_value,
                     )
                     dirty_channels.add(telemetry.channel)
-            for telemetry in telemetry_frames:
-                channel = telemetry.channel
-                if channel >= NUM_CHANNELS:
-                    self.rx_bad_protocol_count += 1
-                    logger.warning("Invalid channel: %s", channel)
-                    continue
-                if telemetry.raw_value is not None:
-                    continue
+            for telemetry in physical_frames:
                 self._ingest_telemetry(telemetry, timestamp)
-                dirty_channels.add(channel)
+                dirty_channels.add(telemetry.channel)
         return dirty_channels
 
     def on_data_updated(self, channel: int, data: dict):
@@ -3435,36 +4297,52 @@ class ReducerMonitorWindow(QMainWindow):
         stats['min'] = voltage if stats['min'] is None else min(stats['min'], voltage)
         stats['max'] = voltage if stats['max'] is None else max(stats['max'], voltage)
         # Write to CSV if logging
-        if self.logging_enabled and self.csv_writer:
+        if self.logging_enabled:
             timestamp = datetime.datetime.now().isoformat()
             row = [timestamp, channel,
                    data['voltage'], data['strain'],
                    data['stress'], data.get('raw', ''), self.telemetry_mode,
                    self.config_sequence, data['samples']]
-            self.csv_pending_rows.append(row)
+            self.csv_logger.append(row)
 
     def update_plots(self):
         """Update waveform plots (called by timer)"""
-        self._drain_can_receiver_frames()
+        self._service_telemetry_input(
+            frame_limit=PLOT_FRAME_TELEMETRY_DRAIN_FRAME_LIMIT,
+            record_limit=PLOT_FRAME_TELEMETRY_DRAIN_RECORD_LIMIT,
+            time_budget_ms=PLOT_FRAME_TELEMETRY_DRAIN_BUDGET_MS,
+        )
+        logging_error = None
         with self.lock:
-            drained_channels = self._drain_pending_telemetry()
             dirty_channels = {
                 ch for ch in range(NUM_CHANNELS) if self.plot_dirty[ch]
             }
-            dirty_channels.update(drained_channels)
             if not self.view_paused:
+                value_cache = {}
+                x_data_cache = {}
+                auto_scale = self.auto_scale_checkbox.isChecked()
+                now = time.monotonic()
                 for plot_index, channel in enumerate(self.plot_channels):
-                    if channel in dirty_channels:
-                        self._refresh_plot_data(plot_index)
-                        if self.auto_scale_checkbox.isChecked():
-                            self._update_plot_range(plot_index)
+                    if (
+                        channel in dirty_channels and
+                        id(self.plot_widgets[plot_index]) not in
+                        self._svg_exporting_plots
+                    ):
+                        render_data = self._refresh_plot_data(
+                            plot_index, value_cache, x_data_cache
+                        )
+                        if (
+                            auto_scale and
+                            now >= self.plot_auto_scale_due[plot_index]
+                        ):
+                            self._update_plot_range(plot_index, render_data)
             for channel in dirty_channels:
                 self.plot_dirty[channel] = False
                 self._update_data_table_row(channel)
                 self._update_statistics_label(channel)
-            if self.csv_writer and self.csv_pending_rows:
-                self.csv_writer.writerows(self.csv_pending_rows)
-                self.csv_pending_rows.clear()
+        logging_error = self.csv_logger.flush()
+        if logging_error is not None:
+            self._handle_logging_failure(logging_error)
 
     def _update_data_table_row(self, channel: int):
         if channel >= self.data_table.rowCount():
@@ -3483,36 +4361,69 @@ class ReducerMonitorWindow(QMainWindow):
         )
         self.data_table.item(channel, 6).setText(str(data['samples']))
 
-    def _update_plot_range(self, plot_index: int):
-        channel = self.plot_channels[plot_index]
+    def _update_plot_range(
+        self,
+        plot_index: int,
+        render_data: Optional[dict] = None,
+        force_y_range: bool = False,
+    ):
+        if render_data is None:
+            render_data = self.plot_render_data[plot_index]
+        if (
+            render_data is None or
+            render_data["channel"] != self.plot_channels[plot_index] or
+            not render_data["auto_scale"]
+        ):
+            render_data = self._refresh_plot_data(plot_index)
+
         series = [
-            self._plot_metric_values(metric, channel, PLOT_VISIBLE_SAMPLES)
-            for metric in self._selected_plot_metrics(plot_index)
+            values for values in render_data["series"].values() if values.size
         ]
-        series = [values for values in series if values.size]
         if not series:
+            if render_data["relative_x"]:
+                self._set_relative_live_x_range(
+                    plot_index, render_data["visible_samples"]
+                )
             return
 
-        sample_count = max(
-            self._plot_metric_count(metric, channel)
-            for metric in self._selected_plot_metrics(plot_index)
-        )
-        visible_count = min(sample_count, PLOT_VISIBLE_SAMPLES)
+        sample_count = max(render_data["total_samples"].values())
+        visible_samples = render_data["visible_samples"]
+        visible_count = min(sample_count, visible_samples)
         first_sample = max(0, sample_count - visible_count)
         last_sample = max(first_sample + 1, sample_count - 1)
-        visible_values = np.concatenate(series)
 
-        minimum = float(np.min(visible_values))
-        maximum = float(np.max(visible_values))
+        minimum = min(float(np.min(values)) for values in series)
+        maximum = max(float(np.max(values)) for values in series)
         center = (minimum + maximum) / 2.0
         y_range = max(maximum - minimum, PLOT_MIN_Y_RANGE_MV)
         y_padding = y_range * 0.1
+        target_y_minimum = center - (y_range / 2.0) - y_padding
+        target_y_maximum = center + (y_range / 2.0) + y_padding
 
         plot = self.plot_widgets[plot_index]
-        plot.setXRange(first_sample, last_sample, padding=0.01)
-        plot.setYRange(center - (y_range / 2.0) - y_padding,
-                       center + (y_range / 2.0) + y_padding,
-                       padding=0.0)
+        if render_data["relative_x"]:
+            self._set_relative_live_x_range(plot_index, visible_samples)
+        else:
+            plot.setXRange(first_sample, last_sample, padding=0.01)
+        current_y_minimum, current_y_maximum = plot.viewRange()[1]
+        current_y_span = max(
+            current_y_maximum - current_y_minimum, PLOT_MIN_Y_RANGE_MV
+        )
+        target_y_span = target_y_maximum - target_y_minimum
+        edge_margin = current_y_span * PLOT_Y_RANGE_EDGE_MARGIN
+        should_update_y_range = (
+            force_y_range or
+            target_y_span < current_y_span * PLOT_Y_RANGE_SHRINK_RATIO or
+            target_y_minimum < current_y_minimum - edge_margin or
+            target_y_maximum > current_y_maximum + edge_margin
+        )
+        if should_update_y_range:
+            plot.setYRange(
+                target_y_minimum, target_y_maximum, padding=0.0
+            )
+        self.plot_auto_scale_due[plot_index] = (
+            time.monotonic() + PLOT_AUTOSCALE_PERIOD_MS / 1000.0
+        )
 
     def on_log_clicked(self):
         """Handle logging button click"""
@@ -3533,42 +4444,31 @@ class ReducerMonitorWindow(QMainWindow):
             return
 
         try:
-            self.csv_file = open(filename, 'w', newline='')
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow([
-                'timestamp', 'channel',
-                'voltage_mv', 'strain_ue', 'stress_mpa', 'raw_value',
-                'telemetry_mode', 'config_sequence', 'samples'
-            ])
-            self.logging_enabled = True
+            self.csv_logger.start(filename)
             self.log_btn.setText(self._tr("stop_logging"))
             self._show_status("logging_to", filename=filename)
-            logger.info(f"Started logging to {filename}")
+            logger.info("Started logging to %s", filename)
 
         except Exception as e:
             QMessageBox.critical(
                 self, self._tr("error"), self._tr("failed_start_logging", error=e)
             )
-            logger.error(f"Failed to start logging: {e}")
+            logger.error("Failed to start logging: %s", e)
+
+    def _handle_logging_failure(self, error: str):
+        self.log_btn.setText(self._tr("start_logging"))
+        message = self._tr("logging_write_failed", error=error)
+        self.statusBar().showMessage(message)
+        QMessageBox.critical(self, self._tr("error"), message)
 
     def stop_logging(self):
         """Stop CSV logging"""
-        if self.csv_writer and self.csv_pending_rows:
-            try:
-                self.csv_writer.writerows(self.csv_pending_rows)
-                self.csv_pending_rows.clear()
-            except Exception:
-                logger.exception("Failed to flush pending CSV rows")
-        if self.csv_file:
-            try:
-                self.csv_file.close()
-            except:
-                pass
-            self.csv_file = None
-        self.csv_writer = None
-        self.logging_enabled = False
+        error = self.csv_logger.stop()
         self.log_btn.setText(self._tr("start_logging"))
-        self._show_status("logging_stopped")
+        if error is None:
+            self._show_status("logging_stopped")
+        else:
+            self._handle_logging_failure(error)
         logger.info("Stopped logging")
 
     def closeEvent(self, event):
@@ -3585,9 +4485,13 @@ class ReducerMonitorWindow(QMainWindow):
         return COMMAND_NAMES.get(cmd_type, self._tr("command_unknown", cmd_type=cmd_type))
 
     def _handle_status_frame(self, status: StatusFrame) -> None:
+        quiet = status.sequence in self.quiet_command_sequences
+        self.quiet_command_sequences.discard(status.sequence)
         command_name = self.pending_commands.pop(status.sequence, self._command_name(status.cmd_type))
         self.pending_command_deadlines.pop(status.sequence, None)
         if status.status == CAN_STATUS_OK:
+            if quiet:
+                return
             self._show_status(
                 "command_acknowledged", command=command_name, value=status.value
             )
@@ -3601,6 +4505,8 @@ class ReducerMonitorWindow(QMainWindow):
             self.last_sent_channel_mask = None
 
         reason = STATUS_NAMES.get(status.status, f"status 0x{status.status:02X}")
+        if quiet:
+            return
         self._show_status("command_rejected", command=command_name, reason=reason)
         logger.warning(
             "%s rejected: %s (detail=0x%02X, value=%u)",
@@ -3619,9 +4525,14 @@ class ReducerMonitorWindow(QMainWindow):
         ]
         for sequence in expired:
             self.pending_command_deadlines.pop(sequence, None)
+            quiet = sequence in self.quiet_command_sequences
+            self.quiet_command_sequences.discard(sequence)
             command_name = self.pending_commands.pop(
                 sequence, self._tr("command_sequence", sequence=sequence)
             )
+            if quiet:
+                logger.debug("%s timed out waiting for ACK", command_name)
+                continue
             self._show_status("command_timeout", command=command_name)
             logger.warning("%s timed out waiting for ACK", command_name)
 
