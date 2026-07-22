@@ -39,6 +39,12 @@
 #define CAN_DIAG_PERIOD_MS           250U
 #define CONFIG_SAVE_DELAY_MS         750U
 #define HOST_SESSION_TIMEOUT_MS      3000U
+#define MCU_LED_IDLE_PERIOD_MS       1000U
+#define MCU_LED_IDLE_ON_MS           75U
+#define MCU_LED_STREAM_PERIOD_MS     250U
+#define MCU_LED_STREAM_ON_MS         75U
+#define MCU_LED_FAULT_PERIOD_MS      250U
+#define MCU_LED_FAULT_ON_MS          125U
 #define CAN_RESTORE_STEP_VREF         1U
 #define CAN_RESTORE_STEP_PGA          2U
 #define CAN_RESTORE_STEP_SAMPLE_RATE  3U
@@ -60,6 +66,13 @@ typedef struct {
     bool dirty;
     uint32_t save_deadline;
 } config_transaction_snapshot_t;
+
+typedef enum {
+    MCU_LED_PATTERN_IDLE,
+    MCU_LED_PATTERN_STREAMING,
+    MCU_LED_PATTERN_FAULT,
+    MCU_LED_PATTERN_COUNT,
+} mcu_led_pattern_t;
 
 // ============================================================================
 // Module State
@@ -86,6 +99,9 @@ static uint8_t can_diag_sequence = 0U;
 static bool can_main_loop_seen = false;
 static bool host_session_active = false;
 static uint32_t host_session_last_rx_tick = 0U;
+static mcu_led_pattern_t mcu_led_pattern = MCU_LED_PATTERN_COUNT;
+static uint32_t mcu_led_pattern_started_tick = 0U;
+static bool mcu_led_is_on = false;
 static can_tx_status_frame_t can_status_queue[CAN_STATUS_QUEUE_COUNT];
 static uint8_t can_status_queue_read = 0U;
 static uint8_t can_status_queue_write = 0U;
@@ -110,6 +126,60 @@ static flexspline_params_t flexspline_params;
 static void reset_can_telemetry_queue(void);
 static void flush_can_telemetry(void);
 static void service_can_status_queue(void);
+
+/* MCU_LED is wired active-low: RESET turns it on, SET turns it off. */
+static void mcu_led_set(bool on)
+{
+    if (mcu_led_is_on == on) {
+        return;
+    }
+
+    HAL_GPIO_WritePin(MCU_LED_GPIO_Port, MCU_LED_Pin,
+                      on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    mcu_led_is_on = on;
+}
+
+#if CAN_TX_DRIVER_TEST_ENABLED
+static void mcu_led_toggle(void)
+{
+    mcu_led_set(!mcu_led_is_on);
+}
+#endif
+
+static void service_mcu_led(void)
+{
+    uint32_t period_ms;
+    uint32_t on_time_ms;
+    mcu_led_pattern_t desired_pattern;
+
+    /* Idle: slow heartbeat; host session: fast activity; fault: 50% blink. */
+    if (!can_ready || adc_ads1256_is_running() == 0U) {
+        desired_pattern = MCU_LED_PATTERN_FAULT;
+        period_ms = MCU_LED_FAULT_PERIOD_MS;
+        on_time_ms = MCU_LED_FAULT_ON_MS;
+    } else if (host_session_active) {
+        desired_pattern = MCU_LED_PATTERN_STREAMING;
+        period_ms = MCU_LED_STREAM_PERIOD_MS;
+        on_time_ms = MCU_LED_STREAM_ON_MS;
+    } else {
+        desired_pattern = MCU_LED_PATTERN_IDLE;
+        period_ms = MCU_LED_IDLE_PERIOD_MS;
+        on_time_ms = MCU_LED_IDLE_ON_MS;
+    }
+
+    uint32_t now = HAL_GetTick();
+    if (desired_pattern != mcu_led_pattern) {
+        mcu_led_pattern = desired_pattern;
+        mcu_led_pattern_started_tick = now;
+    }
+
+    uint32_t elapsed = (uint32_t)(now - mcu_led_pattern_started_tick);
+    if (elapsed >= period_ms) {
+        mcu_led_pattern_started_tick = now;
+        elapsed = 0U;
+    }
+    mcu_led_set(elapsed < on_time_ms);
+}
 
 static void reset_can_status_queue(void)
 {
@@ -195,7 +265,7 @@ static void send_can_tx_driver_test(void)
         return;
     }
     can_tx_driver_test_last_tx_tick = now;
-    HAL_GPIO_TogglePin(MCU_LED_GPIO_Port, MCU_LED_Pin);
+    mcu_led_toggle();
 
 #if CAN_TX_DRIVER_TEST_GPIO_PULSE_ONLY
     can_tx_driver_test_init_pa12_gpio();
@@ -243,6 +313,9 @@ void setup(void)
     can_ready = (can_init() == 0);
     reset_can_status_queue();
     host_session_active = false;
+    mcu_led_pattern = MCU_LED_PATTERN_COUNT;
+    mcu_led_pattern_started_tick = HAL_GetTick();
+    mcu_led_set(false);
 
 #if CAN_TX_DRIVER_TEST_ENABLED
 #if CAN_TX_DRIVER_TEST_GPIO_PULSE_ONLY
@@ -1224,6 +1297,7 @@ void loop(void)
     flush_can_telemetry();
 
     adc_ads1256_poll();
+    service_mcu_led();
 
     int recv_count = adc_ads1256_get_data(adc_ads1256_data, ADC_SAMPLE_BATCH_COUNT);
 

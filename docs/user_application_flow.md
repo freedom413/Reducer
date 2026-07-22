@@ -23,6 +23,25 @@ The application does not wait for a complete multi-channel batch. That keeps ADC
 polling responsive and avoids bursts that could overflow the three-slot FDCAN TX
 FIFO.
 
+ADC sampling continues while no host is connected, but periodic CAN telemetry,
+health, diagnostics, and config snapshots are gated by a host session. Any valid
+protocol command activates the session. The GUI sends a silent keepalive every
+second; after three seconds without a valid command, firmware ends the session
+and clears pending ACK and telemetry queues. A subsequent `GET_CONFIG` command
+reactivates transmission immediately. On a normal GUI disconnect, the host sends
+an explicit session-stop parameter before closing the CAN adapter.
+
+## MCU Status LED
+
+`MCU_LED` is active-low: driving the pin low turns the LED on, and driving it
+high turns it off. GPIO initialization therefore leaves it off. The application
+uses a short heartbeat while the MCU is healthy and idle (75 ms every second),
+a faster short flash while a host session is active (75 ms every 250 ms), and a
+50% duty-cycle fault flash whenever CAN initialization failed or the ADS1256 is
+not running. The LED is deliberately not toggled for every ADC conversion, so
+high-SPS acquisition does not spend time on GPIO writes. `Error_Handler` also
+uses an explicit active-low fault blink.
+
 ## Channels And Acquisition
 
 Each ADS1256 scans four differential inputs:
@@ -70,12 +89,12 @@ Runtime voltage statistics are maintained by the host GUI. The MCU does not
 currently maintain a Welford statistics accumulator.
 
 The eight zero offsets and runtime configuration are persisted in the final
-STM32 Flash page as a versioned 64-byte record with CRC32 and a magic value.
+two STM32 Flash pages as versioned 64-byte records with CRC32 and a magic value.
 Flash writes happen after explicit zero/configuration changes. Each programmed
 record is read back, CRC-validated, and compared byte-for-byte before the save
-is reported as successful. The append log still uses one Flash page; a
-dual-page journal is the planned follow-up if stronger power-loss guarantees
-are required.
+is reported as successful. Records append to the active page. When it is full,
+the inactive page is erased and the new record is written and verified there,
+so the previous valid page survives an interrupted rollover.
 
 ## CAN FD Protocol
 
@@ -187,6 +206,7 @@ byte 7: XOR CRC over bytes 0..6
 | `SET_PGA` | `0x0C` | Set ADS1256 PGA gain and recalibrate |
 | `RESTORE_DEFAULTS` | `0x0D` | Apply, calibrate, restart, and save defaults |
 | `SET_ZERO_OFFSET` | `0x0E` | Set one channel zero offset |
+| `HOST_KEEPALIVE` | `0x0F` | Refresh the host telemetry session |
 
 `SAVE_ZERO` and `LOAD_ZERO` are legacy reserved commands. Current zero and
 configuration persistence is performed by the active commands above; the GUI
