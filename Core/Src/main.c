@@ -168,8 +168,14 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
-    HAL_GPIO_TogglePin(MCU_LED_GPIO_Port, MCU_LED_Pin);
-    for (volatile uint32_t delay = 0U; delay < 800000U; delay++)
+    /* MCU_LED is active-low: use a visible explicit fault blink. */
+    HAL_GPIO_WritePin(MCU_LED_GPIO_Port, MCU_LED_Pin, GPIO_PIN_RESET);
+    for (volatile uint32_t delay = 0U; delay < 8000000U; delay++)
+    {
+      __NOP();
+    }
+    HAL_GPIO_WritePin(MCU_LED_GPIO_Port, MCU_LED_Pin, GPIO_PIN_SET);
+    for (volatile uint32_t delay = 0U; delay < 8000000U; delay++)
     {
       __NOP();
     }

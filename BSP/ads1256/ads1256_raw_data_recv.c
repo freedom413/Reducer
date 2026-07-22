@@ -334,7 +334,6 @@ void adc_ads1256_poll(void)
         return;
     }
 
-    bool sample_read = false;
     bool poll_error = false;
 
     for (uint32_t i = 0; i < ADS1256_ARRAY_SIZE(ads1256_devices); i++) {
@@ -344,9 +343,7 @@ void adc_ads1256_poll(void)
         }
 
         int ret = ads1256_device_poll(dev);
-        if (ret > 0) {
-            sample_read = true;
-        } else if (ret < 0) {
+        if (ret < 0) {
             poll_error = true;
         }
     }
@@ -364,10 +361,6 @@ void adc_ads1256_poll(void)
     }
 
     ads1256_poll_error_count = 0;
-
-    if (sample_read) {
-        HAL_GPIO_TogglePin(MCU_LED_GPIO_Port, MCU_LED_Pin);
-    }
 }
 
 int adc_ads1256_calibrate(void)

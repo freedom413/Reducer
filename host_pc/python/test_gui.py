@@ -934,6 +934,37 @@ class TestFirmwareSource(unittest.TestCase):
         )
         self.assertIn("adc_ads1256_poll();", loop_body)
 
+    def test_active_low_mcu_led_uses_status_patterns_outside_adc_poll(self):
+        root = Path(__file__).resolve().parents[2]
+        user_source = (root / "Application" / "user.c").read_text(
+            encoding="utf-8"
+        )
+        gpio_source = (root / "Core" / "Src" / "gpio.c").read_text(
+            encoding="utf-8"
+        )
+        main_source = (root / "Core" / "Src" / "main.c").read_text(
+            encoding="utf-8"
+        )
+        adc_source = (
+            root / "BSP" / "ads1256" / "ads1256_raw_data_recv.c"
+        ).read_text(encoding="utf-8")
+        loop_body = user_source.split("void loop(void)", 1)[1]
+
+        self.assertIn("MCU_LED_PATTERN_STREAMING", user_source)
+        self.assertIn("MCU_LED_PATTERN_FAULT", user_source)
+        self.assertIn("on ? GPIO_PIN_RESET : GPIO_PIN_SET", user_source)
+        self.assertIn("service_mcu_led();", loop_body)
+        self.assertIn(
+            "HAL_GPIO_WritePin(MCU_LED_GPIO_Port, MCU_LED_Pin, GPIO_PIN_SET);",
+            gpio_source,
+        )
+        self.assertNotIn(
+            "HAL_GPIO_TogglePin(MCU_LED_GPIO_Port, MCU_LED_Pin)", adc_source
+        )
+        error_handler = main_source.split("void Error_Handler(void)", 1)[1]
+        self.assertIn("GPIO_PIN_RESET", error_handler)
+        self.assertIn("GPIO_PIN_SET", error_handler)
+
     def test_flash_storage_uses_two_atomic_journal_pages(self):
         root = Path(__file__).resolve().parents[2]
         header = (root / "Application" / "algorithm" / "flash_storage.h").read_text(
@@ -1191,6 +1222,10 @@ class TestFirmwareSource(unittest.TestCase):
         self.assertIn("versioned 64-byte records with CRC32", flow_en)
         self.assertIn("two STM32 Flash pages", flow_en)
         self.assertIn("64 字节记录，使用 CRC32", flow_zh)
+        self.assertIn("MCU Status LED", flow_en)
+        self.assertIn("active-low", flow_en)
+        self.assertIn("MCU 状态 LED", flow_zh)
+        self.assertIn("低电平有效", flow_zh)
         self.assertIn("legacy reserved commands", flow_en)
         self.assertIn("旧版保留命令", flow_zh)
         self.assertIn("host_pc\\python\\.venv\\Scripts\\python.exe", readme)
