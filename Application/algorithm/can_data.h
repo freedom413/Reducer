@@ -263,6 +263,10 @@ _Static_assert(sizeof(can_tx_diag_frame_t) == 8, "can_tx_diag_frame_t must be 8 
 #define CAN_CMD_SET_PGA            0x0C
 #define CAN_CMD_RESTORE_DEFAULTS   0x0D
 #define CAN_CMD_SET_ZERO_OFFSET    0x0E  // param=channel, value=int32 raw zero offset
+#define CAN_CMD_HOST_KEEPALIVE     0x0F  // Refresh host telemetry session
+
+#define CAN_HOST_SESSION_PARAM_REFRESH  0x00
+#define CAN_HOST_SESSION_PARAM_STOP     0x01
 
 #define CAN_SAMPLE_RATE_PARAM_SPS       0x00
 #define CAN_SAMPLE_RATE_PARAM_DECI_SPS  0x01

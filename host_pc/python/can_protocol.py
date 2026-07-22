@@ -74,6 +74,7 @@ COMMAND_NAMES = {
     0x0C: "Set PGA",
     0x0D: "Restore Defaults",
     0x0E: "Set Zero Offset",
+    0x0F: "Host Keepalive",
 }
 
 STATUS_NAMES = {
@@ -93,6 +94,7 @@ CAN_TELEMETRY_BATCH_FRAME_LEN = 64
 CAN_TELEMETRY_BATCH_MAX_RECORDS = 10
 CAN_TELEMETRY_RECORD_LEN = 6
 CAN_TELEMETRY_V2_HEADER_LEN = 8
+ADC_CHANNEL_COUNT = 8
 CAN_TELEMETRY_RAW_RECORD_LEN = 4
 CAN_TELEMETRY_RAW_MAX_RECORDS = 14
 CAN_TELEMETRY_PHYSICAL_RECORD_LEN = 9
@@ -333,10 +335,17 @@ def _parse_v2_raw_telemetry_batch(frame: CANFrame) -> Optional[List[TelemetryFra
     record_count = frame.data[4]
     if not 1 <= record_count <= CAN_TELEMETRY_RAW_MAX_RECORDS:
         return None
+    payload_end = CAN_TELEMETRY_V2_HEADER_LEN + (
+        record_count * CAN_TELEMETRY_RAW_RECORD_LEN
+    )
+    if frame.data[7] != 0 or any(frame.data[payload_end:]):
+        return None
 
     records = []
     for index in range(record_count):
         offset = CAN_TELEMETRY_V2_HEADER_LEN + index * CAN_TELEMETRY_RAW_RECORD_LEN
+        if frame.data[offset] >= ADC_CHANNEL_COUNT:
+            return None
         records.append(
             TelemetryFrame(
                 channel=frame.data[offset],
@@ -359,6 +368,11 @@ def _parse_v2_physical_telemetry_batch(frame: CANFrame) -> Optional[List[Telemet
     record_count = frame.data[4]
     if not 1 <= record_count <= CAN_TELEMETRY_PHYSICAL_MAX_RECORDS:
         return None
+    payload_end = CAN_TELEMETRY_V2_HEADER_LEN + (
+        record_count * CAN_TELEMETRY_PHYSICAL_RECORD_LEN
+    )
+    if frame.data[7] != 0 or any(frame.data[payload_end:]):
+        return None
 
     records = []
     for index in range(record_count):
@@ -366,6 +380,8 @@ def _parse_v2_physical_telemetry_batch(frame: CANFrame) -> Optional[List[Telemet
         channel, voltage_uv, strain_ue, stress_qmpa = struct.unpack(
             ">Bihh", frame.data[offset:offset + CAN_TELEMETRY_PHYSICAL_RECORD_LEN]
         )
+        if channel >= ADC_CHANNEL_COUNT:
+            return None
         records.append(
             TelemetryFrame(
                 channel=channel,
