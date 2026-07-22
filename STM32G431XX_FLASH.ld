@@ -56,8 +56,8 @@ ENTRY(Reset_Handler)
 MEMORY
 {
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 32K
-/* Last 2 KB page is reserved for calibration data at 0x0801F800. */
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 126K
+/* Last two 2 KB pages are reserved for atomic calibration/configuration data. */
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 124K
 }
 
 /* Highest address of the user mode stack */
