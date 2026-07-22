@@ -19,13 +19,15 @@ static int flash_erase_page(uint32_t addr)
     FLASH_EraseInitTypeDef erase = {0};
     uint32_t page_error = 0;
 
-    if (addr != FLASH_STORAGE_ADDR) {
+    if (addr < FLASH_STORAGE_ADDR || addr >= FLASH_STORAGE_END_ADDR ||
+        ((addr - FLASH_STORAGE_ADDR) % FLASH_STORAGE_PAGE_SIZE) != 0U) {
         return -1;
     }
 
     erase.TypeErase = FLASH_TYPEERASE_PAGES;
     erase.Banks = FLASH_BANK_1;
-    erase.Page = FLASH_STORAGE_PAGE;
+    erase.Page = FLASH_STORAGE_FIRST_PAGE +
+                 (addr - FLASH_STORAGE_ADDR) / FLASH_STORAGE_PAGE_SIZE;
     erase.NbPages = 1;
 
     return (HAL_FLASHEx_Erase(&erase, &page_error) == HAL_OK) ? 0 : -1;
@@ -35,7 +37,7 @@ static int flash_program_dw(uint32_t addr, uint64_t data)
 {
     if ((addr & 0x7U) != 0U ||
         addr < FLASH_STORAGE_ADDR ||
-        addr > (FLASH_STORAGE_ADDR + FLASH_STORAGE_PAGE_SIZE - sizeof(data))) {
+        addr > (FLASH_STORAGE_END_ADDR - sizeof(data))) {
         return -1;
     }
 

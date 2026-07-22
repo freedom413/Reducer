@@ -31,13 +31,14 @@
 #define CAN_INTERVAL_TEST_ID         0x123U
 #define CAN_INTERVAL_TEST_PERIOD_MS  1000U
 #endif
-#define CAN_TX_WAIT_TIMEOUT_MS       5U
+#define CAN_STATUS_QUEUE_COUNT       16U
 #define CAN_TELEMETRY_QUEUE_RECORD_COUNT      128U
 #define CAN_TELEMETRY_FLUSH_PERIOD_MIN_MS     2U
 #define CAN_TELEMETRY_FLUSH_PERIOD_MAX_MS     50U
 #define CAN_HEALTH_PERIOD_MS         1000U
 #define CAN_DIAG_PERIOD_MS           250U
 #define CONFIG_SAVE_DELAY_MS         750U
+#define HOST_SESSION_TIMEOUT_MS      3000U
 #define CAN_RESTORE_STEP_VREF         1U
 #define CAN_RESTORE_STEP_PGA          2U
 #define CAN_RESTORE_STEP_SAMPLE_RATE  3U
@@ -53,6 +54,12 @@ typedef struct {
     int16_t strain_ue;
     int16_t stress_qmpa;
 } can_telemetry_sample_t;
+
+typedef struct {
+    persistent_config_t config;
+    bool dirty;
+    uint32_t save_deadline;
+} config_transaction_snapshot_t;
 
 // ============================================================================
 // Module State
@@ -77,6 +84,12 @@ static uint16_t can_telemetry_samples_since_health = 0U;
 static uint16_t can_telemetry_frames_since_health = 0U;
 static uint8_t can_diag_sequence = 0U;
 static bool can_main_loop_seen = false;
+static bool host_session_active = false;
+static uint32_t host_session_last_rx_tick = 0U;
+static can_tx_status_frame_t can_status_queue[CAN_STATUS_QUEUE_COUNT];
+static uint8_t can_status_queue_read = 0U;
+static uint8_t can_status_queue_write = 0U;
+static uint8_t can_status_queue_count = 0U;
 static persistent_config_t persistent_config;
 static bool config_dirty = false;
 static bool config_snapshot_pending = false;
@@ -96,6 +109,37 @@ static flexspline_params_t flexspline_params;
 
 static void reset_can_telemetry_queue(void);
 static void flush_can_telemetry(void);
+static void service_can_status_queue(void);
+
+static void reset_can_status_queue(void)
+{
+    can_status_queue_read = 0U;
+    can_status_queue_write = 0U;
+    can_status_queue_count = 0U;
+}
+
+static void activate_host_session(void)
+{
+    host_session_active = true;
+    host_session_last_rx_tick = HAL_GetTick();
+}
+
+static void end_host_session(void)
+{
+    host_session_active = false;
+    reset_can_status_queue();
+    reset_can_telemetry_queue();
+}
+
+static void service_host_session(void)
+{
+    if (!host_session_active ||
+        (uint32_t)(HAL_GetTick() - host_session_last_rx_tick) <
+            HOST_SESSION_TIMEOUT_MS) {
+        return;
+    }
+    end_host_session();
+}
 
 #if CAN_INTERVAL_TEST_ENABLED
 static void send_can_interval_test(void)
@@ -197,6 +241,8 @@ void setup(void)
 {
     delay_init();
     can_ready = (can_init() == 0);
+    reset_can_status_queue();
+    host_session_active = false;
 
 #if CAN_TX_DRIVER_TEST_ENABLED
 #if CAN_TX_DRIVER_TEST_GPIO_PULSE_ONLY
@@ -340,21 +386,38 @@ static void reset_can_telemetry_queue(void)
     can_telemetry_queue_first_tick = HAL_GetTick();
 }
 
+static bool can_status_queue_has_space(void)
+{
+    return can_status_queue_count < CAN_STATUS_QUEUE_COUNT;
+}
+
 static void send_can_status(uint8_t sequence, uint8_t cmd_type, uint8_t status,
                             uint32_t value, uint8_t detail)
 {
-    if (!can_ready) {
+    if (!can_ready || !can_status_queue_has_space()) {
         return;
     }
 
-    can_tx_status_frame_t frame;
-    can_build_status_frame(&frame, sequence, cmd_type, status, value, detail);
-    uint32_t start = HAL_GetTick();
-    while (can_fd_data_frame_send(CAN_ID_TX_CONTROL, (const uint8_t *)&frame,
-                                  sizeof(frame)) == -3) {
-        if ((uint32_t)(HAL_GetTick() - start) >= CAN_TX_WAIT_TIMEOUT_MS) {
-            break;
+    can_build_status_frame(&can_status_queue[can_status_queue_write],
+                           sequence, cmd_type, status, value, detail);
+    can_status_queue_write =
+        (uint8_t)((can_status_queue_write + 1U) % CAN_STATUS_QUEUE_COUNT);
+    can_status_queue_count++;
+}
+
+static void service_can_status_queue(void)
+{
+    while (can_ready && can_status_queue_count > 0U) {
+        can_tx_status_frame_t *frame = &can_status_queue[can_status_queue_read];
+        int ret = can_fd_data_frame_send(CAN_ID_TX_CONTROL,
+                                         (const uint8_t *)frame,
+                                         sizeof(*frame));
+        if (ret != (int)sizeof(*frame)) {
+            return;
         }
+        can_status_queue_read =
+            (uint8_t)((can_status_queue_read + 1U) % CAN_STATUS_QUEUE_COUNT);
+        can_status_queue_count--;
     }
 }
 
@@ -387,7 +450,7 @@ static void queue_can_telemetry(uint8_t channel, int32_t raw_filtered,
                                 int32_t voltage_uv, int16_t strain_ue,
                                 int16_t stress_qmpa)
 {
-    if (!can_ready || channel >= ADC_CHANNEL_COUNT) {
+    if (!can_ready || !host_session_active || channel >= ADC_CHANNEL_COUNT) {
         return;
     }
 
@@ -411,7 +474,7 @@ static void queue_can_telemetry(uint8_t channel, int32_t raw_filtered,
 
 static void flush_can_telemetry(void)
 {
-    if (!can_ready) {
+    if (!can_ready || !host_session_active) {
         return;
     }
 
@@ -505,7 +568,7 @@ static void flush_can_telemetry(void)
 static void send_can_health(void)
 {
     uint32_t now = HAL_GetTick();
-    if (!can_ready ||
+    if (!can_ready || !host_session_active ||
         (uint32_t)(now - can_health_last_tx_tick) < CAN_HEALTH_PERIOD_MS) {
         return;
     }
@@ -540,7 +603,7 @@ static void send_can_health(void)
 static void send_can_diag(void)
 {
     uint32_t now = HAL_GetTick();
-    if (!can_ready ||
+    if (!can_ready || !host_session_active ||
         (uint32_t)(now - can_diag_last_tx_tick) < CAN_DIAG_PERIOD_MS) {
         return;
     }
@@ -598,18 +661,12 @@ static void request_config_save(bool immediate)
         HAL_GetTick() + CONFIG_SAVE_DELAY_MS;
 }
 
-static int save_config_now(void)
+static void capture_config_transaction(config_transaction_snapshot_t *snapshot)
 {
     sync_persistent_config_from_runtime();
-    if (flash_storage_save_config(&persistent_config) != 0) {
-        config_dirty = true;
-        config_snapshot_pending = true;
-        config_save_deadline = HAL_GetTick() + CONFIG_SAVE_DELAY_MS;
-        return -1;
-    }
-    config_dirty = false;
-    config_snapshot_pending = true;
-    return 0;
+    snapshot->config = persistent_config;
+    snapshot->dirty = config_dirty;
+    snapshot->save_deadline = config_save_deadline;
 }
 
 static void service_config_save(void)
@@ -697,9 +754,32 @@ static int restore_runtime_config(const persistent_config_t *config)
     return result;
 }
 
+static int commit_config_candidate(persistent_config_t *candidate)
+{
+    if (flash_storage_save_config(candidate) != 0) {
+        config_snapshot_pending = true;
+        return -1;
+    }
+    persistent_config = *candidate;
+    config_dirty = false;
+    config_snapshot_pending = true;
+    return 0;
+}
+
+static int rollback_config_transaction(
+    const config_transaction_snapshot_t *snapshot)
+{
+    int result = restore_runtime_config(&snapshot->config);
+    persistent_config = snapshot->config;
+    config_dirty = snapshot->dirty;
+    config_save_deadline = snapshot->save_deadline;
+    config_snapshot_pending = true;
+    return result;
+}
+
 static void send_config_snapshot(void)
 {
-    if (!can_ready || !config_snapshot_pending) {
+    if (!can_ready || !host_session_active || !config_snapshot_pending) {
         return;
     }
     sync_persistent_config_from_runtime();
@@ -769,7 +849,8 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
 
     switch (cmd_type) {
         case CAN_CMD_ZERO_DATUM: {
-            // Save current filtered values as zero offset, then reset
+            config_transaction_snapshot_t snapshot;
+            persistent_config_t candidate;
             uint16_t channel_mask = adc_ads1256_get_channel_mask();
             if (channel_mask == 0U) {
                 return CAN_STATUS_BAD_VALUE;
@@ -785,16 +866,23 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
                     return CAN_STATUS_BAD_VALUE;
                 }
             }
+            capture_config_transaction(&snapshot);
+            candidate = snapshot.config;
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
                 if ((channel_mask & (1U << i)) == 0U) {
                     continue;
                 }
-                int32_t raw_filtered = filter_get_raw_filtered(i);
-                filter_set_zero_offset(i, raw_filtered);
+                candidate.zero_offset[i] = filter_get_raw_filtered(i);
             }
-            persistent_config.flags |= PERSISTENT_CONFIG_FLAG_ZERO_VALID;
-            if (save_config_now() != 0) {
+            candidate.flags |= PERSISTENT_CONFIG_FLAG_ZERO_VALID;
+            if (commit_config_candidate(&candidate) != 0) {
+                persistent_config = snapshot.config;
+                config_dirty = snapshot.dirty;
+                config_save_deadline = snapshot.save_deadline;
                 return CAN_STATUS_STORAGE_ERROR;
+            }
+            for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
+                filter_set_zero_offset(i, candidate.zero_offset[i]);
             }
             filter_reset_all();
             reset_can_telemetry_queue();
@@ -860,7 +948,13 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
         case CAN_CMD_SET_SAMPLE_RATE: {
             uint32_t requested_sps_x10;
             if (param == CAN_SAMPLE_RATE_PARAM_SPS) {
-                requested_sps_x10 = (uint32_t)value * 10U;
+                if (value > UINT32_MAX / 10U) {
+                    if (detail != NULL) {
+                        *detail = 1U;
+                    }
+                    return CAN_STATUS_BAD_VALUE;
+                }
+                requested_sps_x10 = value * 10U;
             } else if (param == CAN_SAMPLE_RATE_PARAM_DECI_SPS) {
                 requested_sps_x10 = value;
             } else {
@@ -876,10 +970,10 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
                 return CAN_STATUS_BAD_VALUE;
             }
             if (applied_value != NULL) {
-                *applied_value = (uint16_t)(
+                *applied_value =
                     param == CAN_SAMPLE_RATE_PARAM_DECI_SPS ?
                     adc_ads1256_get_sample_rate_x10() :
-                    adc_ads1256_get_sample_rate());
+                    adc_ads1256_get_sample_rate();
             }
             filter_reset_all();
             reset_can_telemetry_queue();
@@ -899,17 +993,26 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
             request_config_save(false);
             return CAN_STATUS_OK;
 
-        case CAN_CMD_CLEAR_ZERO:
+        case CAN_CMD_CLEAR_ZERO: {
+            config_transaction_snapshot_t snapshot;
+            persistent_config_t candidate;
+            capture_config_transaction(&snapshot);
+            candidate = snapshot.config;
+            memset(candidate.zero_offset, 0, sizeof(candidate.zero_offset));
+            candidate.flags &= (uint8_t)~PERSISTENT_CONFIG_FLAG_ZERO_VALID;
+            if (commit_config_candidate(&candidate) != 0) {
+                persistent_config = snapshot.config;
+                config_dirty = snapshot.dirty;
+                config_save_deadline = snapshot.save_deadline;
+                return CAN_STATUS_STORAGE_ERROR;
+            }
             for (uint8_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
                 filter_set_zero_offset(i, 0);
-            }
-            persistent_config.flags &= (uint8_t)~PERSISTENT_CONFIG_FLAG_ZERO_VALID;
-            if (save_config_now() != 0) {
-                return CAN_STATUS_STORAGE_ERROR;
             }
             filter_reset_all();
             reset_can_telemetry_queue();
             return CAN_STATUS_OK;
+        }
 
         case CAN_CMD_SET_TELEMETRY_MODE:
             if (value != CAN_TELEMETRY_MODE_RAW &&
@@ -931,6 +1034,14 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
             config_snapshot_pending = true;
             return CAN_STATUS_OK;
 
+        case CAN_CMD_HOST_KEEPALIVE:
+            if (param == CAN_HOST_SESSION_PARAM_STOP) {
+                end_host_session();
+                return CAN_STATUS_OK;
+            }
+            return param == CAN_HOST_SESSION_PARAM_REFRESH ?
+                CAN_STATUS_OK : CAN_STATUS_BAD_VALUE;
+
         case CAN_CMD_SET_VREF_UV:
             if (adc_ads1256_set_vref_uv(value) != 0) {
                 return CAN_STATUS_BAD_VALUE;
@@ -942,20 +1053,31 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
             request_config_save(false);
             return CAN_STATUS_OK;
 
-        case CAN_CMD_SET_PGA:
+        case CAN_CMD_SET_PGA: {
+            config_transaction_snapshot_t snapshot;
+            persistent_config_t candidate;
+            uint8_t failed_step = CAN_RESTORE_STEP_PGA;
             if (value > UINT8_MAX) {
                 return CAN_STATUS_BAD_VALUE;
             }
-            {
-                uint8_t previous_gain = adc_ads1256_get_pga_gain();
-                if (adc_ads1256_set_pga_gain((uint8_t)value) != 0) {
-                    return CAN_STATUS_BAD_VALUE;
+            capture_config_transaction(&snapshot);
+            int apply_result = adc_ads1256_set_pga_gain((uint8_t)value);
+            if (apply_result == 0) {
+                failed_step = CAN_RESTORE_STEP_CALIBRATION;
+                apply_result = adc_ads1256_calibrate();
+            }
+            if (apply_result == 0) {
+                failed_step = CAN_RESTORE_STEP_RESTART;
+                apply_result = adc_ads1256_restart();
+            }
+            if (apply_result != 0) {
+                if (rollback_config_transaction(&snapshot) != 0) {
+                    failed_step |= CAN_RESTORE_ROLLBACK_FAILED;
                 }
-                if (adc_ads1256_calibrate() != 0 || adc_ads1256_restart() != 0) {
-                    (void)adc_ads1256_set_pga_gain(previous_gain);
-                    (void)adc_ads1256_restart();
-                    return CAN_STATUS_BAD_VALUE;
+                if (detail != NULL) {
+                    *detail = failed_step;
                 }
+                return CAN_STATUS_BAD_VALUE;
             }
             for (uint8_t i = 0U; i < ADC_CHANNEL_COUNT; i++) {
                 filter_set_zero_offset(i, 0);
@@ -968,21 +1090,27 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
                 FLEXSPLINE_GAUGE_FACTOR, FLEXSPLINE_ELASTIC_MODULUS_MPA);
             filter_reset_all();
             reset_can_telemetry_queue();
-            if (save_config_now() != 0) {
+            sync_persistent_config_from_runtime();
+            candidate = persistent_config;
+            candidate.flags &= (uint8_t)~PERSISTENT_CONFIG_FLAG_ZERO_VALID;
+            if (commit_config_candidate(&candidate) != 0) {
+                if (rollback_config_transaction(&snapshot) != 0 && detail != NULL) {
+                    *detail = CAN_RESTORE_ROLLBACK_FAILED;
+                }
                 return CAN_STATUS_STORAGE_ERROR;
             }
             return CAN_STATUS_OK;
+        }
 
         case CAN_CMD_RESTORE_DEFAULTS: {
-            persistent_config_t previous_config;
+            config_transaction_snapshot_t snapshot;
             persistent_config_t default_config;
             uint8_t failed_step = 0U;
 
-            sync_persistent_config_from_runtime();
-            previous_config = persistent_config;
+            capture_config_transaction(&snapshot);
             flash_storage_config_defaults(&default_config);
             if (apply_ads_config(&default_config, &failed_step) != 0) {
-                if (restore_runtime_config(&previous_config) != 0) {
+                if (rollback_config_transaction(&snapshot) != 0) {
                     failed_step |= CAN_RESTORE_ROLLBACK_FAILED;
                 }
                 if (detail != NULL) {
@@ -993,7 +1121,10 @@ static uint8_t process_can_command(uint8_t cmd_type, uint8_t param, uint32_t val
 
             persistent_config = default_config;
             apply_non_ads_runtime_config(&persistent_config);
-            if (save_config_now() != 0) {
+            if (commit_config_candidate(&default_config) != 0) {
+                if (rollback_config_transaction(&snapshot) != 0 && detail != NULL) {
+                    *detail = CAN_RESTORE_ROLLBACK_FAILED;
+                }
                 return CAN_STATUS_STORAGE_ERROR;
             }
             return CAN_STATUS_OK;
@@ -1015,6 +1146,9 @@ static void process_can_commands(void)
 
     can_msg_t msg;
     for (uint8_t cmd_count = 0; cmd_count < CAN_COMMANDS_PER_LOOP; cmd_count++) {
+        if (!can_status_queue_has_space()) {
+            break;
+        }
         if (can_recv(&msg, 1) != 1) {
             break;
         }
@@ -1051,6 +1185,7 @@ static void process_can_commands(void)
                             value, frame->version);
         } else {
             can_diag_record_reject(CAN_DIAG_REJECT_NONE);
+            activate_host_session();
             uint32_t applied_value = value;
             uint8_t status = process_can_command(frame->cmd_type, frame->param, value,
                                                  &applied_value, &detail);
@@ -1078,7 +1213,10 @@ void loop(void)
 
     can_main_loop_seen = true;
     (void)can_recover_bus_off();
+    service_host_session();
+    service_can_status_queue();
     process_can_commands();
+    service_can_status_queue();
     service_config_save();
     send_can_diag();
     send_config_snapshot();

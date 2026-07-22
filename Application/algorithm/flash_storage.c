@@ -28,31 +28,47 @@ static bool config_valid(const persistent_config_t *config)
                        (uint32_t)offsetof(persistent_config_t, crc32));
 }
 
+static bool sequence_is_newer(uint32_t candidate, uint32_t current)
+{
+    return (int32_t)(candidate - current) > 0;
+}
+
 static int find_latest(persistent_config_t *latest, uint32_t *next_addr)
 {
     bool found = false;
     persistent_config_t candidate;
-    uint32_t address = FLASH_STORAGE_ADDR;
     uint32_t best_sequence = 0U;
+    uint32_t best_next_addr = FLASH_STORAGE_ADDR;
+    uint32_t best_page = UINT32_MAX;
 
     if (flash_ops == NULL || flash_ops->read == NULL) {
         return -1;
     }
-    while (address < FLASH_STORAGE_ADDR + FLASH_STORAGE_PAGE_SIZE) {
-        flash_ops->read(address, &candidate, sizeof(candidate));
-        if (candidate.magic == 0xFFFFFFFFUL) {
-            break;
+    for (uint32_t page = 0U; page < FLASH_STORAGE_PAGE_COUNT; page++) {
+        uint32_t page_start = FLASH_STORAGE_ADDR + page * FLASH_STORAGE_PAGE_SIZE;
+        uint32_t page_end = page_start + FLASH_STORAGE_PAGE_SIZE;
+        uint32_t address = page_start;
+
+        while (address < page_end) {
+            flash_ops->read(address, &candidate, sizeof(candidate));
+            if (candidate.magic == 0xFFFFFFFFUL) {
+                break;
+            }
+            if (config_valid(&candidate) &&
+                (!found || sequence_is_newer(candidate.sequence, best_sequence))) {
+                *latest = candidate;
+                best_sequence = candidate.sequence;
+                best_page = page;
+                found = true;
+            }
+            address += FLASH_STORAGE_RECORD_SIZE;
         }
-        if (config_valid(&candidate) &&
-            (!found || candidate.sequence >= best_sequence)) {
-            *latest = candidate;
-            best_sequence = candidate.sequence;
-            found = true;
+        if (found && best_page == page) {
+            best_next_addr = address;
         }
-        address += FLASH_STORAGE_RECORD_SIZE;
     }
     if (next_addr != NULL) {
-        *next_addr = address;
+        *next_addr = best_next_addr;
     }
     return found ? 0 : -1;
 }
@@ -111,7 +127,8 @@ int flash_storage_save_config(persistent_config_t *config)
         return -1;
     }
 
-    if (find_latest(&latest, &address) == 0) {
+    bool have_latest = find_latest(&latest, &address) == 0;
+    if (have_latest) {
         config->sequence = latest.sequence + 1U;
     } else {
         config->sequence = 1U;
@@ -123,12 +140,27 @@ int flash_storage_save_config(persistent_config_t *config)
                                 (uint32_t)offsetof(persistent_config_t, crc32));
 
     flash_ops->unlock();
-    if (address >= FLASH_STORAGE_ADDR + FLASH_STORAGE_PAGE_SIZE) {
-        ret = flash_ops->erase_page(FLASH_STORAGE_ADDR);
+    if (!have_latest) {
         address = FLASH_STORAGE_ADDR;
+        ret = flash_ops->erase_page(address);
         if (ret != 0) {
             flash_ops->lock();
             return ret;
+        }
+    } else {
+        uint32_t active_page =
+            (address - FLASH_STORAGE_ADDR - FLASH_STORAGE_RECORD_SIZE) /
+            FLASH_STORAGE_PAGE_SIZE;
+        uint32_t active_page_end = FLASH_STORAGE_ADDR +
+            (active_page + 1U) * FLASH_STORAGE_PAGE_SIZE;
+        if (address >= active_page_end) {
+            uint32_t target_page = (active_page + 1U) % FLASH_STORAGE_PAGE_COUNT;
+            address = FLASH_STORAGE_ADDR + target_page * FLASH_STORAGE_PAGE_SIZE;
+            ret = flash_ops->erase_page(address);
+            if (ret != 0) {
+                flash_ops->lock();
+                return ret;
+            }
         }
     }
     for (uint32_t offset = 0U; offset < sizeof(*config); offset += 8U) {
@@ -183,7 +215,13 @@ int flash_storage_clear(void)
         return -1;
     }
     flash_ops->unlock();
-    int ret = flash_ops->erase_page(FLASH_STORAGE_ADDR);
+    int ret = 0;
+    for (uint32_t page = 0U; page < FLASH_STORAGE_PAGE_COUNT; page++) {
+        uint32_t address = FLASH_STORAGE_ADDR + page * FLASH_STORAGE_PAGE_SIZE;
+        if (flash_ops->erase_page(address) != 0) {
+            ret = -1;
+        }
+    }
     flash_ops->lock();
     return ret;
 }
