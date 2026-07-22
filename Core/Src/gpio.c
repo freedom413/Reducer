@@ -56,7 +56,8 @@ void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(ADC1_CS_GPIO_Port, ADC1_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(MCU_LED_GPIO_Port, MCU_LED_Pin, GPIO_PIN_RESET);
+  /* MCU_LED is active-low; keep it off until the application status service runs. */
+  HAL_GPIO_WritePin(MCU_LED_GPIO_Port, MCU_LED_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pins : ADC2_DRDY_Pin ADC1_DRDY_Pin */
   GPIO_InitStruct.Pin = ADC2_DRDY_Pin|ADC1_DRDY_Pin;
