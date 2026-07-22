@@ -16,6 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QAbstractButton, QLabel
 from PyQt6.QtCore import QEvent, QPointF
+from pyqtgraph.exporters import SVGExporter
 
 import reducer_monitor as reducer_monitor_module
 from can_protocol import (
@@ -63,6 +64,7 @@ from can_protocol import (
 )
 from reducer_monitor import (
     CANReceiver,
+    CsvLogger,
     CAN_CMD_CLEAR_ZERO,
     CAN_CMD_LOAD_ZERO,
     CAN_CMD_SAVE_ZERO,
@@ -74,6 +76,7 @@ from reducer_monitor import (
     CAN_CMD_SET_TELEMETRY_MODE,
     CAN_CMD_RESTORE_DEFAULTS,
     CAN_CMD_GET_CONFIG,
+    CAN_CMD_HOST_KEEPALIVE,
     CAN_CMD_START_CALIB,
     CAN_CMD_ZERO_DATUM,
     DEFAULT_VISIBLE_PLOTS,
@@ -437,6 +440,19 @@ class TestProtocolHelpers(unittest.TestCase):
         payload[1] = 0x01
         self.assertIsNone(parse_telemetry_frames(CANFrame(
             id=CAN_ID_TX_TELEMETRY, data=bytes(payload)
+        )))
+
+    def test_parse_v2_telemetry_rejects_invalid_channel_or_nonzero_padding(self):
+        raw_payload = bytearray(build_raw_v2_payload([(0, 1)]))
+        raw_payload[8] = NUM_CHANNELS
+        self.assertIsNone(parse_telemetry_frames(CANFrame(
+            id=CAN_ID_TX_TELEMETRY, data=bytes(raw_payload)
+        )))
+
+        physical_payload = bytearray(build_physical_v2_payload([(0, 1, 2, 3)]))
+        physical_payload[-1] = 0x7F
+        self.assertIsNone(parse_telemetry_frames(CANFrame(
+            id=CAN_ID_TX_TELEMETRY, data=bytes(physical_payload)
         )))
 
         payload = bytearray(build_raw_v2_payload([(0, 1)]))
@@ -878,8 +894,64 @@ class TestCANReceiver(unittest.TestCase):
         self.assertEqual(receiver.take_display_drop_count(), 0)
         receiver.stop()
 
+    def test_drops_oldest_control_frame_when_control_queue_is_full(self):
+        can_bus = MagicMock()
+        receiver = CANReceiver(can_bus, control_queue_limit=2)
+        callback = can_bus.register_rx_callback.call_args.args[0]
+        frames = [
+            CANFrame(id=CAN_ID_TX_STATUS, data=bytes([value]))
+            for value in (1, 2, 3)
+        ]
+
+        for frame in frames:
+            callback(frame)
+
+        control_frames, _ = receiver.take_pending_frames(telemetry_limit=0)
+        self.assertEqual(control_frames, frames[1:])
+        self.assertEqual(receiver.take_control_drop_count(), 1)
+        self.assertEqual(receiver.take_control_drop_count(), 0)
+        receiver.stop()
+
 
 class TestFirmwareSource(unittest.TestCase):
+    def test_host_session_gates_periodic_can_without_stopping_adc(self):
+        root = Path(__file__).resolve().parents[2]
+        header = (root / "Application" / "algorithm" / "can_data.h").read_text(
+            encoding="utf-8"
+        )
+        source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        loop_body = source.split("void loop(void)", 1)[1]
+
+        self.assertIn("#define CAN_CMD_HOST_KEEPALIVE", header)
+        self.assertIn("#define CAN_HOST_SESSION_PARAM_STOP", header)
+        self.assertIn("#define HOST_SESSION_TIMEOUT_MS      3000U", source)
+        self.assertIn("case CAN_CMD_HOST_KEEPALIVE:", source)
+        self.assertIn("activate_host_session();", source)
+        self.assertIn("!host_session_active", source)
+        self.assertLess(
+            loop_body.index("service_host_session();"),
+            loop_body.index("process_can_commands();"),
+        )
+        self.assertIn("adc_ads1256_poll();", loop_body)
+
+    def test_flash_storage_uses_two_atomic_journal_pages(self):
+        root = Path(__file__).resolve().parents[2]
+        header = (root / "Application" / "algorithm" / "flash_storage.h").read_text(
+            encoding="utf-8"
+        )
+        source = (root / "Application" / "algorithm" / "flash_storage.c").read_text(
+            encoding="utf-8"
+        )
+        linker = (root / "STM32G431XX_FLASH.ld").read_text(encoding="utf-8")
+
+        self.assertIn("#define FLASH_STORAGE_FIRST_PAGE    62U", header)
+        self.assertIn("#define FLASH_STORAGE_PAGE_COUNT    2U", header)
+        self.assertIn("#define FLASH_STORAGE_ADDR          0x0801F000U", header)
+        self.assertIn("sequence_is_newer", source)
+        self.assertIn("target_page = (active_page + 1U)", source)
+        self.assertIn("flash_ops->erase_page(address)", source)
+        self.assertIn("LENGTH = 124K", linker)
+
     def test_flash_save_reads_back_and_validates_programmed_record(self):
         root = Path(__file__).resolve().parents[2]
         source = (root / "Application" / "algorithm" / "flash_storage.c").read_text(
@@ -1057,11 +1129,33 @@ class TestFirmwareSource(unittest.TestCase):
             "default:", 1
         )[0]
 
-        self.assertIn("persistent_config_t previous_config", restore_case)
+        self.assertIn("config_transaction_snapshot_t snapshot", restore_case)
         self.assertIn("apply_ads_config", restore_case)
-        self.assertIn("restore_runtime_config", restore_case)
+        self.assertIn("rollback_config_transaction", restore_case)
         self.assertIn("return CAN_STATUS_BAD_VALUE", restore_case)
         self.assertNotIn("(void)adc_ads1256_", restore_case)
+
+    def test_sample_rate_command_checks_overflow_and_keeps_u32_ack(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        branch = source.split("case CAN_CMD_SET_SAMPLE_RATE:", 1)[1].split(
+            "case CAN_CMD_START_CALIB:", 1
+        )[0]
+
+        self.assertIn("value > UINT32_MAX / 10U", branch)
+        self.assertNotIn("*applied_value = (uint16_t)", branch)
+
+    def test_status_ack_path_is_queued_without_busy_wait(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "Application" / "user.c").read_text(encoding="utf-8")
+        status_section = source.split("static bool can_status_queue_has_space", 1)[1].split(
+            "static void count_can_tx_drops", 1
+        )[0]
+
+        self.assertIn("CAN_STATUS_QUEUE_COUNT", source)
+        self.assertIn("service_can_status_queue", status_section)
+        self.assertNotIn("HAL_GetTick", status_section)
+        self.assertNotIn("CAN_TX_WAIT_TIMEOUT_MS", source)
 
     def test_canfd_docs_match_500k_2m_runtime_configuration(self):
         root = Path(__file__).resolve().parents[2]
@@ -1094,7 +1188,8 @@ class TestFirmwareSource(unittest.TestCase):
         self.assertIn("up to 6 physical records", setup_doc)
         self.assertIn("does not decimate telemetry", flow_en)
         self.assertIn("不进行遥测抽取", flow_zh)
-        self.assertIn("64-byte record with CRC32", flow_en)
+        self.assertIn("versioned 64-byte records with CRC32", flow_en)
+        self.assertIn("two STM32 Flash pages", flow_en)
         self.assertIn("64 字节记录，使用 CRC32", flow_zh)
         self.assertIn("legacy reserved commands", flow_en)
         self.assertIn("旧版保留命令", flow_zh)
@@ -1212,9 +1307,15 @@ class TestReducerMonitorWindow(unittest.TestCase):
         for plot in self.window.plot_widgets:
             x_range, y_range = plot.viewRange()
             self.assertAlmostEqual(x_range[0], 0.0)
-            self.assertAlmostEqual(x_range[1], 100.0)
+            self.assertAlmostEqual(
+                x_range[1],
+                self.window._plot_visible_sample_count(
+                    self.window.plot_channels[self.window.plot_widgets.index(plot)]
+                ) - 1,
+            )
             self.assertAlmostEqual(y_range[0], -1.0)
             self.assertAlmostEqual(y_range[1], 1.0)
+            self.assertFalse(plot.getAxis("bottom").style["showValues"])
 
     def test_stream_summary_has_its_own_command_row(self):
         self.assertEqual(self.window.cmd_group.layout().count(), 2)
@@ -1384,6 +1485,90 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertIn("Entire Scene", self._tree_texts(dialog.ui.itemTree))
         self.assertIn("CSV of original plot data", format_texts)
 
+    def test_live_plot_hides_x_values_and_svg_export_uses_absolute_samples(self):
+        visible_samples = self.window._plot_visible_sample_count(0)
+        sample_count = visible_samples + 3
+        for sample in range(sample_count):
+            self.window.on_data_updated(0, {
+                "voltage": float(sample),
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": sample + 1,
+            })
+        self.window.update_plots()
+
+        plot = self.window.plot_widgets[0]
+        curve = self.window.plot_curves[0]
+        self.assertFalse(plot.getAxis("bottom").style["showValues"])
+        self.assertEqual(curve.xData[-1], visible_samples - 1)
+
+        restore = self.window._prepare_plot_svg_export(plot)
+
+        self.assertIsNotNone(restore)
+        self.assertTrue(plot.getAxis("bottom").style["showValues"])
+        self.assertEqual(curve.xData[-1], sample_count - 1)
+
+        restore()
+
+        self.assertFalse(plot.getAxis("bottom").style["showValues"])
+        self.assertEqual(curve.xData[-1], visible_samples - 1)
+
+    def test_high_rate_live_x_range_stays_fixed_while_curve_updates(self):
+        self.window.sample_rate_sps = 30000.0
+        self.window._set_acquisition_channel_mask(0x01)
+        expected_visible_samples = self.window._plot_visible_sample_count(0)
+
+        for sample in range(1, 4):
+            self.window.on_data_updated(0, {
+                "voltage": float(sample),
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": sample,
+            })
+            self.window.update_plots()
+
+        x_range, _ = self.window.plot_widgets[0].viewRange()
+        self.assertEqual(x_range, [0.0, float(expected_visible_samples - 1)])
+        self.assertFalse(
+            self.window.plot_widgets[0].getAxis("bottom").style["showValues"]
+        )
+        self.assertEqual(self.window.plot_curves[0].xData[-1], 2)
+
+    def test_svg_export_dialog_prepares_absolute_x_only_while_exporting(self):
+        visible_samples = self.window._plot_visible_sample_count(0)
+        sample_count = visible_samples + 2
+        for sample in range(sample_count):
+            self.window.on_data_updated(0, {
+                "voltage": float(sample),
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": sample + 1,
+            })
+        self.window.update_plots()
+
+        plot = self.window.plot_widgets[0]
+        scene = plot.scene()
+        scene.contextMenuItem = plot.getPlotItem()
+        scene.showExportDialog()
+        dialog = scene.exportDialog
+        self.addCleanup(dialog.close)
+        exporter = SVGExporter(plot.getPlotItem())
+        dialog.currentExporter = exporter
+        observed = []
+
+        def inspect_export():
+            observed.append((
+                plot.getAxis("bottom").style["showValues"],
+                self.window.plot_curves[0].xData[-1],
+            ))
+
+        with patch.object(exporter, "export", side_effect=inspect_export):
+            dialog.exportClicked()
+
+        self.assertEqual(observed, [(True, sample_count - 1)])
+        self.assertFalse(plot.getAxis("bottom").style["showValues"])
+        self.assertEqual(self.window.plot_curves[0].xData[-1], visible_samples - 1)
+
     def test_waveform_plot_defaults_to_voltage_curve(self):
         checkboxes = self.window.plot_metric_checkboxes[0]
 
@@ -1466,6 +1651,13 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.window._add_waveform_plot()
         self.assertEqual(len(self.window.plot_panels), MAX_VISIBLE_PLOTS)
+
+    def test_add_plot_button_does_not_treat_clicked_state_as_channel(self):
+        self.window.add_plot_btn.click()
+
+        self.assertEqual(len(self.window.plot_panels), DEFAULT_VISIBLE_PLOTS + 1)
+        self.assertEqual(self.window.plot_channels[-1], 4)
+        self.assertEqual(self.window.plot_channel_combos[-1].currentData(), 4)
 
     def test_adding_plot_does_not_override_mcu_channel_mask(self):
         self.window.can_bus.send_frame.reset_mock()
@@ -1602,6 +1794,38 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.assertAlmostEqual(self.window.channel_data[0].voltage_mv, 12.34)
         self.assertAlmostEqual(self.window.channel_data[1].voltage_mv, 56.78)
         self.assertEqual(self.window.rx_telemetry_count, 2)
+
+    def test_pending_telemetry_drains_whole_batches_within_record_budget(self):
+        self.window.on_can_frame_received(CANFrame(
+            id=CAN_ID_TX_TELEMETRY,
+            data=build_telemetry_batch_payload([
+                (0, 100, 1, 1),
+                (1, 200, 2, 2),
+            ]),
+        ))
+        self.window.on_can_frame_received(CANFrame(
+            id=CAN_ID_TX_TELEMETRY,
+            data=build_telemetry_batch_payload([
+                (2, 300, 3, 3),
+                (3, 400, 4, 4),
+            ]),
+        ))
+
+        with self.window.lock:
+            dirty = self.window._drain_pending_telemetry(
+                record_limit=3, time_budget_ms=None
+            )
+
+        self.assertEqual(dirty, {0, 1})
+        self.assertEqual(len(self.window.pending_telemetry_batches), 1)
+        self.assertEqual(self.window.channel_data[0].samples, 1)
+        self.assertEqual(self.window.channel_data[2].samples, 0)
+
+        with self.window.lock:
+            self.window._drain_pending_telemetry(
+                record_limit=3, time_budget_ms=None
+            )
+        self.assertEqual(self.window.channel_data[2].samples, 1)
 
     def test_parse_v2_raw_telemetry_is_converted_on_gui_thread(self):
         frame = CANFrame(
@@ -1856,8 +2080,8 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertEqual(self.window.sample_rate_sps, 30000)
         self.assertEqual(self.window.telemetry_mode, TELEMETRY_MODE_RAW)
-        self.assertIn("new drops 0, total 4", self.window.health_summary_label.text())
-        self.assertIn("new overflows 0, total 5", self.window.health_summary_label.text())
+        self.assertIn("new drops 0, session 0", self.window.health_summary_label.text())
+        self.assertIn("new overflows 0, session 0", self.window.health_summary_label.text())
         self.assertEqual(
             self.window.health_icon_label.pixmap().toImage()
             .pixelColor(7, 7).name(),
@@ -1870,7 +2094,7 @@ class TestReducerMonitorWindow(unittest.TestCase):
                 data=build_health_v2_payload(tx_drop=6, overflow=6, recovery=7),
             )
         )
-        self.assertIn("new drops 2, total 6", self.window.health_summary_label.text())
+        self.assertIn("new drops 2, session 2", self.window.health_summary_label.text())
         self.assertEqual(
             self.window.health_icon_label.pixmap().toImage()
             .pixelColor(7, 7).name(),
@@ -1982,6 +2206,29 @@ class TestReducerMonitorWindow(unittest.TestCase):
 
         self.assertEqual(self.window.pending_command_deadlines[0], 102.0)
 
+    def test_keepalive_command_is_quiet_and_does_not_overlap(self):
+        self.window._send_host_keepalive()
+
+        sent_frame = self.window.can_bus.send_frame.call_args.args[0]
+        self.assertEqual(sent_frame.data[3], CAN_CMD_HOST_KEEPALIVE)
+        self.assertEqual(sent_frame.data[4], 0)
+        self.assertEqual(self.window.quiet_command_sequences, {0})
+        self.window.can_bus.send_frame.reset_mock()
+
+        self.window._send_host_keepalive()
+
+        self.window.can_bus.send_frame.assert_not_called()
+
+    def test_disconnect_sends_explicit_session_stop(self):
+        can_bus = self.window.can_bus
+
+        self.window.disconnect()
+
+        sent_frame = can_bus.send_frame.call_args.args[0]
+        self.assertEqual(sent_frame.data[3], CAN_CMD_HOST_KEEPALIVE)
+        self.assertEqual(sent_frame.data[4], 1)
+        can_bus.disconnect.assert_called_once()
+
     def test_waveform_buffer_limit(self):
         from reducer_monitor import WAVEFORM_BUFFER_SIZE
 
@@ -2008,6 +2255,180 @@ class TestReducerMonitorWindow(unittest.TestCase):
         self.window.update_plots()
 
         self.assertFalse(self.window.auto_scale_checkbox.isChecked())
+
+    def test_plot_frame_uses_a_small_telemetry_slice(self):
+        with patch.object(self.window, "_service_telemetry_input") as service:
+            self.window.update_plots()
+
+        service.assert_called_once_with(
+            frame_limit=reducer_monitor_module.PLOT_FRAME_TELEMETRY_DRAIN_FRAME_LIMIT,
+            record_limit=reducer_monitor_module.PLOT_FRAME_TELEMETRY_DRAIN_RECORD_LIMIT,
+            time_budget_ms=reducer_monitor_module.PLOT_FRAME_TELEMETRY_DRAIN_BUDGET_MS,
+        )
+
+    def test_auto_scale_range_updates_are_throttled_while_curve_data_refreshes(self):
+        with patch.object(
+            self.window, "_update_plot_range", wraps=self.window._update_plot_range
+        ) as update_range:
+            self.window.on_data_updated(0, {
+                "voltage": 1.0,
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": 1,
+            })
+            self.window.update_plots()
+            self.window.plot_auto_scale_due[0] = float("inf")
+            self.window.on_data_updated(0, {
+                "voltage": 2.0,
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": 2,
+            })
+            self.window.update_plots()
+
+            self.assertEqual(update_range.call_count, 1)
+            self.assertEqual(list(self.window.plot_curves[0].yData), [1.0, 2.0])
+
+            self.window.plot_auto_scale_due[0] = 0.0
+            self.window.on_data_updated(0, {
+                "voltage": 3.0,
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": 3,
+            })
+            self.window.update_plots()
+
+        self.assertEqual(update_range.call_count, 2)
+
+    def test_auto_scale_keeps_y_ticks_stable_for_small_signal_changes(self):
+        self.window.on_data_updated(0, {
+            "voltage": 310.420,
+            "strain": 0.0,
+            "stress": 0.0,
+            "samples": 1,
+        })
+        self.window.update_plots()
+        before_y_range = self.window.plot_widgets[0].viewRange()[1]
+
+        self.window.plot_auto_scale_due[0] = 0.0
+        self.window.on_data_updated(0, {
+            "voltage": 310.421,
+            "strain": 0.0,
+            "stress": 0.0,
+            "samples": 2,
+        })
+        self.window.update_plots()
+        after_y_range = self.window.plot_widgets[0].viewRange()[1]
+
+        self.assertEqual(before_y_range, after_y_range)
+
+    def test_duplicate_plots_share_visible_metric_data_within_one_refresh(self):
+        self.window._add_waveform_plot(channel=0)
+        with patch.object(
+            self.window,
+            "_plot_metric_window",
+            wraps=self.window._plot_metric_window,
+        ) as metric_window:
+            self.window.on_data_updated(0, {
+                "voltage": 12.5,
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": 1,
+            })
+            self.window.update_plots()
+
+        self.assertEqual(metric_window.call_count, 1)
+
+    def test_plot_window_dynamically_controls_live_scroll_span(self):
+        self.window.sample_rate_sps = 1000.0
+        self.window._set_acquisition_channel_mask(1 << 1)
+        self.window.plot_channel_combos[0].setCurrentIndex(1)
+        self.window.waveform_metric_buffers["voltage"][1].extend(range(3000))
+
+        self.window.plot_window_spin.setValue(0.5)
+        fast_window_samples = self.window._plot_visible_sample_count(1)
+        fast_curve_samples = len(self.window.plot_curves[0].yData)
+
+        self.window.plot_window_spin.setValue(3.0)
+        slow_window_samples = self.window._plot_visible_sample_count(1)
+        slow_curve_samples = len(self.window.plot_curves[0].yData)
+
+        self.assertEqual(fast_window_samples, round(837 * 0.5))
+        self.assertEqual(slow_window_samples, round(837 * 3.0))
+        self.assertEqual(fast_curve_samples, fast_window_samples)
+        self.assertEqual(slow_curve_samples, slow_window_samples)
+        self.assertGreater(slow_curve_samples, fast_curve_samples)
+
+    def test_curve_keeps_full_history_while_auto_scale_follows_recent_window(self):
+        visible_samples = self.window._plot_visible_sample_count(0)
+        sample_count = visible_samples + 50
+        for index in range(sample_count):
+            self.window.on_data_updated(0, {
+                "voltage": float(index),
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": index + 1,
+            })
+
+        self.window.update_plots()
+
+        curve = self.window.plot_curves[0]
+        x_data, y_data = curve.xData, curve.yData
+        self.assertEqual(len(y_data), visible_samples)
+        self.assertEqual(x_data[0], 0)
+        self.assertEqual(x_data[-1], visible_samples - 1)
+        self.assertEqual(len(self.window.waveform_buffers[0]), sample_count)
+        x_range, _ = self.window.plot_widgets[0].viewRange()
+        self.assertEqual(x_range, [0.0, float(visible_samples - 1)])
+
+        self.window.auto_scale_checkbox.setChecked(False)
+        self.window.plot_widgets[0].setXRange(0, sample_count - 1, padding=0)
+        self.window._refresh_plot_data(0)
+        self.assertEqual(len(curve.yData), sample_count)
+
+    def test_manual_view_range_is_preserved_as_new_samples_arrive(self):
+        for index in range(400):
+            self.window.on_data_updated(0, {
+                "voltage": float(index),
+                "strain": 0.0,
+                "stress": 0.0,
+                "samples": index + 1,
+            })
+        self.window.update_plots()
+        self.window.auto_scale_checkbox.setChecked(False)
+        self.window.plot_widgets[0].setXRange(25, 75, padding=0)
+
+        self.window.on_data_updated(0, {
+            "voltage": 400.0,
+            "strain": 0.0,
+            "stress": 0.0,
+            "samples": 401,
+        })
+        self.window.update_plots()
+
+        x_range, _ = self.window.plot_widgets[0].viewRange()
+        self.assertAlmostEqual(x_range[0], 25.0)
+        self.assertAlmostEqual(x_range[1], 75.0)
+        curve_x = self.window.plot_curves[0].xData
+        self.assertLessEqual(curve_x[0], 25)
+        self.assertGreaterEqual(curve_x[-1], 75)
+        self.assertEqual(len(self.window.waveform_buffers[0]), 401)
+
+    def test_ring_buffer_curve_uses_monotonic_sample_numbers_after_wrap(self):
+        buffer = self.window.waveform_metric_buffers["voltage"][0]
+        buffer.extend(range(reducer_monitor_module.WAVEFORM_BUFFER_SIZE + 2))
+
+        self.window.auto_scale_checkbox.setChecked(False)
+        self.window.plot_widgets[0].setXRange(
+            2, reducer_monitor_module.WAVEFORM_BUFFER_SIZE + 1, padding=0
+        )
+        self.window._refresh_plot_data(0)
+
+        curve = self.window.plot_curves[0]
+        x_data, y_data = curve.xData, curve.yData
+        self.assertEqual(len(y_data), reducer_monitor_module.WAVEFORM_BUFFER_SIZE)
+        self.assertEqual(x_data[0], 2)
+        self.assertEqual(x_data[-1], reducer_monitor_module.WAVEFORM_BUFFER_SIZE + 1)
 
     def test_paused_view_freezes_curves_while_buffers_continue(self):
         self.window.on_data_updated(0, {
@@ -2070,6 +2491,14 @@ class TestReducerMonitorWindow(unittest.TestCase):
     def test_plot_refresh_rate_is_fixed_at_60_hz(self):
         self.assertFalse(hasattr(self.window, "plot_refresh_combo"))
         self.assertEqual(self.window.update_timer.interval(), 17)
+        self.assertEqual(
+            self.window.update_timer.timerType(),
+            reducer_monitor_module.Qt.TimerType.PreciseTimer,
+        )
+        self.assertEqual(
+            self.window.telemetry_drain_timer.timerType(),
+            reducer_monitor_module.Qt.TimerType.PreciseTimer,
+        )
 
     def test_clear_plots_keeps_current_values(self):
         self.window.on_data_updated(0, {
@@ -2107,6 +2536,59 @@ class TestReducerMonitorWindow(unittest.TestCase):
             row, column, row_span, column_span = self.window.waveform_layout.getItemPosition(index)
             self.assertEqual((row, column, row_span, column_span),
                              (plot_index // 2, plot_index % 2, 1, 1))
+
+
+class TestCsvLogger(unittest.TestCase):
+    def test_background_writer_flushes_all_rows_when_stopped(self):
+        temporary_file = tempfile.NamedTemporaryFile(
+            mode="w", delete=False, suffix=".csv", newline=""
+        )
+        temporary_file.close()
+        csv_logger = CsvLogger(batch_rows=64, flush_interval_s=60.0)
+        try:
+            csv_logger.start(temporary_file.name)
+            csv_logger.append(["timestamp", 0, 12.5, 3.0, 4.0, "", 0, 1, 1])
+
+            self.assertIsNone(csv_logger.stop())
+            with open(temporary_file.name, "r", newline="") as handle:
+                rows = list(csv.reader(handle))
+        finally:
+            csv_logger.stop()
+            os.unlink(temporary_file.name)
+
+        self.assertEqual(rows[0], CsvLogger.HEADER)
+        self.assertEqual(rows[1][2], "12.5")
+        self.assertFalse(csv_logger.active)
+
+    def test_start_failure_closes_partially_opened_file(self):
+        csv_logger = CsvLogger()
+        handle = MagicMock()
+        with patch("builtins.open", return_value=handle), patch(
+            "reducer_monitor.csv.writer", side_effect=OSError("header failed")
+        ):
+            with self.assertRaises(OSError):
+                csv_logger.start("broken.csv")
+
+        handle.close.assert_called_once()
+        self.assertFalse(csv_logger.active)
+        self.assertIsNone(csv_logger.file)
+        self.assertIsNone(csv_logger.writer)
+
+    def test_flush_failure_fails_closed_and_discards_pending_rows(self):
+        csv_logger = CsvLogger()
+        csv_logger.file = MagicMock()
+        csv_logger.writer = MagicMock()
+        csv_logger.writer.writerows.side_effect = OSError("disk full")
+        csv_logger.active = True
+        csv_logger.pending_rows.append(["row"])
+
+        error = csv_logger.flush()
+
+        self.assertEqual(error, "disk full")
+        self.assertFalse(csv_logger.active)
+        self.assertEqual(csv_logger.pending_rows, [])
+        self.assertIsNone(csv_logger.file)
+        self.assertIsNone(csv_logger.writer)
 
 
 class TestCsvLogging(unittest.TestCase):
@@ -2147,6 +2629,35 @@ class TestCsvLogging(unittest.TestCase):
 
         self.assertEqual(len(rows), 2)
         self.assertIn("123.45", rows[1][2])
+
+    def test_clear_plots_keeps_pending_log_rows(self):
+        self.window.csv_writer = MagicMock()
+        self.window.logging_enabled = True
+        self.window.on_data_updated(0, {
+            "voltage": 1.0,
+            "strain": 2.0,
+            "stress": 3.0,
+            "samples": 1,
+        })
+
+        self.window._clear_plots()
+
+        self.assertEqual(len(self.window.csv_pending_rows), 1)
+
+    def test_runtime_write_failure_is_reported_only_once(self):
+        self.window.csv_file = MagicMock()
+        self.window.csv_writer = MagicMock()
+        self.window.csv_writer.writerows.side_effect = OSError("disk full")
+        self.window.logging_enabled = True
+        self.window.csv_pending_rows.append(["row"])
+
+        with patch("reducer_monitor.QMessageBox.critical") as critical:
+            self.window.update_plots()
+            self.window.update_plots()
+
+        critical.assert_called_once()
+        self.assertFalse(self.window.logging_enabled)
+        self.assertEqual(self.window.csv_pending_rows, [])
 
     def test_csv_import_opens_offline_window_without_changing_live_waveforms(self):
         with open(self.csv_path, "w", newline="") as handle:
