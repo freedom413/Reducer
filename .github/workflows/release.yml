@@ -1,0 +1,115 @@
+name: Build release artifacts
+
+on:
+  push:
+    tags:
+      - "*"
+
+# Publishing a tag creates or updates its GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  validate-main-tag:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    outputs:
+      is_main_tag: ${{ steps.validate.outputs.is_main_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: validate
+        shell: bash
+        run: |
+          if git merge-base --is-ancestor "${GITHUB_REF_NAME}^{commit}" origin/main; then
+            echo "is_main_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag ${GITHUB_REF_NAME} does not point to a commit reachable from main."
+            echo "is_main_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  firmware:
+    name: Build MCU firmware
+    needs: validate-main-tag
+    if: needs.validate-main-tag.outputs.is_main_tag == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ARM build tools
+        run: sudo apt-get update && sudo apt-get install --yes cmake ninja-build gcc-arm-none-eabi
+
+      - name: Build Release firmware
+        run: |
+          cmake -S . -B build/Release -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/Release
+
+      - name: Create firmware images
+        shell: bash
+        run: |
+          mkdir -p release/firmware
+          cp build/Release/Reducer.elf release/firmware/Reducer.elf
+          arm-none-eabi-objcopy -O ihex build/Release/Reducer.elf release/firmware/Reducer.hex
+          arm-none-eabi-objcopy -O binary build/Release/Reducer.elf release/firmware/Reducer.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reducer-firmware-${{ github.ref_name }}
+          path: release/firmware/
+          if-no-files-found: error
+
+  host-pc:
+    name: Package Python host application
+    needs: validate-main-tag
+    if: needs.validate-main-tag.outputs.is_main_tag == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r host_pc/python/requirements.txt pyinstaller
+
+      - name: Build Windows executable
+        working-directory: host_pc/python
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name ReducerMonitor --add-data "assets;assets" reducer_monitor.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reducer-monitor-windows-${{ github.ref_name }}
+          path: host_pc/python/dist/ReducerMonitor.exe
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [firmware, host-pc]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reducer-*-${{ github.ref_name }}
+          path: release
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release/* --generate-notes
+          fi
