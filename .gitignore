@@ -6,3 +6,8 @@ __pycache__/
 .venv/
 host_pc/.venv/
 .vscode/c_cpp_properties.json
+.claude/
+.codegraph/
+.serena/
+AGENTS.md
+plan_docs/
